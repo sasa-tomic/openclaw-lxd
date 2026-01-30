@@ -1,21 +1,21 @@
-# Moltbot LXD
+# Openclaw
 
-Run [Moltbot](https://docs.molt.bot) in an LXD container with host browser control.
+Run [Clawdbot](https://docs.molt.bot) in an LXD container with host browser control.
 
 ## Setup
 
 ```bash
-./moltbot-lxd --projects ~/projects/myapp ~/projects/other
+./openclaw --projects ~/projects/myapp ~/projects/other
 ```
 
 ## Container Management
 
 ```bash
-./moltbot-lxd --shell      # enter container
-./moltbot-lxd --list       # status
-./moltbot-lxd --stop       # stop
-./moltbot-lxd --start      # start
-./moltbot-lxd --destroy    # remove
+./openclaw shell      # enter container
+./openclaw list       # status
+./openclaw stop       # stop
+./openclaw start      # start
+./openclaw destroy    # remove
 ```
 
 ## Usage
@@ -60,7 +60,7 @@ clawdbot gateway status
 
 ## Architecture
 
-- LXD container runs Moltbot + Playwright
+- LXD container runs Clawdbot + Playwright
 - Browser runs on host with CDP (port 9222)
 - Container connects to host browser via LXD bridge
 - Projects mounted at `/projects/<name>`

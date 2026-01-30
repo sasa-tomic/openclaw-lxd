@@ -32,7 +32,7 @@ tail -f ~/.signal-cli/obsidian-sync.log
 | `OBSIDIAN_SIGNAL_DIR` | `~/clawd/notes/Signal` | Output directory |
 | `SIGNAL_STATE_FILE` | `~/.signal-cli/obsidian-sync-state.json` | Sync state |
 | `SIGNAL_CONTACTS_FILE` | `~/.signal-cli/contacts.json` | Contacts cache |
-| `SIGNAL_CLI` | `/home/moltbot/homebrew/bin/signal-cli` | signal-cli path |
+| `SIGNAL_CLI` | `/home/openclaw/homebrew/bin/signal-cli` | signal-cli path |
 | `SIGNAL_PHONE` | `+41798471964` | Account phone number |
 
 ## WhatsApp Sync

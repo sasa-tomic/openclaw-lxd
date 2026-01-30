@@ -4,24 +4,24 @@
 # dependencies = []
 # ///
 """
-LXD-based Moltbot runner.
+LXD-based Openclaw runner.
 
-Creates an LXD container with Moltbot installed and project directories mounted.
-The container provides isolation, so Molt's internal Docker sandbox is disabled.
+Creates an LXD container with Clawdbot installed and project directories mounted.
+The container provides isolation, so the internal Docker sandbox is disabled.
 Browser control uses your host's Chrome via CDP for manual captcha/login.
 
 Usage:
-    ./moltbot-lxd create --projects ~/myapp ~/other   # create with mounted dirs
-    ./moltbot-lxd list                                # show status
-    ./moltbot-lxd shell                               # shell into container
-    ./moltbot-lxd destroy                             # remove container
-    ./moltbot-lxd port-forward 8080:80 33495          # forward ports (kubectl style)
-    ./moltbot-lxd mount ~/Documents                   # mount directory
-    ./moltbot-lxd unmount Documents                   # unmount directory
+    ./openclaw create --projects ~/myapp ~/other   # create with mounted dirs
+    ./openclaw list                                # show status
+    ./openclaw shell                               # shell into container
+    ./openclaw destroy                             # remove container
+    ./openclaw port-forward 8080:80 33495          # forward ports (kubectl style)
+    ./openclaw mount ~/Documents                   # mount directory
+    ./openclaw unmount Documents                   # unmount directory
 
 Browser:
     Launch Chrome on host: google-chrome --remote-debugging-port=9222
-    Moltbot connects to your visible Chrome for captchas/logins.
+    Clawdbot connects to your visible Chrome for captchas/logins.
 """
 
 from __future__ import annotations
@@ -37,9 +37,9 @@ from shlex import quote as shlex_quote
 from typing import Optional
 
 
-INSTANCE_NAME = "moltbot"
+INSTANCE_NAME = "openclaw"
 DEFAULT_IMAGE = "ubuntu:24.04"
-DEFAULT_USER = "moltbot"
+DEFAULT_USER = "openclaw"
 NODE_VERSION = "22"
 GATEWAY_PORT = 18789
 CDP_PORT = 9222
@@ -157,7 +157,7 @@ def create_instance(name: str, image: str) -> None:
 
 
 def setup_user(name: str, user: str) -> None:
-    """Setup moltbot user by renaming the default ubuntu user."""
+    """Setup openclaw user by renaming the default ubuntu user."""
     lxc_exec(name, ["usermod", "-l", user, "-d", f"/home/{user}", "-m", "ubuntu"], check=False)
     lxc_exec(name, ["groupmod", "-n", user, "ubuntu"], check=False)
 
@@ -181,8 +181,8 @@ def install_nodejs(name: str) -> None:
     print(f"Node.js installed: {result.stdout.strip()}")
 
 
-def install_moltbot_interactive(name: str, user: str) -> None:
-    """Install moltbot via official installer with interactive TTY."""
+def install_clawdbot_interactive(name: str, user: str) -> None:
+    """Install clawdbot via official installer with interactive TTY."""
     home = f"/home/{user}"
     npm_bin = f"{home}/.npm-global/bin"
 
@@ -204,7 +204,7 @@ def install_moltbot_interactive(name: str, user: str) -> None:
 
     # Verify installation succeeded
     result = lxc_exec(name, ["bash", "-c", f'export PATH="{npm_bin}:$PATH" && clawdbot --version'], user=user)
-    print(f"Moltbot installed: {result.stdout.strip()}")
+    print(f"Clawdbot installed: {result.stdout.strip()}")
 
 
 def mount_project(name: str, host_path: Path, user: str) -> str:
@@ -275,8 +275,8 @@ def get_host_ip(name: str) -> str:
     raise MoltError("Could not determine host IP from container")
 
 
-def configure_moltbot(name: str, user: str, project_paths: list[str]) -> None:
-    """Configure moltbot settings."""
+def configure_clawdbot(name: str, user: str, project_paths: list[str]) -> None:
+    """Configure clawdbot settings."""
     home = f"/home/{user}"
     config_dir = f"{home}/.clawdbot"
 
@@ -304,16 +304,16 @@ def configure_moltbot(name: str, user: str, project_paths: list[str]) -> None:
     config_json = json.dumps(config, indent=2)
     lxc_exec(name, ["bash", "-c", f"cat > {config_dir}/moltbot.json << 'EOF'\n{config_json}\nEOF"], user=user)
 
-    print(f"Moltbot configured (sandbox off, browser via {host_ip}:{CDP_PORT})")
+    print(f"Clawdbot configured (sandbox off, browser via {host_ip}:{CDP_PORT})")
 
 
 def create_systemd_service(name: str, user: str) -> None:
-    """Create systemd service for moltbot gateway."""
+    """Create systemd service for openclaw gateway."""
     home = f"/home/{user}"
     clawdbot_bin = f"{home}/.npm-global/bin/clawdbot"
 
     service_content = f"""[Unit]
-Description=Moltbot Gateway
+Description=Openclaw Gateway
 After=network.target
 
 [Service]
@@ -329,21 +329,21 @@ RestartSec=5
 WantedBy=multi-user.target
 """
 
-    lxc_exec(name, ["bash", "-c", f"cat > /etc/systemd/system/moltbot.service << 'EOF'\n{service_content}\nEOF"])
+    lxc_exec(name, ["bash", "-c", f"cat > /etc/systemd/system/openclaw.service << 'EOF'\n{service_content}\nEOF"])
     lxc_exec(name, ["systemctl", "daemon-reload"])
-    lxc_exec(name, ["systemctl", "enable", "moltbot"])
-    print("Systemd service created: moltbot.service")
+    lxc_exec(name, ["systemctl", "enable", "openclaw"])
+    print("Systemd service created: openclaw.service")
 
 
 def start_service(name: str) -> None:
-    """Start the moltbot service."""
-    lxc_exec(name, ["systemctl", "start", "moltbot"])
-    print("Moltbot gateway started")
+    """Start the openclaw service."""
+    lxc_exec(name, ["systemctl", "start", "openclaw"])
+    print("Openclaw gateway started")
 
 
 def stop_service(name: str) -> None:
-    """Stop the moltbot service."""
-    lxc_exec(name, ["systemctl", "stop", "moltbot"], check=False)
+    """Stop the openclaw service."""
+    lxc_exec(name, ["systemctl", "stop", "openclaw"], check=False)
 
 
 def forward_port(name: str, host_port: int, container_port: int) -> None:
@@ -402,7 +402,7 @@ def port_forward_interactive(name: str, port_specs: list[str]) -> int:
 
 
 def show_status(name: str) -> None:
-    """Show moltbot container status."""
+    """Show openclaw container status."""
     if not instance_exists(name):
         print(f"Container '{name}' does not exist")
         return
@@ -416,7 +416,7 @@ def show_status(name: str) -> None:
 
     if instance_is_running(name):
         # Check service status
-        result = lxc_exec(name, ["systemctl", "is-active", "moltbot"], check=False)
+        result = lxc_exec(name, ["systemctl", "is-active", "openclaw"], check=False)
         svc_status = result.stdout.strip() if result.returncode == 0 else "unknown"
         print(f"Service: {svc_status}")
         print(f"Dashboard: http://127.0.0.1:{GATEWAY_PORT}/")
@@ -430,7 +430,7 @@ def show_status(name: str) -> None:
 
 
 def destroy_instance(name: str) -> None:
-    """Destroy the moltbot container."""
+    """Destroy the openclaw container."""
     if not instance_exists(name):
         print(f"Container '{name}' does not exist")
         return
@@ -465,7 +465,7 @@ class Args:
 
 def parse_args() -> Args:
     p = argparse.ArgumentParser(
-        description="LXD-based Moltbot runner",
+        description="LXD-based Openclaw runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -579,7 +579,7 @@ def main() -> int:
         return 0
 
     # Create new container
-    print(f"Creating moltbot container...")
+    print(f"Creating openclaw container...")
     create_instance(INSTANCE_NAME, args.image)
 
     print("Waiting for container to be ready...")
@@ -593,8 +593,8 @@ def main() -> int:
     print("Installing Node.js...")
     install_nodejs(INSTANCE_NAME)
 
-    print("Installing Moltbot...")
-    install_moltbot_interactive(INSTANCE_NAME, DEFAULT_USER)
+    print("Installing Clawdbot...")
+    install_clawdbot_interactive(INSTANCE_NAME, DEFAULT_USER)
 
     # Mount projects
     mounted_paths = []
@@ -602,8 +602,8 @@ def main() -> int:
         container_path = mount_project(INSTANCE_NAME, project, DEFAULT_USER)
         mounted_paths.append(container_path)
 
-    # Configure moltbot
-    configure_moltbot(INSTANCE_NAME, DEFAULT_USER, mounted_paths)
+    # Configure clawdbot
+    configure_clawdbot(INSTANCE_NAME, DEFAULT_USER, mounted_paths)
 
     # Setup and start service
     create_systemd_service(INSTANCE_NAME, DEFAULT_USER)
@@ -611,16 +611,16 @@ def main() -> int:
     start_service(INSTANCE_NAME)
 
     print("\n" + "=" * 50)
-    print("Moltbot container ready!")
+    print("Openclaw container ready!")
     print(f"Dashboard: http://127.0.0.1:{args.host_port}/")
-    print(f"Shell: ./moltbot-lxd --shell")
-    print(f"Status: ./moltbot-lxd --list")
+    print(f"Shell: ./openclaw shell")
+    print(f"Status: ./openclaw list")
     if mounted_paths:
         print(f"Projects mounted at: /projects/")
     print("=" * 50)
     print("\nTo use browser control, launch Chrome on host:")
     print(f"  google-chrome --remote-debugging-port={CDP_PORT}")
-    print("\nRun 'moltbot onboard' inside the container to complete setup.")
+    print("\nRun 'clawdbot onboard' inside the container to complete setup.")
 
     return 0
 

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SIGNAL_CLI="${SIGNAL_CLI:-/home/moltbot/homebrew/bin/signal-cli}"
+SIGNAL_CLI="${SIGNAL_CLI:-/home/openclaw/homebrew/bin/signal-cli}"
 PHONE="${SIGNAL_PHONE:-+41798471964}"
 
 log() {

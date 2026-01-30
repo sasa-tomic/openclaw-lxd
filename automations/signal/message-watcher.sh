@@ -3,7 +3,7 @@
 # Triggers Clawdbot to draft replies in near real-time
 
 NOTES_DIR="/projects/Notes"
-STATE_FILE="/home/moltbot/clawd/memory/message-watcher-state.json"
+STATE_FILE="/home/openclaw/clawd/memory/message-watcher-state.json"
 SIGNAL_DIR="$NOTES_DIR/Signal"
 WHATSAPP_DIR="$NOTES_DIR/WhatsApp"
 CONTACTS_FILE="$HOME/.signal-cli/contacts.json"
