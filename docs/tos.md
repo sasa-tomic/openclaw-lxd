@@ -4,11 +4,11 @@
 
 ## Acceptance
 
-By using Moltbot Calendar Service ("the Service"), you agree to these terms.
+By using Openclaw ("the Service"), you agree to these terms.
 
 ## Description
 
-The Service provides calendar integration for the Moltbot automation platform, enabling automated calendar operations through Google Calendar API.
+The Service provides calendar integration for the automation platform, enabling automated calendar operations through Google Calendar API.
 
 ## Your Responsibilities
 

@@ -4,7 +4,7 @@
 
 ## Overview
 
-Moltbot Calendar Service ("the Service") accesses your Google Calendar data solely to perform calendar operations you request through the Moltbot automation platform.
+Openclaw ("the Service") accesses your Google Calendar data solely to perform calendar operations you request through the automation platform.
 
 ## Data We Access
 
@@ -22,7 +22,7 @@ We do not share, sell, or transfer your calendar data to any third parties.
 
 ## Data Retention
 
-OAuth tokens are stored only within your local Moltbot container. Deleting the container removes all stored credentials.
+OAuth tokens are stored only within your local Openclaw container. Deleting the container removes all stored credentials.
 
 ## Your Rights
 

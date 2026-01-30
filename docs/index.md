@@ -1,6 +1,6 @@
-# Moltbot Calendar Service
+# Openclaw
 
-Legal documents for Moltbot Calendar Service.
+Legal documents for Openclaw.
 
 - [Privacy Policy](privacy.md)
 - [Terms of Service](tos.md)
