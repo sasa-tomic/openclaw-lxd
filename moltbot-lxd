@@ -11,7 +11,7 @@ The container provides isolation, so Molt's internal Docker sandbox is disabled.
 Browser control uses your host's Chrome via CDP for manual captcha/login.
 
 Usage:
-    ./moltbot-lxd --projects ~/projects/myapp,~/other   # create with mounted dirs
+    ./moltbot-lxd --projects ~/projects/myapp ~/other   # create with mounted dirs
     ./moltbot-lxd --list                                # show status
     ./moltbot-lxd --shell                               # shell into container
     ./moltbot-lxd --destroy                             # remove container
