@@ -1,0 +1,583 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""
+LXD-based Moltbot runner.
+
+Creates an LXD container with Moltbot installed and project directories mounted.
+The container provides isolation, so Molt's internal Docker sandbox is disabled.
+Browser control uses your host's Chrome via CDP for manual captcha/login.
+
+Usage:
+    ./moltbot-lxd --projects ~/projects/myapp,~/other   # create with mounted dirs
+    ./moltbot-lxd --list                                # show status
+    ./moltbot-lxd --shell                               # shell into container
+    ./moltbot-lxd --destroy                             # remove container
+
+Browser:
+    Launch Chrome on host: google-chrome --remote-debugging-port=9222
+    Moltbot connects to your visible Chrome for captchas/logins.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from shlex import quote as shlex_quote
+from typing import Optional
+
+
+INSTANCE_NAME = "moltbot"
+DEFAULT_IMAGE = "ubuntu:24.04"
+DEFAULT_USER = "moltbot"
+NODE_VERSION = "22"
+GATEWAY_PORT = 18789
+CDP_PORT = 9222
+
+
+class MoltError(Exception):
+    """Setup error with context."""
+    pass
+
+
+def run(
+    cmd: list[str],
+    *,
+    check: bool = True,
+    capture: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run a command, fail fast with details on error."""
+    result = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+    if check and result.returncode != 0:
+        err = f"Command failed: {' '.join(cmd)}"
+        if capture:
+            if result.stdout:
+                err += f"\nstdout: {result.stdout.strip()}"
+            if result.stderr:
+                err += f"\nstderr: {result.stderr.strip()}"
+        raise MoltError(err)
+    return result
+
+
+def lxc_exec(
+    name: str,
+    cmd: list[str],
+    *,
+    user: str = "root",
+    check: bool = True,
+    env: Optional[dict[str, str]] = None,
+) -> subprocess.CompletedProcess[str]:
+    """Execute command in LXD instance."""
+    if user != "root":
+        shell_cmd = " ".join(shlex_quote(c) for c in cmd)
+        if env:
+            env_str = " ".join(f"{k}={shlex_quote(v)}" for k, v in env.items())
+            shell_cmd = f"{env_str} {shell_cmd}"
+        full_cmd = ["lxc", "exec", name, "--", "su", "-", user, "-c", shell_cmd]
+    else:
+        full_cmd = ["lxc", "exec", name, "--"]
+        if env:
+            full_cmd.extend(["env"] + [f"{k}={v}" for k, v in env.items()])
+        full_cmd.extend(cmd)
+    return run(full_cmd, check=check, capture=True)
+
+
+def instance_exists(name: str) -> bool:
+    """Check if LXD instance exists."""
+    result = run(["lxc", "info", name], check=False, capture=True)
+    return result.returncode == 0
+
+
+def instance_is_running(name: str) -> bool:
+    """Check if LXD instance is running."""
+    result = run(["lxc", "info", name], check=False, capture=True)
+    if result.returncode != 0:
+        return False
+    return "Status: RUNNING" in result.stdout
+
+
+def wait_for_cloud_init(name: str, timeout: int = 300) -> None:
+    """Wait for cloud-init to complete."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = lxc_exec(name, ["cloud-init", "status", "--wait"], check=False)
+        if result.returncode == 0 and "done" in result.stdout.lower():
+            return
+        time.sleep(2)
+    raise MoltError(f"cloud-init did not complete within {timeout}s")
+
+
+def wait_for_network(name: str, timeout: int = 60) -> None:
+    """Wait for network connectivity."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = lxc_exec(name, ["curl", "-sf", "--connect-timeout", "5", "https://nodejs.org"], check=False)
+        if result.returncode == 0:
+            return
+        time.sleep(2)
+    raise MoltError(f"Network not available within {timeout}s")
+
+
+def get_instance_ip(name: str) -> Optional[str]:
+    """Get instance IP address."""
+    result = run(["lxc", "list", name, "--format", "json"], capture=True)
+    instances = json.loads(result.stdout)
+    if not instances:
+        return None
+
+    network = instances[0].get("state", {}).get("network", {})
+    for iface, data in network.items():
+        if iface == "lo":
+            continue
+        for addr in data.get("addresses", []):
+            if addr.get("family") == "inet" and addr.get("scope") == "global":
+                return addr.get("address")
+    return None
+
+
+def create_instance(name: str, image: str) -> None:
+    """Create LXD container."""
+    run(["lxc", "launch", image, name])
+    print(f"Created container: {name}")
+
+
+def setup_user(name: str, user: str) -> None:
+    """Setup moltbot user by renaming the default ubuntu user."""
+    lxc_exec(name, ["usermod", "-l", user, "-d", f"/home/{user}", "-m", "ubuntu"], check=False)
+    lxc_exec(name, ["groupmod", "-n", user, "ubuntu"], check=False)
+
+
+def install_dependencies(name: str) -> None:
+    """Install system dependencies."""
+    lxc_exec(name, ["apt-get", "update"])
+    lxc_exec(name, ["apt-get", "install", "-y", "curl", "ca-certificates", "git"])
+
+
+def install_nodejs(name: str) -> None:
+    """Install Node.js via nodesource."""
+    # Use NodeSource for Node.js 22
+    lxc_exec(name, ["bash", "-c",
+        f"curl -fsSL https://deb.nodesource.com/setup_{NODE_VERSION}.x | bash -"
+    ])
+    lxc_exec(name, ["apt-get", "install", "-y", "nodejs"])
+
+    # Verify
+    result = lxc_exec(name, ["node", "--version"])
+    print(f"Node.js installed: {result.stdout.strip()}")
+
+
+def install_moltbot_interactive(name: str, user: str) -> None:
+    """Install moltbot via official installer with interactive TTY."""
+    home = f"/home/{user}"
+    npm_bin = f"{home}/.npm-global/bin"
+
+    # Run installer interactively so user can complete onboarding
+    subprocess.run(
+        ["lxc", "exec", name, "--", "su", "-", user, "-c",
+         "curl -fsSL https://molt.bot/install.sh | bash"],
+    )
+
+    # Add npm global bin to PATH in .bashrc
+    lxc_exec(name, ["bash", "-c",
+        f'grep -q ".npm-global/bin" {home}/.bashrc || echo \'export PATH="{npm_bin}:$PATH"\' >> {home}/.bashrc'
+    ], user=user)
+
+    # Playwright for full browser control (skip browser download - using host Chrome via CDP)
+    lxc_exec(name, ["bash", "-c",
+        f'export PATH="{npm_bin}:$PATH" PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 && npm install -g playwright'
+    ], user=user)
+
+    # Verify installation succeeded
+    result = lxc_exec(name, ["bash", "-c", f'export PATH="{npm_bin}:$PATH" && clawdbot --version'], user=user)
+    print(f"Moltbot installed: {result.stdout.strip()}")
+
+
+def mount_project(name: str, host_path: Path, user: str) -> str:
+    """Mount a project directory into the container."""
+    host_path = host_path.expanduser().resolve()
+    if not host_path.exists():
+        raise MoltError(f"Project path does not exist: {host_path}")
+
+    # Mount at /projects/<dirname>
+    container_path = f"/projects/{host_path.name}"
+    device_name = f"project-{host_path.name}"
+
+    # Create mount point
+    lxc_exec(name, ["mkdir", "-p", container_path])
+
+    # Add disk device with shift for UID mapping
+    run([
+        "lxc", "config", "device", "add", name, device_name, "disk",
+        f"source={host_path}",
+        f"path={container_path}",
+        "shift=true",
+    ], check=False)  # May already exist
+
+    print(f"Mounted {host_path} -> {container_path}")
+    return container_path
+
+
+def unmount_project(name: str, dir_name: str) -> None:
+    """Unmount a directory from the container."""
+    device_name = f"project-{dir_name}"
+    result = run(["lxc", "config", "device", "remove", name, device_name], check=False, capture=True)
+    if result.returncode == 0:
+        print(f"Unmounted {dir_name}")
+    else:
+        raise MoltError(f"Failed to unmount {dir_name}: {result.stderr.strip()}")
+
+
+def list_mounts(name: str) -> list[tuple[str, str]]:
+    """List mounted directories."""
+    result = run(["lxc", "config", "device", "show", name], capture=True)
+    mounts = []
+    current_device = None
+    source = path = None
+    for line in result.stdout.splitlines():
+        if line and not line.startswith(" "):
+            if current_device and current_device.startswith("project-") and source and path:
+                mounts.append((source, path))
+            current_device = line.rstrip(":")
+            source = path = None
+        elif "source:" in line:
+            source = line.split(":", 1)[1].strip()
+        elif "path:" in line:
+            path = line.split(":", 1)[1].strip()
+    if current_device and current_device.startswith("project-") and source and path:
+        mounts.append((source, path))
+    return mounts
+
+
+def get_host_ip(name: str) -> str:
+    """Get the host IP (LXD bridge gateway) from inside the container."""
+    # The default gateway from the container's perspective is the host
+    result = lxc_exec(name, ["ip", "route", "show", "default"])
+    # Output like: "default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.x metric 100"
+    parts = result.stdout.strip().split()
+    if "via" in parts:
+        idx = parts.index("via")
+        return parts[idx + 1]
+    raise MoltError("Could not determine host IP from container")
+
+
+def configure_moltbot(name: str, user: str, project_paths: list[str]) -> None:
+    """Configure moltbot settings."""
+    home = f"/home/{user}"
+    config_dir = f"{home}/.clawdbot"
+
+    lxc_exec(name, ["mkdir", "-p", config_dir], user=user)
+
+    # Get host IP for CDP connection
+    host_ip = get_host_ip(name)
+
+    # Create config with sandbox disabled (LXC provides isolation)
+    # and browser configured to use host's Chrome via CDP
+    config = {
+        "agents": {
+            "defaults": {
+                "sandbox": {
+                    "mode": "off"  # LXC provides isolation
+                }
+            }
+        },
+        "browser": {
+            "headless": False,
+            "cdpUrl": f"http://{host_ip}:{CDP_PORT}",
+        }
+    }
+
+    config_json = json.dumps(config, indent=2)
+    lxc_exec(name, ["bash", "-c", f"cat > {config_dir}/moltbot.json << 'EOF'\n{config_json}\nEOF"], user=user)
+
+    print(f"Moltbot configured (sandbox off, browser via {host_ip}:{CDP_PORT})")
+
+
+def create_systemd_service(name: str, user: str) -> None:
+    """Create systemd service for moltbot gateway."""
+    home = f"/home/{user}"
+    clawdbot_bin = f"{home}/.npm-global/bin/clawdbot"
+
+    service_content = f"""[Unit]
+Description=Moltbot Gateway
+After=network.target
+
+[Service]
+Type=simple
+User={user}
+Environment=HOME={home}
+Environment=PATH={home}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart={clawdbot_bin} gateway --port {GATEWAY_PORT} --allow-unconfigured
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    lxc_exec(name, ["bash", "-c", f"cat > /etc/systemd/system/moltbot.service << 'EOF'\n{service_content}\nEOF"])
+    lxc_exec(name, ["systemctl", "daemon-reload"])
+    lxc_exec(name, ["systemctl", "enable", "moltbot"])
+    print("Systemd service created: moltbot.service")
+
+
+def start_service(name: str) -> None:
+    """Start the moltbot service."""
+    lxc_exec(name, ["systemctl", "start", "moltbot"])
+    print("Moltbot gateway started")
+
+
+def stop_service(name: str) -> None:
+    """Stop the moltbot service."""
+    lxc_exec(name, ["systemctl", "stop", "moltbot"], check=False)
+
+
+def forward_port(name: str, host_port: int, container_port: int) -> None:
+    """Set up port forwarding from host to container."""
+    # LXD proxy device for port forwarding (0.0.0.0 needed for proxy to work)
+    run([
+        "lxc", "config", "device", "add", name, "gateway-port", "proxy",
+        f"listen=tcp:0.0.0.0:{host_port}",
+        f"connect=tcp:127.0.0.1:{container_port}",
+    ], check=False)
+    print(f"Port forwarded: localhost:{host_port} -> container:{container_port}")
+
+
+def show_status(name: str) -> None:
+    """Show moltbot container status."""
+    if not instance_exists(name):
+        print(f"Container '{name}' does not exist")
+        return
+
+    status = "Running" if instance_is_running(name) else "Stopped"
+    ip = get_instance_ip(name) or "-"
+
+    print(f"Container: {name}")
+    print(f"Status: {status}")
+    print(f"IP: {ip}")
+
+    if instance_is_running(name):
+        # Check service status
+        result = lxc_exec(name, ["systemctl", "is-active", "moltbot"], check=False)
+        svc_status = result.stdout.strip() if result.returncode == 0 else "unknown"
+        print(f"Service: {svc_status}")
+        print(f"Dashboard: http://127.0.0.1:{GATEWAY_PORT}/")
+
+    # List mounted directories
+    mounts = list_mounts(name)
+    if mounts:
+        print("Mounts:")
+        for source, path in mounts:
+            print(f"  {source} -> {path}")
+
+
+def destroy_instance(name: str) -> None:
+    """Destroy the moltbot container."""
+    if not instance_exists(name):
+        print(f"Container '{name}' does not exist")
+        return
+
+    run(["lxc", "stop", name, "--force"], check=False)
+    run(["lxc", "delete", name, "--force"])
+    print(f"Destroyed: {name}")
+
+
+def shell_into_instance(name: str, user: str) -> None:
+    """Open interactive shell in container."""
+    if not instance_exists(name):
+        raise MoltError(f"Container '{name}' does not exist")
+
+    if not instance_is_running(name):
+        run(["lxc", "start", name])
+
+    import os
+    os.execvp("lxc", ["lxc", "exec", name, "--", "su", "-", user])
+
+
+@dataclass
+class Args:
+    projects: list[Path] = field(default_factory=list)
+    image: str = DEFAULT_IMAGE
+    destroy: bool = False
+    list_status: bool = False
+    shell: bool = False
+    start: bool = False
+    stop: bool = False
+    host_port: int = GATEWAY_PORT
+    mount: list[Path] = field(default_factory=list)
+    unmount: list[str] = field(default_factory=list)
+
+
+def parse_args() -> Args:
+    p = argparse.ArgumentParser(
+        description="LXD-based Moltbot runner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--projects", type=Path, default=[], nargs='*',
+                   help="Project directories to mount")
+    p.add_argument("--image", default=DEFAULT_IMAGE,
+                   help=f"LXD image (default: {DEFAULT_IMAGE})")
+    p.add_argument("--destroy", action="store_true",
+                   help="Destroy the moltbot container")
+    p.add_argument("--list", dest="list_status", action="store_true",
+                   help="Show container status")
+    p.add_argument("--shell", action="store_true",
+                   help="Open shell in container")
+    p.add_argument("--start", action="store_true",
+                   help="Start the container and service")
+    p.add_argument("--stop", action="store_true",
+                   help="Stop the container")
+    p.add_argument("--port", type=int, default=GATEWAY_PORT,
+                   help=f"Host port for gateway (default: {GATEWAY_PORT})")
+    p.add_argument("--mount", type=Path, nargs='+', default=[],
+                   help="Mount directories to existing container")
+    p.add_argument("--unmount", nargs='+', default=[],
+                   help="Unmount directories by name (e.g., Documents)")
+
+    args = p.parse_args()
+
+    return Args(
+        projects=args.projects,
+        image=args.image,
+        destroy=args.destroy,
+        list_status=args.list_status,
+        shell=args.shell,
+        start=args.start,
+        stop=args.stop,
+        host_port=args.port,
+        mount=args.mount,
+        unmount=args.unmount,
+    )
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.list_status:
+        show_status(INSTANCE_NAME)
+        return 0
+
+    if args.destroy:
+        destroy_instance(INSTANCE_NAME)
+        return 0
+
+    if args.shell:
+        shell_into_instance(INSTANCE_NAME, DEFAULT_USER)
+        return 0  # Won't reach here due to exec
+
+    if args.stop:
+        if instance_exists(INSTANCE_NAME) and instance_is_running(INSTANCE_NAME):
+            stop_service(INSTANCE_NAME)
+            run(["lxc", "stop", INSTANCE_NAME])
+            print("Container stopped")
+        return 0
+
+    if args.start:
+        if not instance_exists(INSTANCE_NAME):
+            print(f"Container '{INSTANCE_NAME}' does not exist. Create it first with --projects.")
+            return 1
+        if not instance_is_running(INSTANCE_NAME):
+            run(["lxc", "start", INSTANCE_NAME])
+        start_service(INSTANCE_NAME)
+        show_status(INSTANCE_NAME)
+        return 0
+
+    if args.mount:
+        if not instance_exists(INSTANCE_NAME):
+            print(f"Container '{INSTANCE_NAME}' does not exist.")
+            return 1
+        for path in args.mount:
+            mount_project(INSTANCE_NAME, path, DEFAULT_USER)
+        return 0
+
+    if args.unmount:
+        if not instance_exists(INSTANCE_NAME):
+            print(f"Container '{INSTANCE_NAME}' does not exist.")
+            return 1
+        for name in args.unmount:
+            unmount_project(INSTANCE_NAME, name)
+        return 0
+
+    # Default: create/update container
+    if instance_exists(INSTANCE_NAME):
+        if instance_is_running(INSTANCE_NAME):
+            print(f"Container '{INSTANCE_NAME}' already exists and is running.")
+            print("Use --mount/--unmount to manage dirs, --shell to access, or --list for status.")
+            return 0
+        run(["lxc", "start", INSTANCE_NAME])
+        print(f"Started existing container: {INSTANCE_NAME}")
+        # Mount any new projects
+        for project in args.projects:
+            mount_project(INSTANCE_NAME, project, DEFAULT_USER)
+        start_service(INSTANCE_NAME)
+        show_status(INSTANCE_NAME)
+        return 0
+
+    # Create new container
+    print(f"Creating moltbot container...")
+    create_instance(INSTANCE_NAME, args.image)
+
+    print("Waiting for container to be ready...")
+    wait_for_cloud_init(INSTANCE_NAME)
+    wait_for_network(INSTANCE_NAME)
+
+    print("Setting up user and dependencies...")
+    setup_user(INSTANCE_NAME, DEFAULT_USER)
+    install_dependencies(INSTANCE_NAME)
+
+    print("Installing Node.js...")
+    install_nodejs(INSTANCE_NAME)
+
+    print("Installing Moltbot...")
+    install_moltbot_interactive(INSTANCE_NAME, DEFAULT_USER)
+
+    # Mount projects
+    mounted_paths = []
+    for project in args.projects:
+        container_path = mount_project(INSTANCE_NAME, project, DEFAULT_USER)
+        mounted_paths.append(container_path)
+
+    # Configure moltbot
+    configure_moltbot(INSTANCE_NAME, DEFAULT_USER, mounted_paths)
+
+    # Setup and start service
+    create_systemd_service(INSTANCE_NAME, DEFAULT_USER)
+    forward_port(INSTANCE_NAME, args.host_port, GATEWAY_PORT)
+    start_service(INSTANCE_NAME)
+
+    print("\n" + "=" * 50)
+    print("Moltbot container ready!")
+    print(f"Dashboard: http://127.0.0.1:{args.host_port}/")
+    print(f"Shell: ./moltbot-lxd --shell")
+    print(f"Status: ./moltbot-lxd --list")
+    if mounted_paths:
+        print(f"Projects mounted at: /projects/")
+    print("=" * 50)
+    print("\nTo use browser control, launch Chrome on host:")
+    print(f"  google-chrome --remote-debugging-port={CDP_PORT}")
+    print("\nRun 'moltbot onboard' inside the container to complete setup.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except MoltError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        sys.exit(130)
