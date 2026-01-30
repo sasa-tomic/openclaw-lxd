@@ -11,10 +11,13 @@ The container provides isolation, so Molt's internal Docker sandbox is disabled.
 Browser control uses your host's Chrome via CDP for manual captcha/login.
 
 Usage:
-    ./moltbot-lxd --projects ~/projects/myapp ~/other   # create with mounted dirs
-    ./moltbot-lxd --list                                # show status
-    ./moltbot-lxd --shell                               # shell into container
-    ./moltbot-lxd --destroy                             # remove container
+    ./moltbot-lxd create --projects ~/myapp ~/other   # create with mounted dirs
+    ./moltbot-lxd list                                # show status
+    ./moltbot-lxd shell                               # shell into container
+    ./moltbot-lxd destroy                             # remove container
+    ./moltbot-lxd port-forward 8080:80 33495          # forward ports (kubectl style)
+    ./moltbot-lxd mount ~/Documents                   # mount directory
+    ./moltbot-lxd unmount Documents                   # unmount directory
 
 Browser:
     Launch Chrome on host: google-chrome --remote-debugging-port=9222
@@ -354,6 +357,50 @@ def forward_port(name: str, host_port: int, container_port: int) -> None:
     print(f"Port forwarded: localhost:{host_port} -> container:{container_port}")
 
 
+def parse_port_spec(spec: str) -> tuple[int, int]:
+    """Parse port spec like '8080:80' or '8080' into (local, remote)."""
+    if ':' in spec:
+        parts = spec.split(':')
+        if len(parts) != 2:
+            raise MoltError(f"Invalid port spec: {spec}")
+        return int(parts[0]), int(parts[1])
+    port = int(spec)
+    return port, port
+
+
+def port_forward_interactive(name: str, port_specs: list[str]) -> int:
+    """Forward ports and wait for Ctrl+C, cleaning up on exit."""
+    if not instance_exists(name):
+        raise MoltError(f"Container '{name}' does not exist")
+    if not instance_is_running(name):
+        raise MoltError(f"Container '{name}' is not running")
+
+    devices: list[str] = []
+    try:
+        for spec in port_specs:
+            local_port, remote_port = parse_port_spec(spec)
+            device_name = f"pf-{local_port}-{remote_port}"
+
+            run([
+                "lxc", "config", "device", "add", name, device_name, "proxy",
+                f"listen=tcp:0.0.0.0:{local_port}",
+                f"connect=tcp:127.0.0.1:{remote_port}",
+            ])
+            devices.append(device_name)
+            print(f"Forwarding localhost:{local_port} -> {name}:{remote_port}")
+
+        print("Press Ctrl+C to stop")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        for device_name in devices:
+            run(["lxc", "config", "device", "remove", name, device_name], check=False)
+            print(f"Stopped forwarding {device_name}")
+    return 0
+
+
 def show_status(name: str) -> None:
     """Show moltbot container status."""
     if not instance_exists(name):
@@ -407,16 +454,13 @@ def shell_into_instance(name: str, user: str) -> None:
 
 @dataclass
 class Args:
+    command: Optional[str] = None
     projects: list[Path] = field(default_factory=list)
     image: str = DEFAULT_IMAGE
-    destroy: bool = False
-    list_status: bool = False
-    shell: bool = False
-    start: bool = False
-    stop: bool = False
     host_port: int = GATEWAY_PORT
     mount: list[Path] = field(default_factory=list)
     unmount: list[str] = field(default_factory=list)
+    port_forward: list[str] = field(default_factory=list)
 
 
 def parse_args() -> Args:
@@ -425,96 +469,105 @@ def parse_args() -> Args:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--projects", type=Path, default=[], nargs='*',
-                   help="Project directories to mount")
-    p.add_argument("--image", default=DEFAULT_IMAGE,
-                   help=f"LXD image (default: {DEFAULT_IMAGE})")
-    p.add_argument("--destroy", action="store_true",
-                   help="Destroy the moltbot container")
-    p.add_argument("--list", dest="list_status", action="store_true",
-                   help="Show container status")
-    p.add_argument("--shell", action="store_true",
-                   help="Open shell in container")
-    p.add_argument("--start", action="store_true",
-                   help="Start the container and service")
-    p.add_argument("--stop", action="store_true",
-                   help="Stop the container")
-    p.add_argument("--port", type=int, default=GATEWAY_PORT,
-                   help=f"Host port for gateway (default: {GATEWAY_PORT})")
-    p.add_argument("--mount", type=Path, nargs='+', default=[],
-                   help="Mount directories to existing container")
-    p.add_argument("--unmount", nargs='+', default=[],
-                   help="Unmount directories by name (e.g., Documents)")
+    sub = p.add_subparsers(dest="command")
+
+    # port-forward subcommand
+    pf = sub.add_parser("port-forward", help="Forward ports to container (kubectl style)")
+    pf.add_argument("ports", nargs='+', metavar="[LOCAL:]REMOTE",
+                    help="Ports to forward (e.g., 8080:80 or 8080)")
+
+    # Other subcommands
+    sub.add_parser("list", help="Show container status")
+    sub.add_parser("shell", help="Open shell in container")
+    sub.add_parser("start", help="Start container and service")
+    sub.add_parser("stop", help="Stop container")
+    sub.add_parser("destroy", help="Destroy container")
+
+    # mount/unmount
+    mnt = sub.add_parser("mount", help="Mount directories to container")
+    mnt.add_argument("paths", type=Path, nargs='+', help="Directories to mount")
+
+    umnt = sub.add_parser("unmount", help="Unmount directories from container")
+    umnt.add_argument("names", nargs='+', help="Directory names to unmount")
+
+    # create (default action when no subcommand)
+    create = sub.add_parser("create", help="Create container with mounted projects")
+    create.add_argument("--projects", type=Path, default=[], nargs='*',
+                        help="Project directories to mount")
+    create.add_argument("--image", default=DEFAULT_IMAGE,
+                        help=f"LXD image (default: {DEFAULT_IMAGE})")
+    create.add_argument("--port", type=int, default=GATEWAY_PORT,
+                        help=f"Host port for gateway (default: {GATEWAY_PORT})")
 
     args = p.parse_args()
 
-    return Args(
-        projects=args.projects,
-        image=args.image,
-        destroy=args.destroy,
-        list_status=args.list_status,
-        shell=args.shell,
-        start=args.start,
-        stop=args.stop,
-        host_port=args.port,
-        mount=args.mount,
-        unmount=args.unmount,
-    )
+    result = Args(command=args.command)
+    if args.command == "port-forward":
+        result.port_forward = args.ports
+    elif args.command == "mount":
+        result.mount = args.paths
+    elif args.command == "unmount":
+        result.unmount = args.names
+    elif args.command == "create":
+        result.projects = args.projects
+        result.image = args.image
+        result.host_port = args.port
+    return result
 
 
 def main() -> int:
     args = parse_args()
 
-    if args.list_status:
+    if args.command == "list":
         show_status(INSTANCE_NAME)
         return 0
 
-    if args.destroy:
+    if args.command == "destroy":
         destroy_instance(INSTANCE_NAME)
         return 0
 
-    if args.shell:
+    if args.command == "shell":
         shell_into_instance(INSTANCE_NAME, DEFAULT_USER)
         return 0  # Won't reach here due to exec
 
-    if args.stop:
+    if args.command == "stop":
         if instance_exists(INSTANCE_NAME) and instance_is_running(INSTANCE_NAME):
             stop_service(INSTANCE_NAME)
             run(["lxc", "stop", INSTANCE_NAME])
             print("Container stopped")
         return 0
 
-    if args.start:
+    if args.command == "start":
         if not instance_exists(INSTANCE_NAME):
-            print(f"Container '{INSTANCE_NAME}' does not exist. Create it first with --projects.")
-            return 1
+            raise MoltError(f"Container '{INSTANCE_NAME}' does not exist. Create it first.")
         if not instance_is_running(INSTANCE_NAME):
             run(["lxc", "start", INSTANCE_NAME])
         start_service(INSTANCE_NAME)
         show_status(INSTANCE_NAME)
         return 0
 
-    if args.mount:
+    if args.command == "mount":
         if not instance_exists(INSTANCE_NAME):
-            print(f"Container '{INSTANCE_NAME}' does not exist.")
-            return 1
+            raise MoltError(f"Container '{INSTANCE_NAME}' does not exist.")
         for path in args.mount:
             mount_project(INSTANCE_NAME, path, DEFAULT_USER)
         return 0
 
-    if args.unmount:
+    if args.command == "unmount":
         if not instance_exists(INSTANCE_NAME):
-            print(f"Container '{INSTANCE_NAME}' does not exist.")
-            return 1
+            raise MoltError(f"Container '{INSTANCE_NAME}' does not exist.")
         for name in args.unmount:
             unmount_project(INSTANCE_NAME, name)
         return 0
 
-    # Default: create/update container
+    if args.command == "port-forward":
+        return port_forward_interactive(INSTANCE_NAME, args.port_forward)
+
+    # Default (no command or "create"): create/update container
     if instance_exists(INSTANCE_NAME):
         if instance_is_running(INSTANCE_NAME):
             print(f"Container '{INSTANCE_NAME}' already exists and is running.")
-            print("Use --mount/--unmount to manage dirs, --shell to access, or --list for status.")
+            print("Use mount/unmount to manage dirs, shell to access, or list for status.")
             return 0
         run(["lxc", "start", INSTANCE_NAME])
         print(f"Started existing container: {INSTANCE_NAME}")
