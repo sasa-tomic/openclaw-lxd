@@ -74,7 +74,7 @@ check_file() {
             echo "[$(date -Iseconds)] New messages in: $file (contact: $contact, platform: $platform)"
             
             # Trigger agent to draft a reply
-            clawdbot agent --channel telegram --to 5996479639 --deliver --message "📨 New incoming message - draft a reply if appropriate
+            openclaw agent --channel telegram --to 5996479639 --deliver --message "📨 New incoming message - draft a reply if appropriate
 
 Platform: $platform
 Contact: $contact
