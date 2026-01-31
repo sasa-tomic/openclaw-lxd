@@ -1,0 +1,22 @@
+[Unit]
+Description=Obsidian Note Watcher - monitors notes and wakes OpenClaw
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/projects/automations/obsidian/.venv/bin/python /projects/automations/obsidian/obsidian-watcher.py
+WorkingDirectory=/projects/automations/obsidian
+Restart=always
+RestartSec=10
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Security hardening (optional)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/projects/Notes
+
+[Install]
+WantedBy=default.target
