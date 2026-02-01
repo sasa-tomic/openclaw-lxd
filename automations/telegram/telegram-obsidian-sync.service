@@ -1,0 +1,24 @@
+[Unit]
+Description=Telegram to Obsidian Sync
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/projects/automations/telegram/.venv/bin/python /projects/automations/telegram/telegram-sync.py
+WorkingDirectory=/projects/automations/telegram
+Restart=always
+RestartSec=30
+
+# Environment
+EnvironmentFile=/projects/automations/telegram/.env
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=append:/projects/automations/telegram/sync.log
+StandardError=append:/projects/automations/telegram/sync.log
+
+[Install]
+WantedBy=default.target

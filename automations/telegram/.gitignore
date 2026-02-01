@@ -1,0 +1,21 @@
+# Credentials
+.env
+
+# Session files (contain auth tokens!)
+.session/
+
+# State tracking
+.state/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+*.log
