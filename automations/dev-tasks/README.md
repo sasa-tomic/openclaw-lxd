@@ -1,100 +1,181 @@
-# Dev Task Manager
+# Dev Pipeline - Usage
 
-Automated task tracking and agent spawning for development work.
+**Updated:** 2026-02-01 - Now runs every 4 hours with per-project locking
 
-## Overview
+---
 
-- **Task files:** `/projects/Notes/Pickle/dev-tasks/` (Obsidian, synced)
-- **Pipeline state:** `~/clawd/memory/dev-pipeline-state.json`
-- **Cron job:** `nightly-dev-run` (02:00 CET)
+## Quick Start
 
-## Pipeline Flow
-
-```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  BACKLOG    │ ──▶ │  IMPLEMENT   │ ──▶ │   VERIFY    │
-│  (P0/P1)    │     │   (agent)    │     │   (agent)   │
-└─────────────┘     └──────────────┘     └─────────────┘
-                           │                    │
-                           │              ┌─────┴─────┐
-                           │              │           │
-                           ▼              ▼           ▼
-                    BLOCKED          CHANGES?     CLEAN
-                    (stop)           (retry ×3)   (commit)
-                                          │           │
-                                          └─────┬─────┘
-                                                ▼
-                                        ┌─────────────┐
-                                        │    DONE     │
-                                        └─────────────┘
-```
-
-- **Implement:** Fresh agent implements task, runs relevant tests
-- **Verify:** Different agent with fresh context, runs full test suite
-- **Retry:** If verifier makes changes, re-verify (max 3 attempts)
-- **Commit:** Only if verification passes with clean git diff
-
-## Task Files
-
-| File | Purpose |
-|------|---------|
-| `BACKLOG.md` | Prioritized queue (P0-P3) |
-| `IN-PROGRESS.md` | Currently being worked on |
-| `BLOCKED.md` | Waiting on dependencies |
-| `DONE.md` | Completed (rolling log) |
-
-## Task Format
-
-```markdown
-## [P1] Task title here
-- ID: unique-id
-- Project: decent-cloud
-- Created: 2026-01-31
-- Context: Description and any relevant notes
-```
-
-Priority levels: P0 (critical), P1 (high), P2 (medium), P3 (low)
-
-## Scripts
-
-### add_task.py
-Add a task to the backlog:
+### Manual Run (Specific Task)
 ```bash
-python3 add_task.py "Task title" -p decent-cloud -P P1 -c "Context here"
+cd /projects/automations/dev-tasks && python3 unified_pipeline.py manual --task-id <id>
 ```
 
-### nightly_dev_run.py
-Called by cron at 02:00. Picks highest priority task, outputs spawn request.
+### Manual Run (Next P0/P1 Task)
 ```bash
-python3 nightly_dev_run.py
-# Output: JSON with action=spawn or action=skip
+cd /projects/automations/dev-tasks && python3 unified_pipeline.py manual --next
 ```
 
-### agent_monitor.py
-Called by cron every 4h. Checks agent status, detects stuck agents.
+### Check Pipeline Status
 ```bash
-python3 agent_monitor.py
-# Output: JSON status report
-
-# Mark task complete/blocked/failed:
-python3 agent_monitor.py complete <task_id> "Result description"
-python3 agent_monitor.py blocked <task_id> "Reason"
-python3 agent_monitor.py failed <task_id> "Reason"
+cd /projects/automations/dev-tasks && python3 unified_pipeline.py status
 ```
 
-### task_manager.py
-Core library. Also initializes files when run directly:
+### Force Unlock (Emergency Only)
 ```bash
-python3 task_manager.py
+cd /projects/automations/dev-tasks && python3 unified_pipeline.py unlock <project>
+# Example: python3 unified_pipeline.py unlock decent-cloud
 ```
 
-## Workflow
+---
 
-1. Tasks added to BACKLOG.md (manually or via add_task.py)
-2. Nightly job (02:00) picks top task → spawns agent → moves to IN-PROGRESS
-3. Monitor job (every 4h) checks progress, alerts if stuck
-4. On completion: moves to DONE with result
+## Automation
 
-## Concurrency
+**Cron schedule:** Every 4 hours (`0 */4 * * *`)
 
-Max 2 concurrent agents (configurable in nightly_dev_run.py).
+**Next runs:**
+- 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 (CET)
+
+**Jobs:**
+- `unified-dev-run-every-4h` - Runs `unified_pipeline.py automated`
+- `hourly-note-review` - Runs note watcher
+- `agent-monitor` - Monitors active dev agents
+
+---
+
+## Per-Project Locking
+
+Each project has independent lock file:
+
+| Project | Lock File | State File |
+|---------|-----------|-------------|
+| decent-cloud | `memory/dev-pipeline-decent-cloud.lock` | `memory/dev-pipeline-state-decent-cloud.json` |
+| voki | `memory/dev-pipeline-voki.lock` | `memory/dev-pipeline-state-voki.json` |
+
+**Projects run independently** - no cross-blocking.
+
+---
+
+## Pipeline Flow (All Steps)
+
+```
+Step 0: Resume Check
+  ↓
+Step 1: Start (pick next P0/P1 task)
+  ↓
+Step 2: Preflight (clean slate)
+  ↓
+Step 3: Implement (45 min timeout)
+  ↓
+Step 4: Verify (fresh agent, max 3 retries)
+  ↓
+Step 5: Commit (if verified clean)
+  ↓
+Step 6: Next/Done (check for more tasks)
+```
+
+**Timeouts:**
+- Preflight: 45 min
+- Implementation: 45 min
+- Verification: 45 min (max 3 attempts)
+- Total batch: 2 hours
+
+---
+
+## Lock Management
+
+**Auto-cleanup:**
+- Locks release on completion (success/failure)
+- Signal traps (SIGINT, SIGTERM, etc.) trigger cleanup
+- Stale locks (>2h old) are auto-broken
+
+**Manual override:**
+```bash
+python3 unified_pipeline.py unlock <project>
+```
+
+Use only if pipeline is truly stuck (process crashed without cleanup).
+
+---
+
+## State Tracking
+
+**Per-project state files** track:
+- Current status (idle, preflight, implementing, verifying, committing, done, failed)
+- Current task ID and title
+- Verify attempts (max 3)
+- Session keys of spawned agents
+- Completed tasks list
+- Running by (manual/automated)
+
+**Example state:**
+```json
+{
+  "status": "implementing",
+  "current_task_id": "dc-regions",
+  "current_task_title": "Move geographic region mapping to shared crate",
+  "project": "decent-cloud",
+  "verify_attempts": 0,
+  "running_by": "manual"
+}
+```
+
+---
+
+## Error Recovery
+
+### Stale Lock Detected
+```
+⚠️  Found stale lock (PID 12345 not running)
+   Removing stale lock for 'decent-cloud'...
+```
+→ Lock auto-removed, pipeline proceeds normally.
+
+### Process Killed (Ctrl+C)
+```
+🛑 Signal received, cleaning up...
+   Lock released for 'decent-cloud'
+```
+→ Cleanup runs, lock removed.
+
+### Both Manual + Cron Race
+```
+❌ Project 'decent-cloud' already locked
+   Locked by: manual
+   Locked at: 2026-02-01T12:55:00Z
+   PID: 54321
+   Task: dc-regions
+```
+→ Cron skips, manual continues uninterrupted.
+
+---
+
+## Troubleshooting
+
+### Pipeline Won't Start
+```bash
+# Check if locked
+python3 unified_pipeline.py status
+
+# Force unlock (if stale)
+python3 unified_pipeline.py unlock decent-cloud
+```
+
+### Agent Won't Spawn
+- Check gateway logs for spawn errors
+- Verify `runTimeoutSeconds: 2700` is being used
+- Check available agent IDs with `agents_list`
+
+### Lock File Corruption
+- Delete lock file manually:
+  ```bash
+  rm -f /home/openclaw/clawd/memory/dev-pipeline-*.lock
+  ```
+- Reset state:
+  ```bash
+  rm -f /home/openclaw/clawd/memory/dev-pipeline-state-*.json
+  ```
+
+---
+
+*For detailed process rules, see `/home/openclaw/clawd/docs/DEV_PROCESS.md`*
