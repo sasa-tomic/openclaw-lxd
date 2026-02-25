@@ -1,0 +1,20 @@
+[Unit]
+Description=Prefect worker for Twitter automation
+Documentation=https://docs.prefect.io
+After=twitter-prefect-server.service
+Wants=twitter-prefect-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/projects/automations/twitter
+Environment="PATH=/home/openclaw/.npm-global/bin:/home/openclaw/homebrew/bin:/home/openclaw/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PREFECT_API_URL=http://127.0.0.1:4200/api"
+EnvironmentFile=/home/openclaw/.openclaw/.env
+ExecStart=/home/openclaw/.local/bin/uv run prefect worker start --pool twitter-automation
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
