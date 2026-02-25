@@ -15,14 +15,17 @@ Task format in markdown:
 Where PRIORITY is: P0 (critical), P1 (high), P2 (medium), P3 (low)
 """
 
-import json
 import re
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import Optional
 import uuid
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib.state_utils import load_state as _load_state, save_state as _save_state
 
 # Paths
 TASKS_DIR = Path("/projects/Notes/Pickle/dev-tasks")
@@ -66,42 +69,41 @@ class State:
 
 def load_state() -> State:
     """Load machine state from JSON."""
-    if STATE_FILE.exists():
-        data = json.loads(STATE_FILE.read_text())
-        active = {}
-        for tid, agent_data in data.get("active_agents", {}).items():
-            active[tid] = AgentRun(**agent_data)
-        return State(
-            active_agents=active,
-            last_nightly_run=data.get("last_nightly_run"),
-            last_monitor_run=data.get("last_monitor_run"),
-        )
-    return State(active_agents={})
+    data = _load_state(STATE_FILE)
+    active = {}
+    for tid, agent_data in data.get("active_agents", {}).items():
+        active[tid] = AgentRun(**agent_data)
+    return State(
+        active_agents=active,
+        last_nightly_run=data.get("last_nightly_run"),
+        last_monitor_run=data.get("last_monitor_run"),
+    )
 
 
 def save_state(state: State):
     """Save machine state to JSON."""
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {
-        "active_agents": {tid: asdict(agent) for tid, agent in state.active_agents.items()},
+        "active_agents": {
+            tid: asdict(agent) for tid, agent in state.active_agents.items()
+        },
         "last_nightly_run": state.last_nightly_run,
         "last_monitor_run": state.last_monitor_run,
     }
-    STATE_FILE.write_text(json.dumps(data, indent=2))
+    _save_state(STATE_FILE, data)
 
 
 def parse_tasks(filepath: Path) -> list[Task]:
     """Parse tasks from a markdown file."""
     if not filepath.exists():
         return []
-    
+
     content = filepath.read_text()
     tasks = []
-    
+
     # Split by task headers (## [P0] Title format)
-    pattern = r'^## \[(P[0-3])\] (.+?)$'
+    pattern = r"^## \[(P[0-3])\] (.+?)$"
     blocks = re.split(pattern, content, flags=re.MULTILINE)
-    
+
     # blocks[0] is content before first task (header/intro)
     # then [priority, title, body, priority, title, body, ...]
     i = 1
@@ -109,7 +111,7 @@ def parse_tasks(filepath: Path) -> list[Task]:
         priority = blocks[i]
         title = blocks[i + 1].strip()
         body = blocks[i + 2] if i + 2 < len(blocks) else ""
-        
+
         # Parse body for metadata
         task_id = _extract_field(body, "ID") or str(uuid.uuid4())[:8]
         project = _extract_field(body, "Project") or "unknown"
@@ -120,33 +122,35 @@ def parse_tasks(filepath: Path) -> list[Task]:
         blocked_reason = _extract_field(body, "Blocked")
         completed_at = _extract_field(body, "Completed")
         result = _extract_field(body, "Result")
-        
-        tasks.append(Task(
-            id=task_id,
-            title=title,
-            priority=priority,
-            project=project,
-            created=created,
-            context=context,
-            agent_session=agent_session,
-            started_at=started_at,
-            blocked_reason=blocked_reason,
-            completed_at=completed_at,
-            result=result,
-        ))
+
+        tasks.append(
+            Task(
+                id=task_id,
+                title=title,
+                priority=priority,
+                project=project,
+                created=created,
+                context=context,
+                agent_session=agent_session,
+                started_at=started_at,
+                blocked_reason=blocked_reason,
+                completed_at=completed_at,
+                result=result,
+            )
+        )
         i += 3
-    
+
     return tasks
 
 
 def _extract_field(body: str, field: str) -> Optional[str]:
     """Extract a field value from task body."""
-    pattern = rf'^\s*-?\s*\*?\*?{field}\*?\*?:\s*(.+?)$'
+    pattern = rf"^\s*-?\s*\*?\*?{field}\*?\*?:\s*(.+?)$"
     match = re.search(pattern, body, re.MULTILINE | re.IGNORECASE)
     if match:
         value = match.group(1).strip()
         # Remove any leading ** from markdown bold
-        value = re.sub(r'^\*\*\s*', '', value)
+        value = re.sub(r"^\*\*\s*", "", value)
         return value
     return None
 
@@ -192,11 +196,13 @@ def get_top_backlog_task() -> Optional[Task]:
     return tasks[0]
 
 
-def move_task(task_id: str, from_file: Path, to_file: Path, updates: dict = None):
+def move_task(
+    task_id: str, from_file: Path, to_file: Path, updates: dict | None = None
+):
     """Move a task from one file to another, optionally updating fields."""
     from_tasks = parse_tasks(from_file)
     to_tasks = parse_tasks(to_file)
-    
+
     task = None
     remaining = []
     for t in from_tasks:
@@ -204,21 +210,21 @@ def move_task(task_id: str, from_file: Path, to_file: Path, updates: dict = None
             task = t
         else:
             remaining.append(t)
-    
+
     if not task:
         raise ValueError(f"Task {task_id} not found in {from_file}")
-    
+
     # Apply updates
     if updates:
         for key, value in updates.items():
             if hasattr(task, key):
                 setattr(task, key, value)
-    
+
     to_tasks.insert(0, task)  # Add to top
-    
+
     write_tasks(from_file, remaining, _get_header(from_file))
     write_tasks(to_file, to_tasks, _get_header(to_file))
-    
+
     return task
 
 
@@ -243,13 +249,13 @@ def add_task(title: str, project: str, priority: str, context: str) -> Task:
         created=datetime.now().strftime("%Y-%m-%d"),
         context=context,
     )
-    
+
     tasks = parse_tasks(BACKLOG)
     tasks.append(task)
     # Sort by priority
     tasks.sort(key=lambda t: t.priority)
     write_tasks(BACKLOG, tasks, _get_header(BACKLOG))
-    
+
     return task
 
 

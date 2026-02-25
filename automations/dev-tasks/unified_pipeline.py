@@ -22,15 +22,21 @@ import signal
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
-from dataclasses import dataclass
+from models import PipelineState
 
 # Import task management
 sys.path.insert(0, str(Path(__file__).parent))
 from task_manager import (
-    parse_tasks, move_task, write_tasks,
-    BACKLOG, IN_PROGRESS, BLOCKED, DONE,
-    Task
+    parse_tasks,
+    move_task,
+    write_tasks,
+    BACKLOG,
+    IN_PROGRESS,
+    BLOCKED,
+    DONE,
+    Task,
 )
+from shared_config import PROJECT_CONFIGS, get_project_config as _get_project_config
 
 # Paths
 WORKSPACE = Path.home() / "clawd"
@@ -47,34 +53,6 @@ STATE_FILES = {
 LOCK_FILES = {
     "decent-cloud": MEMORY_DIR / "dev-pipeline-decent-cloud.lock",
     "voki": MEMORY_DIR / "dev-pipeline-voki.lock",
-}
-
-# Project configs
-PROJECT_CONFIGS = {
-    "decent-cloud": {
-        "repo_path": "/projects/decent-cloud",
-        "test_command": "cargo test",
-        "agents_md": "/projects/decent-cloud/AGENTS.md",
-        "pre_impl_read": [
-            "/projects/decent-cloud/AGENTS.md",
-            "/projects/Notes/Pickle/memory/decent-cloud-dev.md",
-        ],
-        "dev_process": "/home/openclaw/clawd/docs/DEV_PROCESS.md",
-    },
-    "voki": {
-        "repo_path": "/projects/voice-ai-agent",
-        "test_command": "pytest",
-        "agents_md": "/projects/voice-ai-agent/AGENTS.md",
-        "pre_impl_read": [],
-        "dev_process": "/home/openclaw/clawd/docs/DEV_PROCESS.md",
-    },
-    "default": {
-        "repo_path": None,
-        "test_command": "echo 'No test command configured'",
-        "agents_md": None,
-        "pre_impl_read": [],
-        "dev_process": "/home/openclaw/clawd/docs/DEV_PROCESS.md",
-    }
 }
 
 # Global state for cleanup
@@ -94,7 +72,7 @@ def get_project_state_file(project: str) -> Path:
 
 def get_project_config(project: str) -> dict:
     """Get configuration for a project."""
-    return PROJECT_CONFIGS.get(project, PROJECT_CONFIGS["default"])
+    return _get_project_config(project)
 
 
 def acquire_lock(project: str, mode: str = "unknown") -> bool:
@@ -173,28 +151,6 @@ def release_lock(project: Optional[str] = None):
         print(f"🔓 Lock released for '{lock_file.stem.replace('dev-pipeline-', '')}'")
 
 
-@dataclass
-class PipelineState:
-    """Tracks current position in dev pipeline."""
-    status: str = "idle"  # idle, preflight, implementing, verifying, committing, done, failed
-    current_task_id: Optional[str] = None
-    current_task_title: Optional[str] = None
-    project: Optional[str] = None
-    verify_attempts: int = 0
-    max_verify_attempts: int = 3
-    impl_session_key: Optional[str] = None
-    verify_session_key: Optional[str] = None
-    batch_started_at: Optional[str] = None
-    completed_tasks: list = None
-    failed_task: Optional[str] = None
-    error_message: Optional[str] = None
-    running_by: str = "unknown"  # manual or automated
-
-    def __post_init__(self):
-        if self.completed_tasks is None:
-            self.completed_tasks = []
-
-
 def load_pipeline_state(project: str) -> PipelineState:
     """Load pipeline state from JSON."""
     state_file = get_project_state_file(project)
@@ -249,7 +205,11 @@ def build_implementation_prompt(task: Task) -> str:
     if repo_path:
         repo_note = f"\n**Repository:** `{repo_path}`"
 
-    test_cmd = f'"{config["test_command"]}"' if " " in config["test_command"] else config["test_command"]
+    test_cmd = (
+        f'"{config["test_command"]}"'
+        if " " in config["test_command"]
+        else config["test_command"]
+    )
     test_note = f"\n**Test command:** `{config['test_command']}`"
 
     return f"""You are implementing a development task. Focus on clean, production-ready code.
@@ -299,7 +259,11 @@ def build_verification_prompt(task: Task, attempt: int) -> str:
     """Build prompt for verification agent."""
     config = get_project_config(task.project)
     repo_path = config["repo_path"]
-    test_cmd = f'"{config["test_command"]}"' if " " in config["test_command"] else config["test_command"]
+    test_cmd = (
+        f'"{config["test_command"]}"'
+        if " " in config["test_command"]
+        else config["test_command"]
+    )
 
     return f"""You are verifying a code implementation. You have fresh context - no knowledge of how it was implemented.
 
@@ -307,14 +271,14 @@ def build_verification_prompt(task: Task, attempt: int) -> str:
 **Task ID:** {task.id}
 **Project:** {task.project}
 **Verification attempt:** {attempt} of 3
-**Repository:** `{repo_path or 'unknown'}`
-**Test command:** `{config['test_command']}`
-**Dev process:** `{config['dev_process']}`
+**Repository:** `{repo_path or "unknown"}`
+**Test command:** `{config["test_command"]}`
+**Dev process:** `{config["dev_process"]}`
 
 **Your job:**
 1. Check `git status` to see what files were changed
 2. Review changes with `git diff`
-3. Run FULL test suite: `{config['test_command']}`
+3. Run FULL test suite: `{config["test_command"]}`
 4. Verify implementation matches task requirements
 
 **Task requirements were:**
@@ -354,13 +318,17 @@ def build_preflight_prompt(project: str) -> str:
     """Build prompt for preflight check (clean slate)."""
     config = get_project_config(project)
     repo_path = config["repo_path"]
-    test_cmd = f'"{config["test_command"]}"' if " " in config["test_command"] else config["test_command"]
+    test_cmd = (
+        f'"{config["test_command"]}"'
+        if " " in config["test_command"]
+        else config["test_command"]
+    )
 
     return f"""You are preparing repository for a dev cycle. Ensure a clean slate.
 
 **Repository:** `{repo_path}`
-**Test command:** `{config['test_command']}`
-**Dev process:** `{config['dev_process']}`
+**Test command:** `{config["test_command"]}`
+**Dev process:** `{config["dev_process"]}`
 
 **Steps:**
 1. Change directory to repository using os.chdir()
@@ -525,7 +493,9 @@ def after_preflight(project: str, success: bool, error: str = None) -> dict:
     }
 
 
-def after_implementation(project: str, success: bool, session_key: str = None, error: str = None) -> dict:
+def after_implementation(
+    project: str, success: bool, session_key: str = None, error: str = None
+) -> dict:
     """Called after implementation completes."""
     state = load_pipeline_state(project)
 
@@ -540,8 +510,12 @@ def after_implementation(project: str, success: bool, session_key: str = None, e
         save_pipeline_state(state)
 
         # Move task to blocked
-        move_task(state.current_task_id, IN_PROGRESS, BLOCKED,
-                  {"blocked_reason": state.error_message})
+        move_task(
+            state.current_task_id,
+            IN_PROGRESS,
+            BLOCKED,
+            {"blocked_reason": state.error_message},
+        )
 
         release_lock(project)
 
@@ -576,7 +550,9 @@ def after_implementation(project: str, success: bool, session_key: str = None, e
         "pre_verify_commands": [
             f"cd {config['repo_path']}",
             "git add -A",  # Stage all changes
-        ] if config["repo_path"] else [],
+        ]
+        if config["repo_path"]
+        else [],
     }
 
 
@@ -601,7 +577,7 @@ def after_verification(project: str, result: str, session_key: str = None) -> di
         release_lock(project)
         return {"error": f"Task {state.current_task_id} not found"}
 
-    config = get_project_config(project.project)
+    config = get_project_config(task.project)
 
     if result == "clean":
         # Ready to commit
@@ -617,8 +593,10 @@ def after_verification(project: str, result: str, session_key: str = None) -> di
             "commands": [
                 f"cd {config['repo_path']}",
                 "git add -A",
-                f"git commit -m '{build_commit_message(task).replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}'",
-            ] if config["repo_path"] else [],
+                f"git commit -m '{build_commit_message(task).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'",
+            ]
+            if config["repo_path"]
+            else [],
         }
 
     elif result == "changes_made":
@@ -626,11 +604,17 @@ def after_verification(project: str, result: str, session_key: str = None) -> di
         if state.verify_attempts >= state.max_verify_attempts:
             state.status = "failed"
             state.failed_task = state.current_task_id
-            state.error_message = f"Verification failed after {state.max_verify_attempts} attempts"
+            state.error_message = (
+                f"Verification failed after {state.max_verify_attempts} attempts"
+            )
             save_pipeline_state(state)
 
-            move_task(state.current_task_id, IN_PROGRESS, BLOCKED,
-                      {"blocked_reason": state.error_message})
+            move_task(
+                state.current_task_id,
+                IN_PROGRESS,
+                BLOCKED,
+                {"blocked_reason": state.error_message},
+            )
 
             release_lock(project)
 
@@ -653,7 +637,9 @@ def after_verification(project: str, result: str, session_key: str = None) -> di
             "pre_verify_commands": [
                 f"cd {config['repo_path']}",
                 "git add -A",
-            ] if config["repo_path"] else [],
+            ]
+            if config["repo_path"]
+            else [],
         }
 
     else:  # blocked
@@ -662,8 +648,12 @@ def after_verification(project: str, result: str, session_key: str = None) -> di
         state.error_message = "Verification found blocking issues"
         save_pipeline_state(state)
 
-        move_task(state.current_task_id, IN_PROGRESS, BLOCKED,
-                  {"blocked_reason": state.error_message})
+        move_task(
+            state.current_task_id,
+            IN_PROGRESS,
+            BLOCKED,
+            {"blocked_reason": state.error_message},
+        )
 
         release_lock(project)
 
@@ -695,15 +685,22 @@ def after_commit(project: str, success: bool, error: str = None) -> dict:
 
     # Success! Move to done
     now = datetime.now(timezone.utc).isoformat()
-    move_task(state.current_task_id, IN_PROGRESS, DONE, {
-        "completed_at": now,
-        "result": f"Implemented and verified via {state.running_by} pipeline",
-    })
+    move_task(
+        state.current_task_id,
+        IN_PROGRESS,
+        DONE,
+        {
+            "completed_at": now,
+            "result": f"Implemented and verified via {state.running_by} pipeline",
+        },
+    )
 
-    state.completed_tasks.append({
-        "id": state.current_task_id,
-        "title": state.current_task_title,
-    })
+    state.completed_tasks.append(
+        {
+            "id": state.current_task_id,
+            "title": state.current_task_title,
+        }
+    )
 
     # Check for more tasks
     remaining_tasks = get_approved_tasks(project)
@@ -773,20 +770,19 @@ def show_status():
                 print(f"    At: {lock_data.get('lockedAt', 'unknown')}")
                 print(f"    PID: {lock_data.get('pid', 'unknown')}")
                 print(f"    Task: {lock_data.get('task', 'unknown')}")
-            except:
+            except (json.JSONDecodeError, OSError):
                 print(f"  Lock: 🔒 Locked (corrupt file)")
         else:
             print(f"  Lock: 🔓 Not locked")
 
-        # Pipeline state
         if state_file.exists():
             try:
                 state_data = json.loads(state_file.read_text())
                 print(f"  Status: {state_data.get('status', 'unknown')}")
-                if state_data.get('current_task_id'):
+                if state_data.get("current_task_id"):
                     print(f"  Task: {state_data.get('current_task_title', 'unknown')}")
                 print(f"  Running by: {state_data.get('running_by', 'unknown')}")
-            except:
+            except (json.JSONDecodeError, OSError):
                 print(f"  Status: ❓ Unknown (corrupt state)")
         else:
             print(f"  Status: ❓ No state file")
@@ -815,7 +811,7 @@ def force_unlock(project: str):
         print(f"   Was locked by: {lock_data.get('lockedBy', 'unknown')}")
         print(f"   Locked at: {lock_data.get('lockedAt', 'unknown')}")
         print(f"   PID: {lock_data.get('pid', 'unknown')}")
-    except:
+    except (json.JSONDecodeError, OSError):
         print(f"⚠️  Lock file appears corrupt")
 
     lock_file.unlink()
@@ -828,10 +824,10 @@ def signal_handler(signum, frame):
     if current_lock_file and current_lock_file.exists():
         try:
             lock_data = json.loads(current_lock_file.read_text())
-            project = lock_data.get('project')
+            project = lock_data.get("project")
             if project:
                 release_lock(project)
-        except:
+        except (json.JSONDecodeError, OSError):
             pass
     sys.exit(1)
 
@@ -875,7 +871,9 @@ if __name__ == "__main__":
             print(f"📋 Task: {result['task_title']} ({result['task_id']})")
             print(f"📝 Preflight prompt ready for {result['project']}")
             print("\nNext step: Run preflight, then:")
-            print(f"  unified_pipeline.py after_preflight {result['project']} <success|blocked> [error]")
+            print(
+                f"  unified_pipeline.py after_preflight {result['project']} <success|blocked> [error]"
+            )
 
     elif cmd == "automated":
         # Run automated batch for all projects
@@ -887,7 +885,9 @@ if __name__ == "__main__":
             if result.get("action") == "skip":
                 print(f"⏭  {project}: {result['reason']}")
             elif result.get("action") == "preflight":
-                print(f"📋 {project}: Task: {result['task_title']} ({result['task_id']})")
+                print(
+                    f"📋 {project}: Task: {result['task_title']} ({result['task_id']})"
+                )
                 print(f"📝 Preflight prompt ready")
 
     elif cmd == "status":
@@ -901,18 +901,24 @@ if __name__ == "__main__":
 
     elif cmd == "after_preflight":
         if len(sys.argv) < 3:
-            print("Usage: unified_pipeline.py after_preflight <project> <success|blocked> [error]")
+            print(
+                "Usage: unified_pipeline.py after_preflight <project> <success|blocked> [error]"
+            )
             sys.exit(1)
 
         project = sys.argv[2]
-        success = sys.argv[3].lower() in ("true", "success") if len(sys.argv) > 3 else False
+        success = (
+            sys.argv[3].lower() in ("true", "success") if len(sys.argv) > 3 else False
+        )
         error = sys.argv[4] if len(sys.argv) > 4 else None
         result = after_preflight(project, success, error)
         print(json.dumps(result, indent=2))
 
     elif cmd == "after_impl":
         if len(sys.argv) < 3:
-            print("Usage: unified_pipeline.py after_impl <project> <true|false> [session] [error]")
+            print(
+                "Usage: unified_pipeline.py after_impl <project> <true|false> [session] [error]"
+            )
             sys.exit(1)
 
         project = sys.argv[2]
@@ -924,7 +930,9 @@ if __name__ == "__main__":
 
     elif cmd == "after_verify":
         if len(sys.argv) < 3:
-            print("Usage: unified_pipeline.py after_verify <project> <clean|changes_made|blocked> [session]")
+            print(
+                "Usage: unified_pipeline.py after_verify <project> <clean|changes_made|blocked> [session]"
+            )
             sys.exit(1)
 
         project = sys.argv[2]
@@ -935,7 +943,9 @@ if __name__ == "__main__":
 
     elif cmd == "after_commit":
         if len(sys.argv) < 3:
-            print("Usage: unified_pipeline.py after_commit <project> <true|false> [error]")
+            print(
+                "Usage: unified_pipeline.py after_commit <project> <true|false> [error]"
+            )
             sys.exit(1)
 
         project = sys.argv[2]

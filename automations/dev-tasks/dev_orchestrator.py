@@ -17,60 +17,24 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass, asdict
-from typing import Optional
+from dataclasses import asdict
+from models import PipelineState
 from task_manager import (
-    parse_tasks, move_task, write_tasks, load_state, save_state,
-    BACKLOG, IN_PROGRESS, BLOCKED, DONE, _get_header, Task
+    parse_tasks,
+    move_task,
+    write_tasks,
+    load_state,
+    save_state,
+    BACKLOG,
+    IN_PROGRESS,
+    BLOCKED,
+    DONE,
+    _get_header,
+    Task,
 )
+from shared_config import PROJECT_CONFIGS, get_project_config
 
 STATE_FILE = Path.home() / "clawd" / "memory" / "dev-pipeline-state.json"
-
-# Project-specific configurations
-PROJECT_CONFIGS = {
-    "decent-cloud": {
-        "repo_path": "/projects/decent-cloud",
-        "test_command": "cargo test",
-        "agents_md": "/projects/decent-cloud/AGENTS.md",
-        "pre_impl_read": [
-            "/projects/decent-cloud/AGENTS.md",
-            "/projects/decent-cloud/memory/decent-cloud-dev.md"
-        ],
-    },
-    "voki": {
-        "repo_path": "/projects/voice-ai-agent",
-        "test_command": "pytest",
-        "agents_md": "/projects/voice-ai-agent/AGENTS.md",
-        "pre_impl_read": [],
-    },
-    "default": {
-        "repo_path": None,
-        "test_command": "echo 'No test command configured'",
-        "agents_md": None,
-        "pre_impl_read": [],
-    }
-}
-
-
-@dataclass
-class PipelineState:
-    """Tracks current position in the dev pipeline."""
-    status: str = "idle"  # idle, implementing, verifying, committing, done, failed
-    current_task_id: Optional[str] = None
-    current_task_title: Optional[str] = None
-    project: Optional[str] = None
-    verify_attempts: int = 0
-    max_verify_attempts: int = 3
-    impl_session_key: Optional[str] = None
-    verify_session_key: Optional[str] = None
-    batch_started_at: Optional[str] = None
-    completed_tasks: list = None
-    failed_task: Optional[str] = None
-    error_message: Optional[str] = None
-    
-    def __post_init__(self):
-        if self.completed_tasks is None:
-            self.completed_tasks = []
 
 
 def load_pipeline_state() -> PipelineState:
@@ -87,11 +51,6 @@ def save_pipeline_state(state: PipelineState):
     STATE_FILE.write_text(json.dumps(asdict(state), indent=2, default=list))
 
 
-def get_project_config(project: str) -> dict:
-    """Get configuration for a project."""
-    return PROJECT_CONFIGS.get(project, PROJECT_CONFIGS["default"])
-
-
 def get_approved_tasks() -> list[Task]:
     """Get tasks marked as approved (P0 or P1) from backlog."""
     tasks = parse_tasks(BACKLOG)
@@ -103,20 +62,20 @@ def get_approved_tasks() -> list[Task]:
 def build_implementation_prompt(task: Task) -> str:
     """Build the prompt for the implementation agent."""
     config = get_project_config(task.project)
-    
+
     pre_read = ""
     if config["pre_impl_read"]:
         files = ", ".join(config["pre_impl_read"])
         pre_read = f"\n\n**First, read these files:** {files}"
-    
+
     repo_note = ""
     if config["repo_path"]:
         repo_note = f"\n**Repository:** `{config['repo_path']}`"
-    
+
     test_note = ""
     if config["test_command"]:
         test_note = f"\n**Test command:** `{config['test_command']}`"
-    
+
     return f"""You are implementing a development task. Focus on clean, production-ready code.
 
 **Task:** {task.title}
@@ -149,20 +108,20 @@ def build_implementation_prompt(task: Task) -> str:
 def build_verification_prompt(task: Task, attempt: int) -> str:
     """Build the prompt for the verification agent."""
     config = get_project_config(task.project)
-    
+
     return f"""You are verifying a code implementation. You have fresh context - no knowledge of how it was implemented.
 
 **Task that was implemented:** {task.title}
 **Task ID:** {task.id}
 **Project:** {task.project}
 **Verification attempt:** {attempt} of 3
-**Repository:** `{config['repo_path'] or 'unknown'}`
-**Test command:** `{config['test_command']}`
+**Repository:** `{config["repo_path"] or "unknown"}`
+**Test command:** `{config["test_command"]}`
 
 **Your job:**
 1. Check `git status` to see what files were changed
 2. Review the changes with `git diff`
-3. Run the FULL test suite: `{config['test_command']}`
+3. Run the FULL test suite: `{config["test_command"]}`
 4. Verify the implementation matches the task requirements
 
 **Task requirements were:**
@@ -182,37 +141,40 @@ def build_verification_prompt(task: Task, attempt: int) -> str:
 
 def build_commit_message(task: Task) -> str:
     """Build a commit message for the task."""
-    # Map priority to conventional commit type
     type_map = {"P0": "fix", "P1": "feat", "P2": "feat", "P3": "chore"}
     commit_type = type_map.get(task.priority, "chore")
-    
-    # Extract scope from task title if it has parentheses
+
     title = task.title
     scope = ""
     if "(" in title and ")" in title:
-        # e.g., "Uptime calculation per provider (Phase 6.2)"
-        # Keep the main title
-        pass
-    
+        import re
+
+        match = re.search(r"\(([^)]+)\)", title)
+        if match:
+            scope = match.group(1)
+            title = re.sub(r"\s*\([^)]+\)", "", title).strip()
+
+    if scope:
+        return f"{commit_type}({scope}): {title}\n\nTask ID: {task.id}\n\nAutomated implementation via dev-orchestrator."
     return f"{commit_type}: {title}\n\nTask ID: {task.id}\n\nAutomated implementation via dev-orchestrator."
 
 
 def build_preflight_prompt(project: str) -> str:
     """Build prompt for preflight check (clean slate)."""
     config = get_project_config(project)
-    
+
     return f"""You are preparing the repository for a dev cycle. Ensure a clean slate.
 
-**Repository:** `{config['repo_path']}`
-**Test command:** `{config['test_command']}`
+**Repository:** `{config["repo_path"]}`
+**Test command:** `{config["test_command"]}`
 
 **Steps:**
-1. `cd {config['repo_path']}`
+1. `cd {config["repo_path"]}`
 2. Check `git status` - if there are uncommitted changes:
    - Review them briefly
    - If they look intentional, commit with message "chore: uncommitted changes from previous session"
    - If they look broken/partial, stash them: `git stash -m "partial changes"`
-3. Run the full test suite: `{config['test_command']}`
+3. Run the full test suite: `{config["test_command"]}`
 4. If tests fail:
    - Analyze the failures
    - Fix them
@@ -230,7 +192,7 @@ def build_preflight_prompt(project: str) -> str:
 def start_batch():
     """Start a new batch run."""
     state = load_pipeline_state()
-    
+
     # Check if already running
     if state.status not in ("idle", "done", "failed"):
         return {
@@ -238,21 +200,21 @@ def start_batch():
             "reason": f"Pipeline already in progress: {state.status}",
             "current_task": state.current_task_id,
         }
-    
+
     # Get approved tasks
     tasks = get_approved_tasks()
     if not tasks:
         return {
-            "action": "skip", 
+            "action": "skip",
             "reason": "No approved tasks (P0/P1) in backlog",
         }
-    
+
     # Pick first task
     task = tasks[0]
     config = get_project_config(task.project)
-    
+
     now = datetime.now().isoformat()
-    
+
     # Update state - start with preflight
     state.status = "preflight"
     state.current_task_id = task.id
@@ -266,7 +228,7 @@ def start_batch():
     state.failed_task = None
     state.error_message = None
     save_pipeline_state(state)
-    
+
     return {
         "action": "preflight",
         "task_id": task.id,
@@ -281,36 +243,36 @@ def start_batch():
 def after_preflight(success: bool, error: str = None):
     """Called after preflight completes."""
     state = load_pipeline_state()
-    
+
     if state.status != "preflight":
         return {"error": f"Unexpected state: {state.status}"}
-    
+
     if not success:
         state.status = "failed"
         state.failed_task = state.current_task_id
         state.error_message = error or "Preflight failed"
         save_pipeline_state(state)
-        
+
         return {
             "action": "stop",
             "reason": state.error_message,
             "task_id": state.current_task_id,
         }
-    
+
     # Move task to in-progress
     now = datetime.now().isoformat()
     move_task(state.current_task_id, BACKLOG, IN_PROGRESS, {"started_at": now})
-    
+
     state.status = "implementing"
     save_pipeline_state(state)
-    
+
     # Get task for prompt
     tasks = parse_tasks(IN_PROGRESS)
     task = next((t for t in tasks if t.id == state.current_task_id), None)
-    
+
     if not task:
         return {"error": f"Task {state.current_task_id} not found in IN_PROGRESS"}
-    
+
     return {
         "action": "implement",
         "task_id": task.id,
@@ -324,40 +286,44 @@ def after_preflight(success: bool, error: str = None):
 def after_implementation(success: bool, session_key: str = None, error: str = None):
     """Called after implementation completes."""
     state = load_pipeline_state()
-    
+
     if state.status != "implementing":
         return {"error": f"Unexpected state: {state.status}"}
-    
+
     if not success:
         state.status = "failed"
         state.failed_task = state.current_task_id
         state.error_message = error or "Implementation failed"
         save_pipeline_state(state)
-        
+
         # Move task to blocked
-        move_task(state.current_task_id, IN_PROGRESS, BLOCKED, 
-                  {"blocked_reason": state.error_message})
-        
+        move_task(
+            state.current_task_id,
+            IN_PROGRESS,
+            BLOCKED,
+            {"blocked_reason": state.error_message},
+        )
+
         return {
             "action": "stop",
             "reason": state.error_message,
             "task_id": state.current_task_id,
         }
-    
+
     state.impl_session_key = session_key
     state.status = "verifying"
     state.verify_attempts = 1
     save_pipeline_state(state)
-    
+
     # Get task for prompt
     tasks = parse_tasks(IN_PROGRESS)
     task = next((t for t in tasks if t.id == state.current_task_id), None)
-    
+
     if not task:
         return {"error": f"Task {state.current_task_id} not found in IN_PROGRESS"}
-    
+
     config = get_project_config(task.project)
-    
+
     return {
         "action": "verify",
         "task_id": task.id,
@@ -367,7 +333,9 @@ def after_implementation(success: bool, session_key: str = None, error: str = No
         "pre_verify_commands": [
             f"cd {config['repo_path']}",
             "git add -A",  # Stage all changes
-        ] if config["repo_path"] else [],
+        ]
+        if config["repo_path"]
+        else [],
     }
 
 
@@ -377,26 +345,26 @@ def after_verification(result: str, session_key: str = None):
     result: "clean", "changes_made", "blocked"
     """
     state = load_pipeline_state()
-    
+
     if state.status != "verifying":
         return {"error": f"Unexpected state: {state.status}"}
-    
+
     state.verify_session_key = session_key
-    
+
     # Get task
     tasks = parse_tasks(IN_PROGRESS)
     task = next((t for t in tasks if t.id == state.current_task_id), None)
-    
+
     if not task:
         return {"error": f"Task {state.current_task_id} not found"}
-    
+
     config = get_project_config(task.project)
-    
+
     if result == "clean":
         # Ready to commit
         state.status = "committing"
         save_pipeline_state(state)
-        
+
         return {
             "action": "commit",
             "task_id": task.id,
@@ -405,30 +373,38 @@ def after_verification(result: str, session_key: str = None):
             "commands": [
                 f"cd {config['repo_path']}",
                 "git add -A",
-                f"git commit -m '{build_commit_message(task).replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}'",
-            ] if config["repo_path"] else [],
+                f"git commit -m '{build_commit_message(task).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'",
+            ]
+            if config["repo_path"]
+            else [],
         }
-    
+
     elif result == "changes_made":
         # Need to verify again
         if state.verify_attempts >= state.max_verify_attempts:
             state.status = "failed"
             state.failed_task = state.current_task_id
-            state.error_message = f"Verification failed after {state.max_verify_attempts} attempts"
+            state.error_message = (
+                f"Verification failed after {state.max_verify_attempts} attempts"
+            )
             save_pipeline_state(state)
-            
-            move_task(state.current_task_id, IN_PROGRESS, BLOCKED,
-                      {"blocked_reason": state.error_message})
-            
+
+            move_task(
+                state.current_task_id,
+                IN_PROGRESS,
+                BLOCKED,
+                {"blocked_reason": state.error_message},
+            )
+
             return {
                 "action": "stop",
                 "reason": state.error_message,
                 "task_id": task.id,
             }
-        
+
         state.verify_attempts += 1
         save_pipeline_state(state)
-        
+
         return {
             "action": "verify",
             "task_id": task.id,
@@ -438,18 +414,24 @@ def after_verification(result: str, session_key: str = None):
             "pre_verify_commands": [
                 f"cd {config['repo_path']}",
                 "git add -A",
-            ] if config["repo_path"] else [],
+            ]
+            if config["repo_path"]
+            else [],
         }
-    
+
     else:  # blocked
         state.status = "failed"
         state.failed_task = state.current_task_id
         state.error_message = "Verification found blocking issues"
         save_pipeline_state(state)
-        
-        move_task(state.current_task_id, IN_PROGRESS, BLOCKED,
-                  {"blocked_reason": state.error_message})
-        
+
+        move_task(
+            state.current_task_id,
+            IN_PROGRESS,
+            BLOCKED,
+            {"blocked_reason": state.error_message},
+        )
+
         return {
             "action": "stop",
             "reason": state.error_message,
@@ -460,10 +442,10 @@ def after_verification(result: str, session_key: str = None):
 def after_commit(success: bool, error: str = None):
     """Called after commit completes."""
     state = load_pipeline_state()
-    
+
     if state.status != "committing":
         return {"error": f"Unexpected state: {state.status}"}
-    
+
     if not success:
         state.status = "failed"
         state.failed_task = state.current_task_id
@@ -473,27 +455,34 @@ def after_commit(success: bool, error: str = None):
             "action": "stop",
             "reason": state.error_message,
         }
-    
+
     # Success! Move to done
     now = datetime.now().isoformat()
-    move_task(state.current_task_id, IN_PROGRESS, DONE, {
-        "completed_at": now,
-        "result": "Implemented and verified automatically",
-    })
-    
-    state.completed_tasks.append({
-        "id": state.current_task_id,
-        "title": state.current_task_title,
-    })
-    
+    move_task(
+        state.current_task_id,
+        IN_PROGRESS,
+        DONE,
+        {
+            "completed_at": now,
+            "result": "Implemented and verified automatically",
+        },
+    )
+
+    state.completed_tasks.append(
+        {
+            "id": state.current_task_id,
+            "title": state.current_task_title,
+        }
+    )
+
     # Check for more tasks
     remaining_tasks = get_approved_tasks()
-    
+
     if remaining_tasks:
         # Start next task
         task = remaining_tasks[0]
         move_task(task.id, BACKLOG, IN_PROGRESS, {"started_at": now})
-        
+
         state.status = "implementing"
         state.current_task_id = task.id
         state.current_task_title = task.title
@@ -502,7 +491,7 @@ def after_commit(success: bool, error: str = None):
         state.impl_session_key = None
         state.verify_session_key = None
         save_pipeline_state(state)
-        
+
         return {
             "action": "implement",
             "task_id": task.id,
@@ -516,7 +505,7 @@ def after_commit(success: bool, error: str = None):
         # Batch complete!
         state.status = "done"
         save_pipeline_state(state)
-        
+
         return {
             "action": "batch_complete",
             "completed_tasks": state.completed_tasks,
@@ -541,27 +530,27 @@ def reset():
 def check_uncommitted_work(repo_path: str) -> dict:
     """Check if there's uncommitted work in a repo."""
     import subprocess
-    
+
     try:
         # Check git status
         result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=repo_path,
             capture_output=True,
-            text=True
+            text=True,
         )
         has_changes = bool(result.stdout.strip())
-        
+
         # Get list of changed files
         changed_files = []
         if has_changes:
-            for line in result.stdout.strip().split('\n'):
+            for line in result.stdout.strip().split("\n"):
                 if line:
                     # Format: "XY filename" where XY is status
                     parts = line.split(None, 1)
                     if len(parts) == 2:
                         changed_files.append(parts[1])
-        
+
         return {
             "has_changes": has_changes,
             "changed_files": changed_files,
@@ -573,16 +562,16 @@ def check_uncommitted_work(repo_path: str) -> dict:
 def build_resume_prompt(task: Task, state: PipelineState, uncommitted: dict) -> str:
     """Build prompt to resume partial work."""
     config = get_project_config(task.project)
-    
+
     files_list = "\n".join(f"  - {f}" for f in uncommitted.get("changed_files", []))
-    
+
     return f"""You are resuming a partially completed task. Previous agent timed out mid-work.
 
 **Task:** {task.title}
 **Task ID:** {task.id}
 **Project:** {task.project}
-**Repository:** `{config['repo_path']}`
-**Test command:** `{config['test_command']}`
+**Repository:** `{config["repo_path"]}`
+**Test command:** `{config["test_command"]}`
 
 **Previous state:** {state.status}
 **Verify attempts so far:** {state.verify_attempts}
@@ -593,26 +582,28 @@ def build_resume_prompt(task: Task, state: PipelineState, uncommitted: dict) -> 
 **Your job:**
 1. Review the uncommitted changes: `git diff`
 2. Understand what was done and what's missing
-3. Run tests: `{config['test_command']}`
+3. Run tests: `{config["test_command"]}`
 4. If tests pass and work looks complete:
-   - Say "IMPLEMENTATION COMPLETE" with summary
+    - Say "IMPLEMENTATION COMPLETE" with summary
 5. If tests fail or work is incomplete:
-   - Fix the issues
-   - Run tests again
-   - When passing, say "IMPLEMENTATION COMPLETE"
+    - Fix the issues
+    - Run tests again
+    - When passing, say "IMPLEMENTATION COMPLETE"
 6. If fundamentally blocked, say "BLOCKED:" with explanation
 
 **Task requirements were:**
 {task.context}
 
-**Important:** Don't start over - build on the existing work.
+**Important:**
+- Do NOT commit - just implement and verify tests pass
+- Don't start over - build on the existing work
 """
 
 
 def resume():
     """Check for partial work and generate continuation prompt if found."""
     state = load_pipeline_state()
-    
+
     # If idle/done/failed with no current task, nothing to resume
     if state.status in ("idle", "done") or not state.current_task_id:
         return {
@@ -620,16 +611,16 @@ def resume():
             "reason": f"No partial work (status: {state.status})",
             "proceed_with": "start",
         }
-    
+
     # Get task info
     tasks = parse_tasks(IN_PROGRESS)
     task = next((t for t in tasks if t.id == state.current_task_id), None)
-    
+
     if not task:
         # Task not in progress, check backlog
         tasks = parse_tasks(BACKLOG)
         task = next((t for t in tasks if t.id == state.current_task_id), None)
-    
+
     if not task:
         # Can't find the task - reset and start fresh
         return {
@@ -638,19 +629,19 @@ def resume():
             "proceed_with": "start",
             "auto_reset": True,
         }
-    
+
     config = get_project_config(task.project)
-    
+
     if not config["repo_path"]:
         return {
             "action": "no_resume",
             "reason": "No repo path configured",
             "proceed_with": "start",
         }
-    
+
     # Check for uncommitted changes
     uncommitted = check_uncommitted_work(config["repo_path"])
-    
+
     if not uncommitted.get("has_changes"):
         # No uncommitted changes but state says in-progress
         # Might have been committed already or work was lost
@@ -660,7 +651,7 @@ def resume():
             "proceed_with": "start",
             "suggestion": "Previous work may have been lost or already committed",
         }
-    
+
     # We have partial work! Generate resume prompt
     return {
         "action": "resume",
@@ -678,17 +669,21 @@ def resume():
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: dev_orchestrator.py <command> [args...]")
-        print("Commands: resume, start, after_impl, after_verify, after_commit, status, reset")
+        print(
+            "Commands: resume, start, after_impl, after_verify, after_commit, status, reset"
+        )
         sys.exit(1)
-    
+
     cmd = sys.argv[1]
-    
+
     if cmd == "resume":
         result = resume()
     elif cmd == "start":
         result = start_batch()
     elif cmd == "after_preflight":
-        success = sys.argv[2].lower() in ("true", "success") if len(sys.argv) > 2 else False
+        success = (
+            sys.argv[2].lower() in ("true", "success") if len(sys.argv) > 2 else False
+        )
         error = sys.argv[3] if len(sys.argv) > 3 else None
         result = after_preflight(success, error)
     elif cmd == "after_impl":
@@ -710,5 +705,5 @@ if __name__ == "__main__":
         result = reset()
     else:
         result = {"error": f"Unknown command: {cmd}"}
-    
+
     print(json.dumps(result, indent=2))
