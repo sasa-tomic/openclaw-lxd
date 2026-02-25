@@ -42,6 +42,10 @@ SKIP_DIRS = {
     "Pickle",
     # bulk archives
     "Archive",
+    # reference materials (no TODOs)
+    "Reference",
+    # auto-generated reports (no TODOs)
+    "_reports",
 }
 
 DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")

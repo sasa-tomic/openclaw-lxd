@@ -1,0 +1,99 @@
+{
+  "rules": [
+    {
+      "id": "daily_maintenance",
+      "name": "Daily Vault Maintenance",
+      "description": "Daily maintenance pass focused on recently modified notes (last 7 days)",
+      "enabled": true,
+      "recent_days": 7,
+      "oldest_notes": 5,
+      "tasks": [
+        "Fix broken wikilinks - find [[links]] pointing to non-existent notes and either create the missing note, fix the link to point to an existing similar note, or remove if obsolete",
+        "Add missing wikilinks - find plain text mentions of note titles and convert them to [[wikilinks]] to improve discoverability",
+        "Review checkboxes - mark completed tasks as [x], but note that actual TODOs are managed in Todoist (not TODO.md)",
+        "Extract knowledge from daily notes - find important decisions, insights, or recurring topics in Daily/ and create permanent notes in appropriate folders",
+        "Remove intra-note duplicates - within each scoped note, delete any repeated sections, redundant headings, or content that restates the same thing; keep the clearest version",
+        "Remove cross-note duplicates - if a scoped note contains content duplicated verbatim or near-verbatim in another note, delete the duplicate from the scoped note and replace with a [[wikilink]] to the authoritative source; you may read other notes for comparison but only modify files in scope (plus the merge target if appending)",
+        "Consolidate near-empty notes - for any scoped note under ~150 words: (a) if the content is already covered in a larger related note, delete the near-empty note and update any incoming wikilinks to point to the larger note; (b) if the content is valuable but thin, append it to the most relevant existing note then delete the original; (c) if the content is trivial or redundant, delete without merging"
+      ]
+    },
+    {
+      "id": "quick_scan",
+      "name": "Quick Hourly Scan",
+      "description": "Fast scan for urgent issues only - suitable for hourly runs",
+      "enabled": true,
+      "recent_days": 1,
+      "tasks": [
+        "Fix obviously broken wikilinks - only fix links that clearly point to non-existent notes",
+        "Mark obviously completed checkboxes"
+      ]
+    },
+    {
+      "id": "knowledge_extraction",
+      "name": "Knowledge Extraction",
+      "description": "Focus on extracting valuable knowledge from daily notes",
+      "enabled": true,
+      "tasks": [
+        "Scan the last 7 days of daily notes in Daily/",
+        "Find important decisions, insights, meeting notes, and ideas",
+        "Create or update permanent notes in appropriate folders (Projects/, People/, Reference/)",
+        "Add wikilinks from daily notes to the new permanent notes",
+        "Update any relevant existing notes with new information"
+      ]
+    },
+    {
+      "id": "organization",
+      "name": "Vault Organization",
+      "description": "Reorganize misplaced notes and improve structure",
+      "enabled": true,
+      "tasks": [
+        "Find notes at vault root that belong in folders",
+        "Identify notes in wrong folders based on their content",
+        "Move notes to appropriate folders (Projects/, People/, Reference/, Travel/, Interviews/, Archive/)",
+        "Create new folders if needed for emerging topics",
+        "Update any wikilinks that reference moved notes"
+      ]
+    },
+    {
+      "id": "link_maintenance",
+      "name": "Link Maintenance",
+      "description": "Focus on wikilink health and connectivity",
+      "enabled": true,
+      "tasks": [
+        "Find and fix all broken wikilinks",
+        "Add missing wikilinks where note titles are mentioned as plain text",
+        "Ensure important notes have incoming links from related content",
+        "Create redirect notes if commonly used link names don't match actual note names"
+      ]
+    },
+    {
+      "id": "consolidation",
+      "name": "Vault Consolidation",
+      "description": "Periodic sweep to merge, deduplicate, and drop low-value notes across the whole vault",
+      "enabled": true,
+      "tasks": [
+        "Find near-empty notes (under ~150 words, excluding frontmatter) across the whole vault - for each one: (a) if content is already covered in a larger related note, delete it and update incoming wikilinks; (b) if content is valuable, append it to the most relevant existing note then delete the original; (c) if trivial or fully redundant, delete without merging",
+        "Find duplicate content across notes - identify notes that cover the same topic with substantially overlapping content; merge them into a single authoritative note, preserving unique details from each, then delete or redirect the duplicates",
+        "Remove repeated information within individual notes - delete duplicate sections, repeated bullet points, and any paragraph that restates content already present in the same note",
+        "Identify stub notes that are just a title with no body - either populate them with a sentence explaining what belongs there, merge them into a parent note, or delete if the topic is already well-covered elsewhere",
+        "Clean up low-signal content - remove filler phrases, obvious placeholders ('TODO: fill this in', 'see above'), and content that adds no information beyond what a wikilink already conveys"
+      ]
+    },
+    {
+      "id": "archive_cleanup",
+      "name": "Archive Cleanup",
+      "description": "Move completed and stale content to archive",
+      "enabled": true,
+      "tasks": [
+        "Find completed projects that should be archived",
+        "Find notes not modified in 6+ months that are no longer actively relevant",
+        "Move stale content to Archive/ with appropriate date prefixes",
+        "Ensure archived content is still linked from relevant active notes"
+      ]
+    }
+  ],
+  "_notes": {
+    "task_management": "Tasks are managed in Todoist, not TODO.md. The obsidian-watcher automatically extracts tasks from notes and chats and adds them to Todoist.",
+    "documentation": "See HOW_TO_ADD_TODOS.md for details on task extraction."
+  }
+}
