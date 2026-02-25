@@ -4,3 +4,7 @@ chrome-openclaw/
 .env
 .env.*
 **/.env
+.ralph/
+.vscode/
+**/_debug/
+**/__pycache__/
