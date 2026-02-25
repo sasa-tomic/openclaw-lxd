@@ -13,10 +13,9 @@ Environment variables:
     WACLI_PATH            - wacli binary path (default: ~/homebrew/bin/wacli)
 """
 
-import fcntl
 import json
+import logging
 import os
-import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -24,23 +23,28 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib.file_utils import append_with_lock, sanitize_filename
+
 # === Configuration ===
 
-OBSIDIAN_DIR = Path(os.environ.get(
-    "OBSIDIAN_WHATSAPP_DIR",
-    os.path.expanduser("~/clawd/notes/WhatsApp")
-))
-STATE_FILE = Path(os.environ.get(
-    "WHATSAPP_STATE_FILE",
-    os.path.expanduser("~/.wacli/obsidian-sync-state.json")
-))
-WACLI = os.environ.get(
-    "WACLI_PATH",
-    os.path.expanduser("~/homebrew/bin/wacli")
+OBSIDIAN_DIR = Path(
+    os.environ.get(
+        "OBSIDIAN_WHATSAPP_DIR", os.path.expanduser("~/clawd/notes/WhatsApp")
+    )
 )
+STATE_FILE = Path(
+    os.environ.get(
+        "WHATSAPP_STATE_FILE", os.path.expanduser("~/.wacli/obsidian-sync-state.json")
+    )
+)
+WACLI = os.environ.get("WACLI_PATH", os.path.expanduser("~/homebrew/bin/wacli"))
 
 
 # === CLI Wrapper ===
+
 
 def wacli(*args: str) -> Optional[dict]:
     """Run wacli command and return JSON output."""
@@ -56,6 +60,7 @@ def wacli(*args: str) -> Optional[dict]:
 
 
 # === Data Types ===
+
 
 @dataclass
 class Message:
@@ -76,6 +81,7 @@ class Message:
 
 # === Contacts Cache ===
 
+
 class ContactsCache:
     def __init__(self):
         self._contacts: dict[str, str] = {}
@@ -86,7 +92,15 @@ class ContactsCache:
         # Load contacts
         data = wacli("contacts", "list", "--limit", "1000")
         if data:
-            for contact in data.get("data", data) if isinstance(data, dict) else data:
+            contacts = data.get("data", data) if isinstance(data, dict) else data
+            if not isinstance(contacts, list):
+                logger.warning(f"Unexpected contacts format: {type(contacts)}")
+                return
+
+            for contact in contacts:
+                if not isinstance(contact, dict):
+                    logger.debug(f"Skipping non-dict contact: {type(contact)}")
+                    continue
                 jid = contact.get("JID", "")
                 name = contact.get("Name") or contact.get("PushName") or ""
                 if jid and name:
@@ -129,6 +143,7 @@ class ContactsCache:
 
 # === State Management ===
 
+
 class SyncState:
     def __init__(self, path: Path):
         self._path = path
@@ -158,13 +173,6 @@ class SyncState:
 
 # === File Operations ===
 
-def sanitize_filename(name: str) -> str:
-    if not name:
-        return "Unknown"
-    result = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
-    result = re.sub(r'\s+', ' ', result).strip().strip('.')
-    return result[:80] or "Unknown"
-
 
 def format_time(ts: str) -> str:
     try:
@@ -182,7 +190,9 @@ def format_date(ts: str) -> str:
         return "unknown"
 
 
-def write_messages(path: Path, messages: list[str], chat_jid: str, chat_name: str, chat_type: str) -> None:
+def write_messages(
+    path: Path, messages: list[str], chat_jid: str, chat_name: str, chat_type: str
+) -> None:
     """Write messages to file with locking."""
     # Create file with header if new
     if not path.exists():
@@ -200,17 +210,15 @@ synced: {datetime.now().isoformat()}
 
     # Append with locking
     content = "\n".join(messages)
-    with path.open("a") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            f.write(content)
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    append_with_lock(path, content)
 
 
 # === Sync Logic ===
 
-def sync_chat(jid: str, name: str, chat_type: str, state: SyncState, contacts: ContactsCache) -> int:
+
+def sync_chat(
+    jid: str, name: str, chat_type: str, state: SyncState, contacts: ContactsCache
+) -> int:
     """Sync a single chat. Returns number of new messages."""
     # Fetch messages
     data = wacli("messages", "list", "--chat", jid, "--limit", "500")
@@ -259,7 +267,9 @@ def sync_chat(jid: str, name: str, chat_type: str, state: SyncState, contacts: C
         media_type = msg.get("MediaType") or ""
 
         if media_type:
-            content = f"*[{media_type}]* {text}".strip() if text else f"*[{media_type}]*"
+            content = (
+                f"*[{media_type}]* {text}".strip() if text else f"*[{media_type}]*"
+            )
         elif text:
             content = text
         else:

@@ -16,33 +16,37 @@ Format matches signal-export:
     [YYYY-MM-DD HH:MM:SS] Sender: Message text
 """
 
-import fcntl
 import json
 import os
-import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib.file_utils import append_with_lock, sanitize_filename
+
 # === Configuration ===
 
-OBSIDIAN_DIR = Path(os.environ.get(
-    "OBSIDIAN_SIGNAL_DIR",
-    os.path.expanduser("~/clawd/notes/Signal")
-))
-STATE_FILE = Path(os.environ.get(
-    "SIGNAL_STATE_FILE",
-    os.path.expanduser("~/.signal-cli/obsidian-sync-state.json")
-))
-CONTACTS_FILE = Path(os.environ.get(
-    "SIGNAL_CONTACTS_FILE",
-    os.path.expanduser("~/.signal-cli/contacts.json")
-))
+OBSIDIAN_DIR = Path(
+    os.environ.get("OBSIDIAN_SIGNAL_DIR", os.path.expanduser("~/clawd/notes/Signal"))
+)
+STATE_FILE = Path(
+    os.environ.get(
+        "SIGNAL_STATE_FILE",
+        os.path.expanduser("~/.signal-cli/obsidian-sync-state.json"),
+    )
+)
+CONTACTS_FILE = Path(
+    os.environ.get(
+        "SIGNAL_CONTACTS_FILE", os.path.expanduser("~/.signal-cli/contacts.json")
+    )
+)
 
 
 # === Data Types ===
+
 
 @dataclass
 class Message:
@@ -67,10 +71,15 @@ class Message:
 
     @property
     def display_sender(self) -> str:
-        return "Me" if self.is_outgoing else (self.sender_name or self.sender_number or "Unknown")
+        return (
+            "Me"
+            if self.is_outgoing
+            else (self.sender_name or self.sender_number or "Unknown")
+        )
 
 
 # === Contacts Cache ===
+
 
 class ContactsCache:
     def __init__(self, path: Path):
@@ -103,6 +112,7 @@ class ContactsCache:
 
 # === State Management ===
 
+
 class SyncState:
     def __init__(self, path: Path):
         self._path = path
@@ -134,14 +144,6 @@ class SyncState:
 
 
 # === File Operations ===
-
-def sanitize_filename(name: str) -> str:
-    """Convert name to safe filename."""
-    if not name:
-        return "Unknown"
-    result = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
-    result = result.strip().strip('.')
-    return result[:80] or "Unknown"
 
 
 def find_chat_file(msg: Message, contacts: ContactsCache) -> Path:
@@ -187,20 +189,18 @@ def write_message_atomic(path: Path, msg: Message, contacts: ContactsCache) -> N
 
     # Create file with header if new
     if not path.exists():
-        chat_name = msg.group_name if msg.is_group else contacts.get_name(msg.sender_number)
+        chat_name = (
+            msg.group_name if msg.is_group else contacts.get_name(msg.sender_number)
+        )
         header = f"# {chat_name}\n\n_Signal chat - live sync via signal-cli_\n\n---\n"
         path.write_text(header)
 
     # Append with file locking
-    with path.open("a") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            f.write(line)
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    append_with_lock(path, line)
 
 
 # === Message Parser ===
+
 
 def parse_envelope(data: dict, contacts: ContactsCache) -> Optional[Message]:
     """Parse a signal-cli JSON envelope."""
@@ -225,8 +225,15 @@ def parse_envelope(data: dict, contacts: ContactsCache) -> Optional[Message]:
         text = dm.get("message") or ""
         group_info = dm.get("groupInfo") or dm.get("groupV2")
         group_id = group_info.get("groupId") if group_info else None
-        group_name = (group_info.get("groupName") or group_info.get("title")) if group_info else None
-        attachments = [a.get("contentType", "file").split("/")[0] for a in dm.get("attachments", [])]
+        group_name = (
+            (group_info.get("groupName") or group_info.get("title"))
+            if group_info
+            else None
+        )
+        attachments = [
+            a.get("contentType", "file").split("/")[0]
+            for a in dm.get("attachments", [])
+        ]
 
         return Message(
             timestamp=datetime.fromtimestamp(timestamp_ms / 1000),
@@ -251,8 +258,15 @@ def parse_envelope(data: dict, contacts: ContactsCache) -> Optional[Message]:
         dest_number = sent.get("destinationNumber") or sent.get("destination") or ""
         group_info = sent.get("groupInfo") or sent.get("groupV2")
         group_id = group_info.get("groupId") if group_info else None
-        group_name = (group_info.get("groupName") or group_info.get("title")) if group_info else None
-        attachments = [a.get("contentType", "file").split("/")[0] for a in sent.get("attachments", [])]
+        group_name = (
+            (group_info.get("groupName") or group_info.get("title"))
+            if group_info
+            else None
+        )
+        attachments = [
+            a.get("contentType", "file").split("/")[0]
+            for a in sent.get("attachments", [])
+        ]
 
         return Message(
             timestamp=datetime.fromtimestamp(timestamp_ms / 1000),
@@ -269,6 +283,7 @@ def parse_envelope(data: dict, contacts: ContactsCache) -> Optional[Message]:
 
 
 # === Main ===
+
 
 def process_line(line: str, state: SyncState, contacts: ContactsCache) -> bool:
     """Process a single JSON line. Returns True if message was written."""
