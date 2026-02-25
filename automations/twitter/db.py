@@ -14,7 +14,25 @@ from typing import Any
 import psycopg2
 import psycopg2.extras
 
-DATABASE_URL = os.environ.get("TWITTER_DB_URL", "")
+def _load_db_url() -> str:
+    url = os.environ.get("TWITTER_DB_URL", "")
+    if url:
+        return url
+    # Fall back to the openclaw env file (set by systemd EnvironmentFile but not
+    # available when scripts are run directly from the shell)
+    env_file = os.path.expanduser("~/.openclaw/.env")
+    try:
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("TWITTER_DB_URL="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return url
+
+
+DATABASE_URL = _load_db_url()
 
 # ---------------------------------------------------------------------------
 # Seed accounts inserted during ensure_schema()
@@ -372,21 +390,33 @@ def insert_engagement(
     conv_likelihood: int | None = None,
     profile_click_worthy: bool | None = None,
     llm_reasoning: str | None = None,
+    target_tweet_text: str | None = None,
+    tweet_url: str | None = None,
+    tweet_likes: int | None = None,
+    tweet_rts: int | None = None,
+    tweet_replies: int | None = None,
 ) -> None:
     """Insert an engagement record. Does nothing on duplicate tweet_id."""
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO engagements (
-                tweet_id, target_username, our_reply_text, our_reply_id,
+                tweet_id, target_username, target_tweet_text, tweet_url,
+                tweet_likes, tweet_rts, tweet_replies,
+                our_reply_text, our_reply_id,
                 replied_at, source, search_term, conv_likelihood,
                 profile_click_worthy, llm_reasoning
-            ) VALUES (%s, %s, %s, %s, now(), %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s, %s, %s, %s, %s)
             ON CONFLICT (tweet_id) DO NOTHING
             """,
             (
                 tweet_id,
                 target_username,
+                target_tweet_text,
+                tweet_url,
+                tweet_likes,
+                tweet_rts,
+                tweet_replies,
                 our_reply_text,
                 our_reply_id,
                 source,
@@ -732,6 +762,11 @@ CREATE TABLE IF NOT EXISTS social_edges (
 CREATE TABLE IF NOT EXISTS engagements (
     tweet_id              TEXT PRIMARY KEY,
     target_username       TEXT,
+    target_tweet_text     TEXT,
+    tweet_url             TEXT,
+    tweet_likes           INTEGER DEFAULT 0,
+    tweet_rts             INTEGER DEFAULT 0,
+    tweet_replies         INTEGER DEFAULT 0,
     our_reply_text        TEXT,
     our_reply_id          TEXT,
     replied_at            TIMESTAMPTZ DEFAULT now(),
@@ -746,6 +781,12 @@ CREATE TABLE IF NOT EXISTS engagements (
     got_reply_back        BOOLEAN DEFAULT FALSE,
     perf_checked_at       TIMESTAMPTZ
 );
+
+ALTER TABLE engagements ADD COLUMN IF NOT EXISTS target_tweet_text TEXT;
+ALTER TABLE engagements ADD COLUMN IF NOT EXISTS tweet_url         TEXT;
+ALTER TABLE engagements ADD COLUMN IF NOT EXISTS tweet_likes       INTEGER DEFAULT 0;
+ALTER TABLE engagements ADD COLUMN IF NOT EXISTS tweet_rts         INTEGER DEFAULT 0;
+ALTER TABLE engagements ADD COLUMN IF NOT EXISTS tweet_replies     INTEGER DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS posts (
     tweet_id        TEXT PRIMARY KEY,
@@ -866,7 +907,7 @@ def get_queued_candidates(conn, limit: int = 100) -> list[dict]:
             WHERE processed_at IS NULL
               AND queued_at > now() - interval '24 hours'
               AND tweet_id NOT IN (SELECT tweet_id FROM engagements)
-            ORDER BY queued_at ASC
+            ORDER BY queued_at DESC
             LIMIT %s
             """,
             (limit,),

@@ -131,7 +131,9 @@ def prune_decision_cache(decision_cache: dict) -> int:
     return len(expired)
 
 
-def _build_voice_context(recent_engagements: list[dict], recent_posts: list[dict]) -> tuple[str, str]:
+def _build_voice_context(
+    recent_engagements: list[dict], recent_posts: list[dict]
+) -> tuple[str, str]:
     """Build voice consistency strings from DB records."""
     recent_our_replies = ""
     recent_our_posts = ""
@@ -144,7 +146,8 @@ def _build_voice_context(recent_engagements: list[dict], recent_posts: list[dict
         recent_our_replies = "\n".join(lines)
 
     posts = [
-        p for p in recent_posts
+        p
+        for p in recent_posts
         if p.get("type") in ("post", "value-drop", "dev-update", "thread")
     ]
     if posts:
@@ -296,48 +299,51 @@ def draft_reply_with_full_context(
 
 4. **If YES, draft a reply that gets engagement (likes, follows):**
 
-   **Voice (see STRATEGY.md for full style guide):**
-   - Observational, not imperative — describe what's happening, don't tell them what to do
-   - Name the underlying mechanic they're bumping into, with specifics
-   - Peer voice — like a knowledgeable friend, not a brand account or security blog
-   - Short sentences. Each one carries its weight.
-   - NOT: "You should check who's actually running your workload" — YES: "p2p compute has no accountability layer. when a provider disappears, there's no recourse."
+   **Voice:**
+   - 1 sentence. Borderline rude cynicism. Sounds like someone who's seen this a hundred times and is mildly annoyed you're only noticing now.
+   - No setup, no punchline structure — just the plain thing, stated plainly
+   - Lowercase preferred. No trailing punctuation if it feels unnatural.
+   - The fact itself carries the cynicism — don't editorialize on top of it
+   - NEVER use template anchors: "wild that", "funny how", "almost like", "turns out", "weird that" — these read as AI tells
+   - Do NOT construct a clever observation. Just say the thing a tired infra engineer would fire off in 5 seconds.
 
    **What gets likes/follows:**
-   - Naming the mechanic behind their pain with a specific, non-obvious angle
-   - Trust/accountability observations ("anonymous providers have zero skin in the game — that's the actual problem")
-   - Specific numbers or facts they probably don't know ("AWS SLA credits cap out at one month of fees")
-   - Contrarian takes that add something new — not what 5 other replies already said
+   - Dropping a specific fact that makes their situation sound worse than they described
+   - Pointing out who actually holds the bag (hint: not the vendor)
+   - Saying the quiet part out loud — no softening, no "to be fair"
 
    **What kills engagement:**
    - Generic validation ("so true", "yeah that's rough")
-   - Generic questions ("what's your biggest cloud cost?")
-   - Repeating what other replies already said
+   - Clever sentence construction that takes effort to parse
    - Imperative framing ("make sure you...", "you should switch to...")
    - Sales pitches or product mentions — zero in Phase 1
+   - Anchor phrases that signal AI: "wild that", "funny how", "almost like", "turns out"
 
    **Hard rules:**
    - 1-2 sentences max, under 280 chars
    - NO questions unless they asked one first
    - NO hashtags, NO links
    - NO "check us out", NO "follow for updates"
-   - profileClickWorthy check: only reply if you're adding a specific fact, a non-obvious angle, or a well-supported pushback. Pure validation ("so true", "exactly", "been there", "this is real") fails this check regardless of conversation likelihood.
+   - profileClickWorthy check: only reply if you're adding a specific fact or a cutting observation. Pure validation ("so true", "exactly", "been there", "this is real") fails this check regardless of conversation likelihood.
 
 5. **If NO (not worth engaging), explain why**
 
-# Example Replies (Study the Voice — Observational, Specific, Not Imperative)
+# Example Replies (Study the Voice — Blunt, Cynical, 1-2 Sentences)
 
 Tweet: "Tried Akash for GPU compute, provider just stopped responding mid-job"
--> "p2p compute ghosting happens because anonymous providers have zero skin in the game. no reviews, no history, no recourse when they disappear."
-
-Tweet: "Why do all these decentralized compute platforms feel like gambling?"
--> "because you're renting from anonymous strangers with no track record. Airbnb works because hosts have reviews and can be kicked off. p2p compute has neither."
+-> "anonymous providers have zero skin in the game, which is fine until your job disappears mid-run"
 
 Tweet: "Cloud support is terrible, been waiting 3 days for a response"
--> "3 days is fast for some. AWS SLA credits cap at one month of fees — and you have to file the claim yourself within 30 days."
+-> "nobody at AWS is losing sleep over your ticket"
 
 Tweet: "Egress fees are such a scam"
--> "AWS charges ~$90/TB out but $0/TB in. ingress is free because it creates lock-in. egress costs because leaving is expensive — by design."
+-> "$0 in. $90/TB out. totally fine."
+
+Tweet: "Accountability cannot be delegated. When a cloud provider manages your data, the liability stays with you."
+-> "they take the contract, you take the fine"
+
+Tweet: "Cloud egress fees are notoriously confusing"
+-> "in: $0. out: $90/TB. not that confusing actually"
 
 # Output Format (JSON)
 {{
@@ -402,7 +408,9 @@ FOLLOW_CHURN_DAYS_MAX = 14
 MAX_FOLLOWS_PER_RUN = 8  # match engagement cap — follow each account we reply to
 
 
-def generate_dynamic_keywords(recent_engagements: list[dict], max_terms: int = 15) -> list[str]:
+def generate_dynamic_keywords(
+    recent_engagements: list[dict], max_terms: int = 15
+) -> list[str]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=14)
     recent = []
 
@@ -487,19 +495,20 @@ def main() -> int:
             recent_engagements = get_recent_engagements(conn, hours=168, limit=8)
             recent_posts = get_recent_posts(conn, limit=5)
 
-            # Prefer the pre-fetched queue (filled by search_queue.py via twscrape).
+            # Prefer the pre-fetched queue (filled hourly by search_queue.py via CDP).
             # Fall back to live CDP search only if the queue is empty.
             candidates = get_queued_candidates(conn, limit=100)
             using_queue = bool(candidates)
 
             if using_queue:
                 print(
-                    f"Using {len(candidates)} candidates from queue (twscrape)",
+                    f"Using {len(candidates)} candidates from queue",
                     flush=True,
                 )
             else:
                 print("Queue empty — falling back to CDP search...", flush=True)
                 from twitter_utils import search_candidates
+
                 candidates = search_candidates(term_stats=term_stats)
                 print(f"Found {len(candidates)} raw candidates from search", flush=True)
 
@@ -510,7 +519,9 @@ def main() -> int:
                         flush=True,
                     )
 
-                    new_keywords = generate_dynamic_keywords(recent_engagements, max_terms=15)
+                    new_keywords = generate_dynamic_keywords(
+                        recent_engagements, max_terms=15
+                    )
                     print(f"  Generated {len(new_keywords)} new keywords", flush=True)
 
                     global SEARCH_TERMS
@@ -524,7 +535,10 @@ def main() -> int:
                     )
 
                     if not candidates:
-                        print("  Still no candidates - might just be quiet period", flush=True)
+                        print(
+                            "  Still no candidates - might just be quiet period",
+                            flush=True,
+                        )
                         return 0
 
             # Shuffle before filtering so all search terms get equal representation
@@ -575,21 +589,25 @@ def main() -> int:
 
                 print(f"\nProcessing {tweet_id} (@{author})...")
 
-                # Mark this queue entry as processed now so it won't re-appear
-                # in the next run's queue even if we skip or fail below.
-                if using_queue:
-                    mark_queue_processed(conn, [str(tweet_id)])
-
                 # Skip if we've already engaged this tweet (double-check DB)
                 if is_engaged(conn, str(tweet_id)):
                     print(f"  Already engaged {tweet_id} in DB — skipping", flush=True)
+                    if using_queue:
+                        mark_queue_processed(conn, [str(tweet_id)])
                     continue
 
                 print("  Fetching thread context...")
                 tweet_context = fetch_tweet_context(tweet_id)
                 if not tweet_context:
-                    print(f"  Skipping {tweet_id} - failed to fetch context", flush=True)
+                    print(
+                        f"  Skipping {tweet_id} - failed to fetch context", flush=True
+                    )
                     continue
+
+                # Mark processed after successful context fetch so a browser failure
+                # doesn't permanently consume the candidate.
+                if using_queue:
+                    mark_queue_processed(conn, [str(tweet_id)])
 
                 # Fetch author profile for context (bio, recent tweets, interests)
                 author_name = tweet_context.get("author", "")
@@ -623,11 +641,15 @@ def main() -> int:
 
                 # Save thread regardless of decision
                 if decision:
-                    save_encountered_thread(tweet_context, decision, tweet_id, search_term)
+                    save_encountered_thread(
+                        tweet_context, decision, tweet_id, search_term
+                    )
 
                 if not decision or not decision.get("shouldEngage"):
                     if decision:
-                        print(f"  LLM skipped: {decision.get('reasoning', 'no reason')}")
+                        print(
+                            f"  LLM skipped: {decision.get('reasoning', 'no reason')}"
+                        )
                     continue
 
                 reply_text = decision["reply"]
@@ -658,6 +680,7 @@ def main() -> int:
                     print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
 
                 # Insert engagement into DB
+                stats = tweet_context.get("stats", {})
                 insert_engagement(
                     conn,
                     tweet_id=str(tweet_id),
@@ -669,6 +692,11 @@ def main() -> int:
                     conv_likelihood=decision.get("conversationLikelihood"),
                     profile_click_worthy=decision.get("profileClickWorthy"),
                     llm_reasoning=decision.get("reasoning"),
+                    target_tweet_text=tweet_context.get("text"),
+                    tweet_url=url,
+                    tweet_likes=stats.get("likes"),
+                    tweet_rts=stats.get("retweets"),
+                    tweet_replies=stats.get("replies"),
                 )
 
                 engaged_ids.add(str(tweet_id))

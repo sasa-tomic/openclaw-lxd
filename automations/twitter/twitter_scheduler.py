@@ -186,7 +186,7 @@ def timeline_monitor_flow():
 
 @flow(name="twitter-search-queue", log_prints=True)
 def search_queue_flow():
-    """Fill candidate queue via twscrape (no browser) — every hour."""
+    """Fill candidate queue via CDP search — every hour."""
     logger = get_run_logger()
     logger.info("Starting search queue fill")
     code = run_script(TWITTER_DIR / "search_queue.py", timeout=300, logger=logger)
@@ -205,17 +205,17 @@ def account_discovery_flow():
 
 
 FLOWS = {
-    "engagement": (engagement_flow, "8x daily: 7,9,11,13,17,20,23,02 UTC"),
-    "content": (original_content_flow, "3x daily: 7:30,10:30,16:30 UTC"),
-    "thread": (weekly_thread_flow, "Wed 15:00 UTC"),
-    "eval": (daily_eval_flow, "Daily 7:00 UTC"),
-    "research": (morning_research_flow, "Daily 8:00 UTC"),
-    "health": (cdp_health_flow, "Every 15 min"),
-    "monitor": (reply_monitor_flow, "Every 5 min"),
-    "targets": (target_monitor_flow, "Every 30 min"),
-    "timeline": (timeline_monitor_flow, "Every 5 min"),
-    "discovery": (account_discovery_flow, "Daily 6:00 UTC"),
-    "search-queue": (search_queue_flow, "Every hour"),
+    "engagement": engagement_flow,
+    "content": original_content_flow,
+    "thread": weekly_thread_flow,
+    "eval": daily_eval_flow,
+    "research": morning_research_flow,
+    "health": cdp_health_flow,
+    "monitor": reply_monitor_flow,
+    "targets": target_monitor_flow,
+    "timeline": timeline_monitor_flow,
+    "discovery": account_discovery_flow,
+    "search-queue": search_queue_flow,
 }
 
 
@@ -231,18 +231,15 @@ if __name__ == "__main__":
 
     if args.all:
         print("Running all flows once...")
-        for name, (flow_fn, _) in FLOWS.items():
+        for name, flow_fn in FLOWS.items():
             print(f"\n=== {name} ===")
             flow_fn()
     elif args.flow:
-        flow_fn, _ = FLOWS[args.flow]
-        flow_fn()
+        FLOWS[args.flow]()
     else:
         print("Twitter Scheduler - Prefect")
-        print("UI: http://localhost:4200")
-        print("\nFlows:")
-        for name, (_, schedule) in FLOWS.items():
-            print(f"  {name}: {schedule}")
+        print("Schedules: http://192.168.0.13:4200")
+        print("\nFlows:", ", ".join(FLOWS))
         print("\nUsage:")
         print("  uv run python twitter_scheduler.py <flow>  # Run specific flow")
         print("  uv run python twitter_scheduler.py --all   # Run all once")

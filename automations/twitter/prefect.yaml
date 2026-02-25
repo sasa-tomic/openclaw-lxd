@@ -110,3 +110,13 @@ deployments:
     entrypoint: twitter_scheduler.py:account_discovery_flow
     work_pool:
       name: twitter-automation
+
+  - name: search-queue
+    description: "Fill candidate queue via CDP search"
+    version: "1.0"
+    tags: ["twitter", "search"]
+    schedule:
+      interval: 3600  # Every hour
+    entrypoint: twitter_scheduler.py:search_queue_flow
+    work_pool:
+      name: twitter-automation

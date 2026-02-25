@@ -137,47 +137,44 @@ SKIP_PATTERNS = [
     r"\$[A-Za-z]{2,10}\b",  # token tickers: $SOL $ETH $RNDR $GPU etc.
 ]
 
+# ---------------------------------------------------------------------------
+# Search term building blocks — max 3-4 options per clause
+# ---------------------------------------------------------------------------
+
+_CLOUD = "(aws OR gcp OR azure OR k8s OR vultr OR linode OR digitalocean OR hetzner OR contabo)"
+_SUPPORT = "(down OR broken OR unreliable OR 'no support' OR 'bad support' OR trust OR ghost OR ghosted)"
+_P2P = "(runpod OR akash OR 'vast.ai' OR 'lambda labs' OR decentralized)"
+_PAAS = "(fly.io OR heroku OR 'render.com' OR railway)"
+_GPU = "(h100 OR a100 OR gpu OR B100 OR B300)"
+_PAIN = "(terrible OR useless OR ghosted OR broken)"
+_COST = "(expensive OR insane OR overpriced OR scam OR overpaying)"
+
+# Kept for backwards-compat with generate_dynamic_keywords()
+PROVIDERS = _CLOUD
+
 SEARCH_TERMS = [
-    # Provider pain — practitioner vocabulary, not positioning vocabulary
-    "cloud support terrible",
-    "provider ghosted",
-    "provider unresponsive",
-    "cloud support response time",
-    "aws support useless",
-    "gcp support bad",
-    "azure support slow",
-    "provider disappeared",
-    "cloud support no response",
-    # Specific GPU/compute platforms — real practitioners complain here
-    "runpod issue",
-    "runpod down",
-    "vast.ai problem",
-    "lambda labs issue",
-    # Cloud cost pain — specific enough to find practitioners, not just venting
-    "aws billing surprise",
-    "unexpected cloud bill",
-    "aws cost spike",
-    "cloud egress fees",
-    "cloud bill shock",
-    "cloud vendor lock",
-    "cloud waste",
-    "serverless expensive",
-    "kubernetes costs",
-    "cloud expensive",
-    # Architecture debates — attracts infra practitioners
-    "self-hosted vs cloud",
-    "bare metal vs cloud",
-    "cloud outage",
-    "aws outage",
-    "gpu compute expensive",
-    # Audience signals — builders hitting real walls
-    "heroku alternative",
-    "render.com down",
-    "platform engineering frustration",
-    "sre incident",
-    "cloud reliability",
-    "cloud migration pain",
-    "cloud SLA",
+    # Provider support failures — named providers anchor to real incidents
+    f"({_CLOUD} OR {_P2P} OR {_PAAS}) AND {_SUPPORT}",
+    # P2P compute pain — named platforms + pain
+    f"{_P2P} {_SUPPORT}",
+    # Cloud/GPU cost and availability
+    f"{_GPU} OR {_CLOUD} AND {_COST}",
+    # Egress — the hidden charge people vent about
+    f"egress {_COST}",
+    # Cloud lock-in — people who feel trapped
+    f'{_CLOUD} AND "lock-in"',
+    # k8s / serverless cost reality
+    f"(kubernetes OR serverless) AND {_COST}",
+    # Cloud outages + SLA frustration
+    f"{_CLOUD} AND (outage OR incident) AND (SLA OR useless OR compensation OR credit OR nightmare OR burnout OR frustrating)",
+    # Cloud exit — exact phrases people actually tweet
+    f'(leaving OR ditching OR "moving off") AND {_CLOUD}',
+    # Cloud migration regret
+    f"{_CLOUD} AND migration AND (nightmare OR regret OR painful OR stuck)",
+    # Self-hosting vs cloud debate
+    '(cheaper OR better OR worth it) AND ("self-hosting" OR "self-hosted")',
+    # Provider accountability — direct positioning angle
+    f"{_CLOUD} AND (accountability OR recourse OR responsible OR support)",
 ]
 
 
@@ -479,7 +476,10 @@ def _get_target_id() -> str | None:
         try:
             data = json.loads(stdout[json_start:])
         except json.JSONDecodeError as e:
-            print(f"  _get_target_id: JSON parse failed ({e}): {stdout[json_start:json_start+300]!r}", flush=True)
+            print(
+                f"  _get_target_id: JSON parse failed ({e}): {stdout[json_start : json_start + 300]!r}",
+                flush=True,
+            )
             return None
         tabs = data.get("tabs", [])
         if tabs:
@@ -612,6 +612,16 @@ def _click(target_id: str, ref: str) -> bool:
 def _evaluate(target_id: str, js: str, timeout: int = 15) -> str | None:
     """Evaluate JavaScript on the page and return the result."""
     try:
+        js_stripped = js.strip()
+        if not js_stripped.startswith(("(", "function", "async")):
+            if ";" in js_stripped:
+                parts = [p.strip() for p in js_stripped.split(";") if p.strip()]
+                if len(parts) > 1:
+                    js = f"() => {{ {'; '.join(parts[:-1])}; return {parts[-1]}; }}"
+                else:
+                    js = f"() => {{ return {parts[0]}; }}"
+            else:
+                js = f"() => {{ return ({js_stripped}); }}"
         r = subprocess.run(
             [
                 OPENCLAW_BIN,
@@ -824,6 +834,16 @@ def _cdp_search(
     if not _navigate_and_wait(url, target_id, wait_sec=4):
         return []
 
+    # Scroll down 3 times to trigger Twitter's infinite-scroll and load more tweets.
+    # Each scroll+sleep typically adds another screenful (~10 tweets).
+    _scroll_js = "window.scrollTo(0, document.body.scrollHeight); document.querySelectorAll('article[data-testid=\"tweet\"]').length"
+    for _i in range(3):
+        n_before = _evaluate(target_id, _scroll_js, timeout=10)
+        time.sleep(2)
+        n_after = _evaluate(target_id, _scroll_js, timeout=10)
+        if n_before == n_after:
+            break  # no new tweets loaded — stop early
+
     # Extract tweet data via JavaScript
     js = """(() => {
   const articles = document.querySelectorAll('article[data-testid="tweet"]');
@@ -895,11 +915,11 @@ def _term_weight(stats: dict) -> float:
     # Hit rate signal — fast feedback, available after each run
     if candidates >= 10:  # need at least 10 candidates before judging
         hit_rate = engaged / candidates
-        if hit_rate >= 0.10:    # >=10% candidates worth engaging
+        if hit_rate >= 0.10:  # >=10% candidates worth engaging
             score *= 2.5
         elif hit_rate >= 0.05:  # 5-10%
             score *= 1.5
-        elif hit_rate == 0:     # never produced an engagement despite volume
+        elif hit_rate == 0:  # never produced an engagement despite volume
             score *= 0.3
 
     # Reply performance signal — slower, needs 24h+ for likes to land
@@ -910,7 +930,7 @@ def _term_weight(stats: dict) -> float:
             score *= 2.0
         elif avg_likes >= 1:
             score *= 1.5
-        if zero_rate >= 0.8:    # 80%+ of replies got nothing back
+        if zero_rate >= 0.8:  # 80%+ of replies got nothing back
             score *= 0.5
 
     return max(score, 0.1)  # floor: never fully exclude a term
@@ -941,46 +961,67 @@ def weighted_sample_terms(all_terms: list[str], term_stats: dict, n: int) -> lis
     return selected
 
 
-def search_candidates(terms: list[str] | None = None, limit: int = 20, term_stats: dict | None = None) -> list[dict]:
+def search_candidates(
+    terms: list[str] | None = None,
+    limit: int = 20,
+    term_stats: dict | None = None,
+    bypass_cache: bool = False,
+    since_hours: int | None = None,
+) -> list[dict]:
     """Search for engagement candidates via Chrome CDP.
 
     Results are cached per search term with a 6h TTL so consecutive runs
     (every 3h) can reuse results without re-navigating Twitter search pages.
     Cache misses fall back to CDP search and populate the cache.
+
+    bypass_cache: skip the shared cache entirely; always do a live search.
+        Used by search_queue.py so it gets fresh results every hour without
+        polluting the engagement flow's cache or being blocked by it.
+    since_hours: when bypass_cache=True, look this far back (default 2h).
+        Ignored when bypass_cache=False (cache's own timestamp is used instead).
     """
     candidates = []
     if terms is not None:
         search_terms = terms
     elif term_stats is not None:
-        search_terms = weighted_sample_terms(SEARCH_TERMS, term_stats, min(8, len(SEARCH_TERMS)))
+        search_terms = weighted_sample_terms(
+            SEARCH_TERMS, term_stats, min(12, len(SEARCH_TERMS))
+        )
     else:
-        search_terms = random.sample(SEARCH_TERMS, min(8, len(SEARCH_TERMS)))
+        search_terms = random.sample(SEARCH_TERMS, min(12, len(SEARCH_TERMS)))
 
-    search_cache = _load_search_cache()
-    terms_to_fetch: list[str] = []
-    cache_hits = 0
-
-    # Serve cached results immediately; collect terms that need a live search
-    for term in search_terms:
-        cached = _get_cached_search(search_cache, term)
-        if cached is not None:
-            cache_hits += 1
-            candidates.extend(cached)
-        else:
-            terms_to_fetch.append(term)
-
-    if cache_hits:
+    if bypass_cache:
+        terms_to_fetch = list(search_terms)
         print(
-            f"  CDP: {cache_hits}/{len(search_terms)} search term(s) served from cache",
+            f"  CDP: bypass_cache — live search for {len(terms_to_fetch)} term(s)...",
             flush=True,
         )
+    else:
+        search_cache = _load_search_cache()
+        terms_to_fetch: list[str] = []
+        cache_hits = 0
 
-    if not terms_to_fetch:
-        print(
-            f"  CDP: all {len(search_terms)} terms cached — skipping live search",
-            flush=True,
-        )
-        return candidates
+        # Serve cached results immediately; collect terms that need a live search
+        for term in search_terms:
+            cached = _get_cached_search(search_cache, term)
+            if cached is not None:
+                cache_hits += 1
+                candidates.extend(cached)
+            else:
+                terms_to_fetch.append(term)
+
+        if cache_hits:
+            print(
+                f"  CDP: {cache_hits}/{len(search_terms)} search term(s) served from cache",
+                flush=True,
+            )
+
+        if not terms_to_fetch:
+            print(
+                f"  CDP: all {len(search_terms)} terms cached — skipping live search",
+                flush=True,
+            )
+            return candidates
 
     with cdp_lock():
         target_id = _get_target_id()
@@ -989,30 +1030,43 @@ def search_candidates(terms: list[str] | None = None, limit: int = 20, term_stat
             send_error_alert("CDP search failed: no browser tab available")
             return candidates
 
-        print(f"  CDP: searching {len(terms_to_fetch)} uncached term(s)...", flush=True)
+        if not bypass_cache:
+            print(
+                f"  CDP: searching {len(terms_to_fetch)} uncached term(s)...",
+                flush=True,
+            )
 
         cache_updated = False
+        _fixed_since_dt: datetime | None = None
+        if bypass_cache:
+            _fixed_since_dt = datetime.now(timezone.utc) - timedelta(
+                hours=(since_hours if since_hours is not None else 2)
+            )
+
         for term in terms_to_fetch:
-            # Use the last time we searched this term as the since cutoff.
-            # Falls back to SEARCH_CACHE_TTL_HOURS ago for first-time queries.
-            raw_entry = search_cache.get(term.lower().strip())
-            since_dt: datetime
-            if raw_entry and raw_entry.get("cachedAt"):
-                try:
-                    since_dt = datetime.fromisoformat(
-                        raw_entry["cachedAt"].replace("Z", "+00:00")
-                    )
-                except (ValueError, TypeError):
-                    logger.debug(
-                        f"search_candidates cache date parse failed for '{term}'"
-                    )
+            if bypass_cache:
+                since_dt = _fixed_since_dt
+            else:
+                # Use the last time we searched this term as the since cutoff.
+                # Falls back to SEARCH_CACHE_TTL_HOURS ago for first-time queries.
+                raw_entry = search_cache.get(term.lower().strip())
+                since_dt: datetime
+                if raw_entry and raw_entry.get("cachedAt"):
+                    try:
+                        since_dt = datetime.fromisoformat(
+                            raw_entry["cachedAt"].replace("Z", "+00:00")
+                        )
+                    except (ValueError, TypeError):
+                        logger.debug(
+                            f"search_candidates cache date parse failed for '{term}'"
+                        )
+                        since_dt = datetime.now(timezone.utc) - timedelta(
+                            hours=SEARCH_CACHE_TTL_HOURS
+                        )
+                else:
                     since_dt = datetime.now(timezone.utc) - timedelta(
                         hours=SEARCH_CACHE_TTL_HOURS
                     )
-            else:
-                since_dt = datetime.now(timezone.utc) - timedelta(
-                    hours=SEARCH_CACHE_TTL_HOURS
-                )
 
             try:
                 tweets = _cdp_search(term, target_id, limit=limit, since_dt=since_dt)
@@ -1048,22 +1102,25 @@ def search_candidates(terms: list[str] | None = None, limit: int = 20, term_stat
                             pass  # Malformed date — keep candidate anyway
                     fresh_candidates.append(c)
 
-                if stale:
-                    print(
-                        f"  CDP: '{term}' — dropped {stale} stale (before {since_dt.strftime('%H:%M UTC')})",
-                        flush=True,
-                    )
+                hit_count = len(fresh_candidates)
+                stale_note = f", {stale} stale dropped" if stale else ""
+                since_note = f" since:{since_dt.strftime('%H:%M UTC')}" if since_dt else ""
+                print(
+                    f"  CDP: '{term}'{since_note} => {hit_count} hits{stale_note}",
+                    flush=True,
+                )
 
                 candidates.extend(fresh_candidates)
-                search_cache[term.lower().strip()] = {
-                    "cachedAt": utc_now(),
-                    "results": fresh_candidates,
-                }
-                cache_updated = True
+                if not bypass_cache:
+                    search_cache[term.lower().strip()] = {
+                        "cachedAt": utc_now(),
+                        "results": fresh_candidates,
+                    }
+                    cache_updated = True
             except Exception as e:
                 print(f"  CDP search error for '{term}': {e}", flush=True)
 
-        if cache_updated:
+        if not bypass_cache and cache_updated:
             _save_search_cache(search_cache)
 
     print(f"  CDP: {len(candidates)} fresh candidates across all terms", flush=True)

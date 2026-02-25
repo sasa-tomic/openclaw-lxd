@@ -7,7 +7,6 @@ dependencies = [
     "prefect>=3.6.18",
     "psycopg2-binary>=2.9.11",
     "requests>=2.32.5",
-    "twscrape>=0.13",
 ]
 
 [dependency-groups]

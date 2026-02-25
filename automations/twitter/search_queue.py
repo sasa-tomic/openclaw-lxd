@@ -1,195 +1,102 @@
 #!/usr/bin/env python3
-"""Fill the Twitter engagement candidate queue via twscrape (no browser needed).
+"""Manage the Twitter engagement candidate queue.
 
-Searches Twitter for relevant tweets and stores them in `candidate_queue`.
-The engagement flow drains the queue instead of doing live CDP searches,
-freeing the browser for fetch_tweet_context() and post_reply() only.
+Subcommands:
+  fill   Search Twitter via CDP and add candidates to the queue (default)
+  show   Display queued candidates
+  stats  Breakdown by search term and age
+  clear  Remove all unprocessed entries
+  drop   Remove specific tweet IDs
 
-Setup (first time):
-  uv run python search_queue.py --setup
-
-Then run searches:
-  uv run python search_queue.py           # weighted sample of terms
-  uv run python search_queue.py --all     # all SEARCH_TERMS
-  uv run python search_queue.py --n 5     # sample 5 terms
-
-The twscrape account DB lives at ~/.config/twscrape/accounts.db.
+Examples:
+  uv run python search_queue.py              # fill: weighted sample of terms
+  uv run python search_queue.py fill --all   # fill: all SEARCH_TERMS
+  uv run python search_queue.py fill -n 5    # fill: sample 5 terms
+  uv run python search_queue.py show
+  uv run python search_queue.py show --limit 20
+  uv run python search_queue.py stats
+  uv run python search_queue.py clear
+  uv run python search_queue.py drop 1234567890 9876543210
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import sys
-from datetime import datetime, timedelta, timezone
-from getpass import getpass
-from pathlib import Path
+from collections import Counter
+from datetime import datetime, timezone
 
 sys.path.insert(0, "/projects/automations/twitter")
 sys.path.insert(0, "/projects/automations")
 
-from twscrape import API
+import psycopg2.extras
 
 from db import (
+    ensure_schema,
     get_conn,
     get_engaged_tweet_ids,
+    get_queued_candidates,
     get_search_term_stats,
     insert_candidate_queue,
     queue_size,
 )
 from twitter_utils import (
-    BLOCKED_AUTHORS,
     SEARCH_TERMS,
-    is_junk,
+    search_candidates,
     utc_now,
     weighted_sample_terms,
 )
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-TWSCRAPE_DB = Path("/home/openclaw/.config/twscrape/accounts.db")
-SEARCH_HOURS_BACK = 12     # look back N hours for fresh content
-RESULTS_PER_TERM = 20      # tweets to fetch per search term
-DEFAULT_SAMPLE_SIZE = 12   # terms to sample per run when not using --all
+DEFAULT_SAMPLE_SIZE = len(SEARCH_TERMS)  # search all terms by default
 
 
 # ---------------------------------------------------------------------------
-# Account setup
+# Fill
 # ---------------------------------------------------------------------------
 
 
-async def cmd_setup(api: API) -> int:
-    print("=== twscrape Account Setup ===")
-    print("You need the credentials for the @DecentCloud_org account.")
-    print()
-    username = input("Twitter username (without @): ").strip()
-    password = getpass("Twitter password: ")
-    email = input("Account email: ").strip()
-    email_password = getpass(
-        "Email password (for 2FA verification codes — can be same as Twitter password): "
-    ).strip()
-
-    await api.pool.add_account(username, password, email, email_password or password)
-    print(f"\nAdded @{username}. Logging in (may take a few seconds)...")
-    await api.pool.login_all()
-
-    accounts = await api.pool.get_all()
-    active = [a for a in accounts if a.active]
-    if active:
-        print(f"✓ Login successful. {len(active)} account(s) active.")
-        return 0
-    else:
-        print("✗ Login failed — check credentials and try again.")
-        return 1
-
-
-# ---------------------------------------------------------------------------
-# Search
-# ---------------------------------------------------------------------------
-
-
-async def search_terms(
-    api: API,
+def fill_queue(
+    conn,
     terms: list[str],
+    term_stats: dict,
     engaged_ids: set[str],
-    hours_back: int = SEARCH_HOURS_BACK,
-    limit_per_term: int = RESULTS_PER_TERM,
 ) -> list[dict]:
-    """Search all terms via twscrape, return deduplicated candidates."""
-    since_dt = datetime.now(timezone.utc) - timedelta(hours=hours_back)
-    since_ts = int(since_dt.timestamp())
+    """Search via CDP and return new candidates ready to insert into the queue."""
+    cdp_candidates = search_candidates(
+        terms=terms, term_stats=term_stats, bypass_cache=True, since_hours=2, limit=50
+    )
 
-    seen: dict[str, dict] = {}  # tweet_id → candidate (dedup across terms)
-    blocked = {a.lower() for a in BLOCKED_AUTHORS}
-
-    for term in terms:
-        print(f"  Searching: {term!r}...", flush=True)
-        term_count = 0
-        try:
-            # Twitter search operators: since_time, -is:retweet, lang:en
-            query = f"{term} since_time:{since_ts} -is:retweet lang:en"
-            async for tweet in api.search(query, limit=limit_per_term):
-                tid = str(tweet.id)
-
-                # Skip duplicates and already-engaged tweets
-                if tid in seen or tid in engaged_ids:
-                    continue
-
-                # Skip blocked authors
-                author = tweet.user.username if tweet.user else ""
-                if author.lower() in blocked:
-                    continue
-
-                # Skip junk content
-                text = tweet.rawContent or ""
-                if is_junk(text):
-                    continue
-
-                seen[tid] = {
-                    "tweet_id": tid,
-                    "author": author or "unknown",
-                    "text": text[:500],
-                    "search_term": term,
-                    "url": f"https://x.com/i/web/status/{tid}",
-                    "tweet_datetime": tweet.date,
-                    "likes": tweet.likeCount or 0,
-                    "retweets": tweet.retweetCount or 0,
-                    "replies": tweet.replyCount or 0,
-                }
-                term_count += 1
-
-        except Exception as e:
-            print(f"    Error searching {term!r}: {e}", flush=True)
-
-        print(f"    → {term_count} new candidates", flush=True)
-
-    return list(seen.values())
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
-async def main_async(args: argparse.Namespace) -> int:
-    TWSCRAPE_DB.parent.mkdir(parents=True, exist_ok=True)
-    api = API(str(TWSCRAPE_DB))
-
-    if args.setup:
-        return await cmd_setup(api)
-
-    # Verify we have active accounts
-    accounts = await api.pool.get_all()
-    active = [a for a in accounts if a.active]
-    if not accounts:
-        print(
-            "ERROR: No twscrape accounts configured.\n"
-            "Run: uv run python search_queue.py --setup",
-            file=sys.stderr,
+    already_queued = {c["tweetId"] for c in get_queued_candidates(conn, limit=10000)}
+    result = []
+    for c in cdp_candidates:
+        tid = str(c.get("tweetId", ""))
+        if not tid or tid in engaged_ids or tid in already_queued:
+            continue
+        result.append(
+            {
+                "tweet_id": tid,
+                "author": c.get("author") or "unknown",
+                "text": (c.get("text") or "")[:500],
+                "search_term": c.get("searchTerm") or "",
+                "url": c.get("url") or f"https://x.com/i/web/status/{tid}",
+                "tweet_datetime": None,
+                "likes": c.get("likes", 0),
+                "retweets": c.get("retweets", 0),
+                "replies": c.get("replies", 0),
+            }
         )
-        return 1
-    if not active:
-        print(
-            f"WARNING: {len(accounts)} account(s) configured but none active. "
-            "Attempting re-login...",
-            flush=True,
-        )
-        await api.pool.login_all()
-        active = [a for a in await api.pool.get_all() if a.active]
-        if not active:
-            print("ERROR: Login failed. Check credentials with --setup.", file=sys.stderr)
-            return 1
+    return result
 
-    print(f"twscrape: {len(active)}/{len(accounts)} account(s) active", flush=True)
+
+def cmd_fill(args: argparse.Namespace) -> int:
+    print("=== SEARCH QUEUE FILL ===", flush=True)
     print(f"Time: {utc_now()}", flush=True)
 
     with get_conn() as conn:
+        ensure_schema(conn)
         engaged_ids = get_engaged_tweet_ids(conn)
         term_stats = get_search_term_stats(conn)
 
-        # Select terms to search
         if args.all:
             terms = list(SEARCH_TERMS)
             print(f"Searching all {len(terms)} terms...", flush=True)
@@ -200,67 +107,235 @@ async def main_async(args: argparse.Namespace) -> int:
             )
             print(f"Searching {len(terms)} weighted terms...", flush=True)
 
-        candidates = await search_terms(
-            api,
-            terms,
-            engaged_ids,
-            hours_back=args.hours,
-            limit_per_term=args.limit,
-        )
+        candidates = fill_queue(conn, terms, term_stats, engaged_ids)
 
-        print(f"\nFound {len(candidates)} fresh candidates total", flush=True)
-
+        print(f"\nFound {len(candidates)} fresh candidates", flush=True)
         if candidates:
             inserted = insert_candidate_queue(conn, candidates)
             print(f"Inserted {inserted} new candidates into queue", flush=True)
 
         size = queue_size(conn)
-        print(
-            f"Queue: {size} unprocessed candidates ready for engagement flow",
-            flush=True,
-        )
+        print(f"Queue: {size} unprocessed candidates ready for engagement", flush=True)
 
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Show
+# ---------------------------------------------------------------------------
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    with get_conn() as conn:
+        ensure_schema(conn)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT tweet_id, author, search_term, queued_at, text
+                FROM candidate_queue
+                WHERE processed_at IS NULL
+                  AND queued_at > now() - interval '24 hours'
+                  AND tweet_id NOT IN (SELECT tweet_id FROM engagements)
+                ORDER BY queued_at DESC
+                LIMIT %s
+                """,
+                (args.limit,),
+            )
+            rows = cur.fetchall()
+        total = queue_size(conn)
+
+    if not rows:
+        print("Queue is empty.")
+        return 0
+
+    now = datetime.now(timezone.utc)
+    print(f"{'TWEET_ID':<20} {'AUTHOR':<22} {'TERM':<28} {'AGE':>6}  TEXT")
+    print("-" * 160)
+    for r in rows:
+        age = now - r["queued_at"].replace(tzinfo=timezone.utc)
+        mins = int(age.total_seconds() / 60)
+        age_str = f"{mins}m" if mins < 60 else f"{mins // 60}h{mins % 60:02d}m"
+        search_term = (r["search_term"] or "")[:28]
+        text = (r["text"] or "").replace("\n", " ")[:100]
+        print(
+            f"{r['tweet_id']:<20} @{(r['author'] or ''):<21} "
+            f"{search_term:<28} {age_str:>6}  {text}"
+        )
+
+    shown = len(rows)
+    print(f"\n{shown} shown" + (f" (of {total} total)" if total > shown else "") + ".")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+
+def cmd_stats(_args: argparse.Namespace) -> int:
+    with get_conn() as conn:
+        ensure_schema(conn)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT search_term, queued_at
+                FROM candidate_queue
+                WHERE processed_at IS NULL
+                  AND queued_at > now() - interval '24 hours'
+                  AND tweet_id NOT IN (SELECT tweet_id FROM engagements)
+                ORDER BY queued_at ASC
+                """
+            )
+            rows = cur.fetchall()
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM candidate_queue WHERE processed_at IS NOT NULL"
+            )
+            processed_total = cur.fetchone()[0]
+
+    if not rows:
+        print(f"Queue is empty.  ({processed_total} candidates processed all-time)")
+        return 0
+
+    now = datetime.now(timezone.utc)
+    by_term: Counter = Counter()
+    by_age: Counter = Counter({"<1h": 0, "1-6h": 0, "6-24h": 0})
+
+    for r in rows:
+        by_term[r["search_term"] or "(none)"] += 1
+        age_h = (
+            now - r["queued_at"].replace(tzinfo=timezone.utc)
+        ).total_seconds() / 3600
+        if age_h < 1:
+            by_age["<1h"] += 1
+        elif age_h < 6:
+            by_age["1-6h"] += 1
+        else:
+            by_age["6-24h"] += 1
+
+    print(f"Unprocessed candidates: {len(rows)}")
+    print(f"Processed all-time:     {processed_total}")
+    print()
+    print("By search term:")
+    for term, count in by_term.most_common():
+        bar = "█" * count
+        print(f"  {term:<35} {count:>3}  {bar}")
+    print()
+    print("By age:")
+    for bucket, count in by_age.items():
+        print(f"  {bucket:<8} {count}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Clear
+# ---------------------------------------------------------------------------
+
+
+def cmd_clear(_args: argparse.Namespace) -> int:
+    with get_conn() as conn:
+        ensure_schema(conn)
+        size = queue_size(conn)
+        if size == 0:
+            print("Queue is already empty.")
+            return 0
+        confirm = input(f"Clear {size} unprocessed candidates? [y/N] ").strip().lower()
+        if confirm != "y":
+            print("Aborted.")
+            return 0
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM candidate_queue
+                WHERE processed_at IS NULL
+                  AND queued_at > now() - interval '24 hours'
+                  AND tweet_id NOT IN (SELECT tweet_id FROM engagements)
+                """
+            )
+            deleted = cur.rowcount
+    print(f"Cleared {deleted} entries.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Drop
+# ---------------------------------------------------------------------------
+
+
+def cmd_drop(args: argparse.Namespace) -> int:
+    ids = args.tweet_ids
+    with get_conn() as conn:
+        ensure_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM candidate_queue WHERE tweet_id = ANY(%s)",
+                (ids,),
+            )
+            deleted = cur.rowcount
+    print(f"Dropped {deleted} of {len(ids)} requested entries.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Fill Twitter engagement queue via twscrape (no browser needed)",
+        description="Manage the Twitter engagement candidate queue",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument(
-        "--setup",
-        action="store_true",
-        help="Add Twitter account credentials interactively",
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Search all SEARCH_TERMS (default: weighted sample)",
-    )
-    parser.add_argument(
+    sub = parser.add_subparsers(dest="cmd")
+
+    # fill (default)
+    p_fill = sub.add_parser("fill", help="Search Twitter and add candidates to queue")
+    p_fill.add_argument("--all", action="store_true", help="Search all SEARCH_TERMS")
+    p_fill.add_argument(
         "-n",
         type=int,
         metavar="N",
-        help=f"Number of terms to sample (default: {DEFAULT_SAMPLE_SIZE})",
+        help=f"Terms to sample (default: {DEFAULT_SAMPLE_SIZE})",
     )
-    parser.add_argument(
-        "--hours",
-        type=int,
-        default=SEARCH_HOURS_BACK,
-        metavar="H",
-        help=f"Look back N hours (default: {SEARCH_HOURS_BACK})",
-    )
-    parser.add_argument(
+
+    # show
+    p_show = sub.add_parser("show", help="Display queued candidates")
+    p_show.add_argument(
         "--limit",
         type=int,
-        default=RESULTS_PER_TERM,
+        default=50,
         metavar="N",
-        help=f"Max results per term (default: {RESULTS_PER_TERM})",
+        help="Max rows to display (default: 50)",
     )
+
+    # stats
+    sub.add_parser("stats", help="Breakdown by search term and age")
+
+    # clear
+    sub.add_parser("clear", help="Remove all unprocessed entries")
+
+    # drop
+    p_drop = sub.add_parser("drop", help="Remove specific tweet IDs from queue")
+    p_drop.add_argument("tweet_ids", nargs="+", metavar="TWEET_ID")
+
     args = parser.parse_args()
-    return asyncio.run(main_async(args))
+
+    # Default to 'fill' when called with no subcommand (preserves old behaviour)
+    if args.cmd is None:
+        args.cmd = "fill"
+        args.all = False
+        args.n = None
+
+    dispatch = {
+        "fill": cmd_fill,
+        "show": cmd_show,
+        "stats": cmd_stats,
+        "clear": cmd_clear,
+        "drop": cmd_drop,
+    }
+    return dispatch[args.cmd](args)
 
 
 if __name__ == "__main__":

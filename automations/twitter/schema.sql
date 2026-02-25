@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS social_edges (
 CREATE TABLE IF NOT EXISTS engagements (
     tweet_id              TEXT PRIMARY KEY,
     target_username       TEXT,
+    target_tweet_text     TEXT,
+    tweet_url             TEXT,
+    tweet_likes           INTEGER DEFAULT 0,
+    tweet_rts             INTEGER DEFAULT 0,
+    tweet_replies         INTEGER DEFAULT 0,
     our_reply_text        TEXT,
     our_reply_id          TEXT,
     replied_at            TIMESTAMPTZ DEFAULT now(),
