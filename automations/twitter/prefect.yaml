@@ -1,0 +1,112 @@
+# Prefect deployment configuration for Twitter automation
+# Run: uv run prefect deploy --all
+
+deployments:
+  - name: engagement
+    description: "Autonomous Twitter engagement"
+    version: "1.0"
+    tags: ["twitter", "engagement"]
+    schedule:
+      cron: "0 7,9,11,13,17,20,23,2 * * *"  # 8x daily: morning fill + US peak
+      timezone: "UTC"
+    entrypoint: twitter_scheduler.py:engagement_flow
+    work_pool:
+      name: twitter-automation
+
+  - name: original-content
+    description: "Post original Twitter content"
+    version: "1.0"
+    tags: ["twitter", "content"]
+    schedule:
+      cron: "30 7,10,16 * * *"  # 3x daily at UTC 07:30, 10:30, 16:30
+      timezone: "UTC"
+    entrypoint: twitter_scheduler.py:original_content_flow
+    work_pool:
+      name: twitter-automation
+
+  - name: weekly-thread
+    description: "Post weekly technical thread"
+    version: "1.0"
+    tags: ["twitter", "thread"]
+    schedule:
+      cron: "0 15 * * 3"  # Wednesday 15:00 UTC
+      timezone: "UTC"
+    entrypoint: twitter_scheduler.py:weekly_thread_flow
+    work_pool:
+      name: twitter-automation
+
+  - name: daily-eval
+    description: "Daily strategy evaluation"
+    version: "1.0"
+    tags: ["twitter", "strategy"]
+    schedule:
+      cron: "0 7 * * *"  # Daily 7:00 UTC
+      timezone: "UTC"
+    entrypoint: twitter_scheduler.py:daily_eval_flow
+    work_pool:
+      name: twitter-automation
+
+  - name: morning-research
+    description: "Morning research and content ideation"
+    version: "1.0"
+    tags: ["twitter", "research"]
+    schedule:
+      cron: "0 8 * * *"  # Daily 8:00 UTC
+      timezone: "UTC"
+    entrypoint: twitter_scheduler.py:morning_research_flow
+    work_pool:
+      name: twitter-automation
+
+  - name: cdp-health
+    description: "CDP health check"
+    version: "1.0"
+    tags: ["twitter", "health"]
+    schedule:
+      interval: 900  # Every 15 minutes
+    entrypoint: twitter_scheduler.py:cdp_health_flow
+    work_pool:
+      name: twitter-automation
+
+  - name: reply-monitor
+    description: "Real-time reply and mention monitoring"
+    version: "1.0"
+    tags: ["twitter", "monitor"]
+    schedule:
+      cron: "*/10 * * * *"  # Every 10 minutes
+      timezone: "UTC"
+    entrypoint: twitter_scheduler.py:reply_monitor_flow
+    work_pool:
+      name: twitter-automation
+
+  - name: target-monitor
+    description: "Monitor curated target accounts for fast-reply"
+    version: "1.0"
+    tags: ["twitter", "targets"]
+    schedule:
+      cron: "0 8,12,18,22 * * *"  # 4x daily: 08:00, 12:00, 18:00, 22:00 UTC
+      timezone: "UTC"
+    entrypoint: twitter_scheduler.py:target_monitor_flow
+    work_pool:
+      name: twitter-automation
+
+  - name: timeline-monitor
+    description: "Monitor Following feed for near-realtime engagement"
+    version: "1.0"
+    tags: ["twitter", "timeline"]
+    schedule:
+      cron: "5-59/10 * * * *"  # Every 10 min, offset +5 min from reply-monitor (:05, :15, :25, ...)
+      timezone: "UTC"
+    entrypoint: twitter_scheduler.py:timeline_monitor_flow
+    work_pool:
+      name: twitter-automation
+
+  - name: account-discovery
+    description: "Discover and score new candidate accounts via social graph"
+    version: "1.0"
+    tags: ["twitter", "discovery"]
+    schedule:
+      cron: "0 6 * * *"  # Daily at 06:00 UTC — low-traffic window, no auto-follow
+      timezone: "UTC"
+    entrypoint: twitter_scheduler.py:account_discovery_flow
+    work_pool:
+      name: twitter-automation

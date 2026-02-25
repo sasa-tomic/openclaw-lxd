@@ -1,0 +1,16 @@
+[project]
+name = "twitter"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "prefect>=3.6.18",
+    "psycopg2-binary>=2.9.11",
+    "requests>=2.32.5",
+    "twscrape>=0.13",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

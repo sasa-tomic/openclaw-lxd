@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""Tests for Twitter engagement analytics and Premium+ thread features.
+
+Tests:
+1. ourReplyId is captured in state after successful engagement post
+2. gather_metrics includes reply_performances from state
+3. Thread length is 6-10 after generation (Premium+ upgrade)
+4. get_tweet_stats returns the expected shape
+
+Run from repo root:
+    pytest twitter/tests/test_analytics.py -v
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import types
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+# Ensure twitter/ and the project root are on the path so imports work
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))  # /projects/automations
+sys.path.insert(0, str(Path(__file__).parent.parent))         # /projects/automations/twitter
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _utc_hours_ago(hours: float) -> str:
+    ts = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return ts.isoformat().replace("+00:00", "Z")
+
+
+# ---------------------------------------------------------------------------
+# Test 1: ourReplyId captured in engagedPosts state after posting a reply
+# ---------------------------------------------------------------------------
+
+class TestOurReplyIdCapture:
+    """Verify that twitter-engagement.py stores ourReplyId in state entries."""
+
+    def _build_state_entry(self, our_reply_id: str | None) -> dict:
+        """Simulate the state dict entry that the engagement script creates."""
+        entry = {
+            "tweetId": "111222333",
+            "timestamp": _utc_hours_ago(1),
+            "author": "testauthor",
+            "replyText": "Great insight on egress fees.",
+            "llmReasoning": "Good match for marketplace trust angle",
+            "searchTerm": "cloud egress fees",
+            "ourReplyId": our_reply_id,
+        }
+        return entry
+
+    def test_reply_id_present_when_captured(self):
+        entry = self._build_state_entry("999888777666555444")
+        assert entry["ourReplyId"] == "999888777666555444"
+
+    def test_reply_id_none_when_not_captured(self):
+        entry = self._build_state_entry(None)
+        assert entry.get("ourReplyId") is None
+
+    def test_engagement_script_uses_get_latest_own_tweet_id(self):
+        """Verify twitter-engagement.py imports get_latest_own_tweet_id."""
+        engagement_path = Path(__file__).parent.parent.parent / "heartbeat" / "twitter-engagement.py"
+        source = engagement_path.read_text()
+        assert "get_latest_own_tweet_id" in source, (
+            "twitter-engagement.py must import and call get_latest_own_tweet_id "
+            "to capture ourReplyId after posting"
+        )
+
+    def test_engagement_script_stores_our_reply_id(self):
+        """Verify twitter-engagement.py stores ourReplyId in the state entry."""
+        engagement_path = Path(__file__).parent.parent.parent / "heartbeat" / "twitter-engagement.py"
+        source = engagement_path.read_text()
+        assert '"ourReplyId"' in source or "'ourReplyId'" in source, (
+            "twitter-engagement.py must store ourReplyId in the engagedPosts state entry"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 2: gather_metrics includes reply_performances
+# ---------------------------------------------------------------------------
+
+class TestGatherMetricsReplyPerformances:
+    """Verify that gather_metrics() collects reply performance data from state."""
+
+    def _make_state(self, entries: list[dict]) -> dict:
+        return {"engagedPosts": entries, "recentPosts": [], "followedUsers": {}}
+
+    def test_reply_performances_in_metrics(self):
+        """gather_metrics returns replyPerformances for entries in 2-24h window."""
+        from twitter import daily_strategy_eval  # type: ignore
+
+        state = self._make_state([
+            {
+                "tweetId": "111",
+                "ourReplyId": "222",
+                "timestamp": _utc_hours_ago(5),   # 5h ago — inside 2-24h window
+                "author": "alice",
+                "replyText": "The egress tax is brutal.",
+                "searchTerm": "cloud egress",
+            }
+        ])
+
+        with patch.object(daily_strategy_eval, "load_eval_history", return_value=[]):
+            with patch.object(daily_strategy_eval, "load_state", return_value=state):
+                with patch.object(daily_strategy_eval, "get_user_follower_count", return_value=250):
+                    with patch.object(daily_strategy_eval, "get_tweet_stats", return_value={"likes": 7, "retweets": 2, "replies": 1}):
+                        metrics = daily_strategy_eval.gather_metrics()
+
+        assert "replyPerformances" in metrics
+        assert len(metrics["replyPerformances"]) == 1
+        perf = metrics["replyPerformances"][0]
+        assert perf["replyId"] == "222"
+        assert perf["author"] == "alice"
+        assert perf["likes"] == 7
+        assert perf["retweets"] == 2
+
+    def test_replies_outside_window_excluded(self):
+        """Replies <2h old or >24h old are excluded from performance check."""
+        from twitter import daily_strategy_eval  # type: ignore
+
+        state = self._make_state([
+            {
+                "tweetId": "333",
+                "ourReplyId": "444",
+                "timestamp": _utc_hours_ago(0.5),   # too recent (<2h)
+                "author": "bob",
+                "replyText": "Too new.",
+                "searchTerm": "cloud costs",
+            },
+            {
+                "tweetId": "555",
+                "ourReplyId": "666",
+                "timestamp": _utc_hours_ago(30),    # too old (>24h)
+                "author": "carol",
+                "replyText": "Too old.",
+                "searchTerm": "cloud costs",
+            },
+        ])
+
+        with patch.object(daily_strategy_eval, "load_eval_history", return_value=[]):
+            with patch.object(daily_strategy_eval, "load_state", return_value=state):
+                with patch.object(daily_strategy_eval, "get_user_follower_count", return_value=250):
+                    with patch.object(daily_strategy_eval, "get_tweet_stats") as mock_stats:
+                        metrics = daily_strategy_eval.gather_metrics()
+
+        assert metrics["replyPerformances"] == []
+        mock_stats.assert_not_called()
+
+    def test_no_our_reply_id_skipped(self):
+        """Entries without ourReplyId are silently skipped."""
+        from twitter import daily_strategy_eval  # type: ignore
+
+        state = self._make_state([
+            {
+                "tweetId": "777",
+                "timestamp": _utc_hours_ago(5),
+                "author": "dave",
+                "replyText": "No reply ID.",
+                # No ourReplyId key at all
+            }
+        ])
+
+        with patch.object(daily_strategy_eval, "load_eval_history", return_value=[]):
+            with patch.object(daily_strategy_eval, "load_state", return_value=state):
+                with patch.object(daily_strategy_eval, "get_user_follower_count", return_value=250):
+                    metrics = daily_strategy_eval.gather_metrics()
+
+        assert metrics["replyPerformances"] == []
+
+
+# ---------------------------------------------------------------------------
+# Test 3: Thread length is 6-10 after generation
+# ---------------------------------------------------------------------------
+
+class TestThreadLength:
+    """Verify that generate_thread() produces 6-10 tweets and uses updated prompt."""
+
+    def test_thread_topics_has_new_entries(self):
+        """THREAD_TOPICS list includes the new Premium+ topics."""
+        from twitter import post_thread  # type: ignore
+
+        expected_new_topics = [
+            "the hidden economics of cloud egress: why providers make it free in, expensive out",
+            "why decentralized cloud needs Airbnb-style reviews (not just lower prices)",
+            "the P2P compute trust gap: what Akash/Flux got wrong",
+            "cloud reliability theater: SLAs that sound good but pay nothing",
+            "why the FinOps movement proves cloud pricing is deliberately opaque",
+            "GPU compute: the $3/hr vs $0.30/hr gap that nobody talks about",
+        ]
+        for topic in expected_new_topics:
+            assert topic in post_thread.THREAD_TOPICS, (
+                f"Expected new Premium+ topic not found in THREAD_TOPICS: {topic!r}"
+            )
+
+    def test_thread_topics_minimum_length(self):
+        """THREAD_TOPICS must have at least 20 entries after additions."""
+        from twitter import post_thread  # type: ignore
+
+        assert len(post_thread.THREAD_TOPICS) >= 20, (
+            f"Expected at least 20 THREAD_TOPICS, got {len(post_thread.THREAD_TOPICS)}"
+        )
+
+    @patch("twitter.post_thread.call_llm")
+    @patch("twitter.post_thread.load_project_context", return_value="# Strategy context")
+    def test_generate_thread_accepts_6_to_10_tweets(self, mock_context, mock_llm):
+        """generate_thread() accepts and returns 6-10 tweets from LLM."""
+        from twitter import post_thread  # type: ignore
+
+        # Simulate LLM returning 8 tweets
+        tweets_8 = [
+            f"{i}/ Tweet number {i} with enough content to be valid."
+            for i in range(1, 9)
+        ]
+        mock_llm.return_value = json.dumps({
+            "topic": "test topic",
+            "tweets": tweets_8
+        })
+
+        state: dict = {"threads": [], "recentPosts": [], "engagedPosts": []}
+        result = post_thread.generate_thread(state)
+
+        assert result is not None, "generate_thread returned None for 8-tweet response"
+        assert 6 <= len(result["tweets"]) <= 10, (
+            f"Expected 6-10 tweets, got {len(result['tweets'])}"
+        )
+
+    @patch("twitter.post_thread.call_llm")
+    @patch("twitter.post_thread.load_project_context", return_value="# Strategy context")
+    def test_generate_thread_prompt_mentions_6_10(self, mock_context, mock_llm):
+        """The LLM prompt must request 6-10 tweets (not 5-7)."""
+        from twitter import post_thread  # type: ignore
+
+        mock_llm.return_value = json.dumps({
+            "topic": "egress fees",
+            "tweets": [f"{i}/ Tweet {i}" for i in range(1, 7)]
+        })
+
+        state: dict = {"threads": [], "recentPosts": [], "engagedPosts": []}
+        post_thread.generate_thread(state)
+
+        # Inspect what was passed to call_llm
+        assert mock_llm.called, "call_llm was not called"
+        prompt_arg = mock_llm.call_args[0][0]
+        assert "6-10" in prompt_arg, (
+            "LLM prompt must mention '6-10' for Premium+ thread length. "
+            f"Got prompt starting with: {prompt_arg[:200]}"
+        )
+        assert "5-7" not in prompt_arg, (
+            "LLM prompt still mentions old '5-7' length — must be updated to 6-10"
+        )
+
+    @patch("twitter.post_thread.call_llm")
+    @patch("twitter.post_thread.load_project_context", return_value="# Strategy context")
+    def test_generate_thread_rejects_too_short(self, mock_context, mock_llm):
+        """generate_thread() rejects threads with fewer than 3 tweets."""
+        from twitter import post_thread  # type: ignore
+
+        mock_llm.return_value = json.dumps({
+            "topic": "test",
+            "tweets": ["1/ Only one tweet."]
+        })
+
+        state: dict = {"threads": [], "recentPosts": [], "engagedPosts": []}
+        result = post_thread.generate_thread(state)
+        assert result is None, "generate_thread should return None for 1-tweet result"
+
+
+# ---------------------------------------------------------------------------
+# Test 4: get_tweet_stats shape
+# ---------------------------------------------------------------------------
+
+class TestGetTweetStatsShape:
+    """Verify get_tweet_stats returns correct dict shape (via mocked CDP)."""
+
+    def test_get_tweet_stats_returns_correct_keys(self):
+        """get_tweet_stats must return dict with likes/retweets/replies."""
+        from twitter import twitter_utils  # type: ignore
+
+        mock_raw = json.dumps(json.dumps({"likes": 5, "retweets": 2, "replies": 1}))
+
+        with patch.object(twitter_utils, "_get_target_id", return_value="mock-target"):
+            with patch.object(twitter_utils, "_navigate_and_wait", return_value=True):
+                with patch.object(twitter_utils, "_evaluate", return_value=mock_raw):
+                    result = twitter_utils.get_tweet_stats("123456789")
+
+        assert result is not None
+        assert set(result.keys()) == {"likes", "retweets", "replies"}
+        assert result["likes"] == 5
+        assert result["retweets"] == 2
+        assert result["replies"] == 1
+
+    def test_get_tweet_stats_returns_none_on_nav_failure(self):
+        """get_tweet_stats returns None when navigation fails."""
+        from twitter import twitter_utils  # type: ignore
+
+        with patch.object(twitter_utils, "_get_target_id", return_value="mock-target"):
+            with patch.object(twitter_utils, "_navigate_and_wait", return_value=False):
+                result = twitter_utils.get_tweet_stats("000")
+
+        assert result is None
+
+    def test_get_tweet_stats_returns_none_on_no_target(self):
+        """get_tweet_stats returns None when no browser target is available."""
+        from twitter import twitter_utils  # type: ignore
+
+        with patch.object(twitter_utils, "_get_target_id", return_value=None):
+            result = twitter_utils.get_tweet_stats("000")
+
+        assert result is None
+
+    def test_get_tweet_stats_handles_zero_counts(self):
+        """get_tweet_stats handles all-zero stats without error."""
+        from twitter import twitter_utils  # type: ignore
+
+        mock_raw = json.dumps(json.dumps({"likes": 0, "retweets": 0, "replies": 0}))
+
+        with patch.object(twitter_utils, "_get_target_id", return_value="mock-target"):
+            with patch.object(twitter_utils, "_navigate_and_wait", return_value=True):
+                with patch.object(twitter_utils, "_evaluate", return_value=mock_raw):
+                    result = twitter_utils.get_tweet_stats("111")
+
+        assert result == {"likes": 0, "retweets": 0, "replies": 0}
+
+    def test_get_tweet_stats_function_exists(self):
+        """get_tweet_stats must be importable from twitter_utils."""
+        from twitter import twitter_utils  # type: ignore
+        assert callable(twitter_utils.get_tweet_stats), (
+            "get_tweet_stats must be a callable function in twitter_utils"
+        )

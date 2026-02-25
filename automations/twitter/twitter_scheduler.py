@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Consolidated Twitter automation scheduler using Prefect.
+
+Replaces 7 systemd services with a single Prefect deployment.
+
+Setup:
+  1. uv sync
+  2. prefect server start  (in one terminal)
+  3. prefect worker start --pool twitter-automation  (in another)
+  4. prefect deploy --all  (to register schedules)
+  5. View UI at http://localhost:4200
+
+Or run ad-hoc:
+  uv run python twitter_scheduler.py <flow>
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+from prefect import flow, get_run_logger
+
+HEARTBEAT_DIR = Path("/projects/automations/heartbeat")
+TWITTER_DIR = Path("/projects/automations/twitter")
+PYTHON = sys.executable
+
+
+def _stream_pipe(pipe, log_fn, print_fn):
+    """Drain a pipe line-by-line, calling log_fn (or print_fn if no logger)."""
+    for raw_line in pipe:
+        line = raw_line.rstrip()
+        if line:
+            if log_fn:
+                log_fn(line)
+            else:
+                print_fn(line)
+
+
+def run_script(script_path: Path, timeout: int = 3600, logger=None) -> int:
+    """Run a Python script, streaming stdout→info and stderr→error to the logger."""
+    process = subprocess.Popen(
+        [PYTHON, "-u", str(script_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=script_path.parent,
+    )
+
+    # Drain stdout and stderr concurrently so neither blocks the other.
+    stdout_thread = threading.Thread(
+        target=_stream_pipe,
+        args=(
+            process.stdout,
+            logger.info if logger else None,
+            lambda line: print(line, flush=True),
+        ),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_stream_pipe,
+        args=(
+            process.stderr,
+            logger.error if logger else None,
+            lambda line: print(line, file=sys.stderr, flush=True),
+        ),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        if logger:
+            logger.error(f"Script timed out after {timeout}s")
+        return 124
+    except Exception as e:
+        if logger:
+            logger.error(f"Script error: {e}")
+        return 1
+    finally:
+        stdout_thread.join()
+        stderr_thread.join()
+
+    rc = process.returncode
+    if rc != 0 and logger:
+        logger.error(f"{script_path.name} exited with code {rc}")
+    return rc
+
+
+@flow(name="twitter-engagement", log_prints=True)
+def engagement_flow():
+    """Autonomous Twitter engagement - 5x daily."""
+    logger = get_run_logger()
+    logger.info("Starting engagement run")
+    code = run_script(HEARTBEAT_DIR / "twitter-engagement.py", logger=logger)
+    logger.info(f"Engagement completed with code {code}")
+    return code
+
+
+@flow(name="twitter-original-content", log_prints=True)
+def original_content_flow():
+    """Post original content - 2x daily."""
+    logger = get_run_logger()
+    logger.info("Starting original content post")
+    code = run_script(TWITTER_DIR / "post_original_content.py", logger=logger)
+    logger.info(f"Original content completed with code {code}")
+    return code
+
+
+@flow(name="twitter-weekly-thread", log_prints=True)
+def weekly_thread_flow():
+    """Post weekly thread - Wed 15:00 UTC."""
+    logger = get_run_logger()
+    logger.info("Starting weekly thread post")
+    code = run_script(TWITTER_DIR / "post_thread.py", timeout=1800, logger=logger)
+    logger.info(f"Weekly thread completed with code {code}")
+    return code
+
+
+@flow(name="twitter-daily-eval", log_prints=True)
+def daily_eval_flow():
+    """Daily strategy evaluation - 7:00 UTC."""
+    logger = get_run_logger()
+    logger.info("Starting daily strategy eval")
+    code = run_script(TWITTER_DIR / "daily_strategy_eval.py", logger=logger)
+    logger.info(f"Daily eval completed with code {code}")
+    return code
+
+
+@flow(name="twitter-morning-research", log_prints=True)
+def morning_research_flow():
+    """Morning research - 8:00 UTC."""
+    logger = get_run_logger()
+    logger.info("Starting morning research")
+    code = run_script(HEARTBEAT_DIR / "twitter_morning.py", logger=logger)
+    logger.info(f"Morning research completed with code {code}")
+    return code
+
+
+@flow(name="twitter-cdp-health", log_prints=True)
+def cdp_health_flow():
+    """CDP health check - every 15 min."""
+    logger = get_run_logger()
+    logger.info("Starting CDP health check")
+    code = run_script(TWITTER_DIR / "cdp_health_check.py", timeout=60, logger=logger)
+    logger.info(f"CDP health check completed with code {code}")
+    return code
+
+
+@flow(name="twitter-reply-monitor", log_prints=True)
+def reply_monitor_flow():
+    """Monitor and respond to replies/mentions — every 5 min."""
+    logger = get_run_logger()
+    logger.info("Starting reply monitor")
+    code = run_script(HEARTBEAT_DIR / "reply_monitor.py", timeout=300, logger=logger)
+    logger.info(f"Reply monitor completed with code {code}")
+    return code
+
+
+
+@flow(name="twitter-target-monitor", log_prints=True)
+def target_monitor_flow():
+    """Monitor target accounts for fast-reply opportunities -- every 30 min."""
+    logger = get_run_logger()
+    logger.info("Starting target account monitor")
+    code = run_script(HEARTBEAT_DIR / "target_monitor.py", timeout=600, logger=logger)
+    logger.info(f"Target monitor completed with code {code}")
+    return code
+
+
+@flow(name="twitter-timeline-monitor", log_prints=True)
+def timeline_monitor_flow():
+    """Monitor Following feed for near-realtime reply opportunities — every 5 min."""
+    logger = get_run_logger()
+    logger.info("Starting timeline monitor")
+    code = run_script(HEARTBEAT_DIR / "timeline_monitor.py", timeout=300, logger=logger)
+    logger.info(f"Timeline monitor completed with code {code}")
+    return code
+
+
+@flow(name="twitter-search-queue", log_prints=True)
+def search_queue_flow():
+    """Fill candidate queue via twscrape (no browser) — every hour."""
+    logger = get_run_logger()
+    logger.info("Starting search queue fill")
+    code = run_script(TWITTER_DIR / "search_queue.py", timeout=300, logger=logger)
+    logger.info(f"Search queue completed with code {code}")
+    return code
+
+
+@flow(name="twitter-account-discovery", log_prints=True)
+def account_discovery_flow():
+    """Discover and score new candidate accounts — daily."""
+    logger = get_run_logger()
+    logger.info("Starting account discovery")
+    code = run_script(HEARTBEAT_DIR / "account_discovery.py", timeout=1800, logger=logger)
+    logger.info(f"Account discovery completed with code {code}")
+    return code
+
+
+FLOWS = {
+    "engagement": (engagement_flow, "8x daily: 7,9,11,13,17,20,23,02 UTC"),
+    "content": (original_content_flow, "3x daily: 7:30,10:30,16:30 UTC"),
+    "thread": (weekly_thread_flow, "Wed 15:00 UTC"),
+    "eval": (daily_eval_flow, "Daily 7:00 UTC"),
+    "research": (morning_research_flow, "Daily 8:00 UTC"),
+    "health": (cdp_health_flow, "Every 15 min"),
+    "monitor": (reply_monitor_flow, "Every 5 min"),
+    "targets": (target_monitor_flow, "Every 30 min"),
+    "timeline": (timeline_monitor_flow, "Every 5 min"),
+    "discovery": (account_discovery_flow, "Daily 6:00 UTC"),
+    "search-queue": (search_queue_flow, "Every hour"),
+}
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Twitter automation scheduler")
+    parser.add_argument(
+        "flow", nargs="?", choices=list(FLOWS.keys()), help="Run specific flow"
+    )
+    parser.add_argument("--all", action="store_true", help="Run all flows once")
+    args = parser.parse_args()
+
+    if args.all:
+        print("Running all flows once...")
+        for name, (flow_fn, _) in FLOWS.items():
+            print(f"\n=== {name} ===")
+            flow_fn()
+    elif args.flow:
+        flow_fn, _ = FLOWS[args.flow]
+        flow_fn()
+    else:
+        print("Twitter Scheduler - Prefect")
+        print("UI: http://localhost:4200")
+        print("\nFlows:")
+        for name, (_, schedule) in FLOWS.items():
+            print(f"  {name}: {schedule}")
+        print("\nUsage:")
+        print("  uv run python twitter_scheduler.py <flow>  # Run specific flow")
+        print("  uv run python twitter_scheduler.py --all   # Run all once")
+        print("\nDeploy with schedules:")
+        print("  uv run prefect deploy --all")

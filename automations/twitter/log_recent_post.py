@@ -56,7 +56,9 @@ def main() -> int:
     if args.type in {"tweet", "reply", "value-drop", "teaser", "repo-update"}:
         state["lastPost"] = now
 
-    state_path.write_text(json.dumps(state, indent=2, sort_keys=False) + "\n")
+    tmp = state_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=False) + "\n")
+    tmp.replace(state_path)
     return 0
 
 
