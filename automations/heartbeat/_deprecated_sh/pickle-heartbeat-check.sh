@@ -95,7 +95,7 @@ echo ""
 echo "=== LOG CHECK ==="
 
 ERROR_LOG=$(mktemp)
-journalctl --user --since "15 minutes ago" --priority err --no-pager 2>/dev/null | head -200 > "$ERROR_LOG" || true
+journalctl --user --since "15 minutes ago" --priority err --no-pager 2>/dev/null | grep -v ' No entries --' | head -200 > "$ERROR_LOG" || true
 
 if [[ -s "$ERROR_LOG" ]]; then
     ERROR_COUNT=$(wc -l < "$ERROR_LOG")
@@ -177,10 +177,13 @@ if [[ ${#ALERTS[@]} -gt 0 ]]; then
     # Write to file for debugging/logs
     echo -e "$ALERT_MESSAGE" > "$ALERT_FILE"
     
-    # Wake Pickle with full context in the message (no file reading needed)
-    # Use openclaw CLI to send system event with immediate wake
-    openclaw system event --text "$(echo -e "$ALERT_MESSAGE")" --mode now 2>&1 | tee -a "$LOG_DIR/wake.log" || {
-        echo "❌ Failed to wake Pickle via openclaw"
+    # Send alert directly to Mr. T on Telegram (immediate delivery)
+    /home/openclaw/.npm-global/bin/openclaw message send \
+        --channel telegram \
+        --target 5996479639 \
+        --message "$(echo -e "$ALERT_MESSAGE")" \
+        2>&1 | tee -a "$LOG_DIR/wake.log" || {
+        echo "❌ Failed to send alert via Telegram"
     }
     
     echo "✅ Pickle woken with alerts"

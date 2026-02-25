@@ -6,8 +6,12 @@ Morning TODO Review - Pull tasks from Todoist and calendar, send summary via Tel
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 
-TELEGRAM_TARGET = "5996479639"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib.config import TELEGRAM_TARGET, OPENCLAW_BIN
+from lib.telegram_utils import send_telegram
+from lib.todoist_client import TodoistClient
 
 
 def run_command(cmd, timeout=60):
@@ -21,24 +25,14 @@ def run_command(cmd, timeout=60):
         return "", "Command timed out", 1
 
 
-def send_telegram(message):
-    """Send message to Telegram"""
-    # Escape quotes in message
-    escaped = message.replace('"', '\"').replace("`", "\`")
-    # Use full path to openclaw (systemd doesn't have .npm-global in PATH)
-    cmd = f'/home/openclaw/.npm-global/bin/openclaw message send --channel telegram --target {TELEGRAM_TARGET} --message "{escaped}"'
-    stdout, stderr, returncode = run_command(cmd, timeout=30)
-    
-    # VERIFY IT WORKED
-    if returncode != 0:
-        print(f"❌ SEND FAILED: {stderr}")
-        sys.exit(1)
-    if "Message ID:" not in stdout:
-        print(f"❌ NO MESSAGE ID in response: {stdout}")
-        sys.exit(1)
-    
-    msg_id = stdout.split("Message ID: ")[1].split()[0] if "Message ID:" in stdout else "unknown"
-    print(f"✅ Sent to Telegram (ID: {msg_id})")
+def format_task(task: dict) -> str:
+    """Format a task dict for display."""
+    content = task.get("content", "")
+    due = task.get("due", {})
+    if due and due.get("date"):
+        return f"{content} (due: {due['date']})"
+    return content
+
 
 def main():
     print("=== MORNING TODO REVIEW ===")
@@ -46,71 +40,84 @@ def main():
 
     summary_parts = []
 
-    # 1. Sync Todoist
-    print("\\nSyncing Todoist...")
-    stdout, stderr, returncode = run_command("todoist sync")
-    if returncode == 0:
-        print("✅ Todoist synced")
+    # 1. Get all tasks via REST API (replaces sync + list)
+    print("\nFetching tasks from Todoist...")
+    all_tasks = TodoistClient.get_tasks()
+    if all_tasks is not None:
+        print(f"✅ Got {len(all_tasks)} tasks")
     else:
-        print(f"⚠️ Todoist sync failed: {stderr}")
-        summary_parts.append("⚠️ Todoist sync failed")
+        print("⚠️ Failed to fetch tasks")
+        summary_parts.append("⚠️ Todoist fetch failed")
 
-    # 2. Get P1 tasks
-    print("\\nFetching P1 tasks...")
-    stdout, stderr, returncode = run_command('todoist list --filter "p1"')
-    if returncode == 0 and stdout.strip():
-        p1_tasks = stdout.strip().split("\\n")
+    # 2. Get P1 tasks (priority 4 in API = P1 in UI)
+    print("\nFetching P1 tasks...")
+    p1_tasks = [t for t in all_tasks if t.get("priority") == 4]
+    if p1_tasks:
         print(f"Found {len(p1_tasks)} P1 tasks")
         summary_parts.append(f"**P1 Tasks ({len(p1_tasks)}):**")
-        for task in p1_tasks[:5]:  # Top 5
-            summary_parts.append(f"• {task}")
+        for task in p1_tasks[:5]:
+            summary_parts.append(f"• {format_task(task)}")
     else:
-        print("No P1 tasks or error")
+        print("No P1 tasks")
 
     # 3. Get Personal P1 tasks
-    print("\\nFetching Personal P1 tasks...")
-    stdout, stderr, returncode = run_command('todoist list --filter "#Personal & p1"')
-    if returncode == 0 and stdout.strip():
-        personal_p1 = stdout.strip().split("\\n")
+    print("\nFetching Personal P1 tasks...")
+    personal_project_id = None
+    projects = TodoistClient.get_projects()
+    for p in projects:
+        if p.get("name", "").lower() == "personal":
+            personal_project_id = p.get("id")
+            break
+
+    personal_p1 = [
+        t
+        for t in all_tasks
+        if t.get("priority") == 4 and t.get("project_id") == personal_project_id
+    ]
+    if personal_p1:
         print(f"Found {len(personal_p1)} Personal P1 tasks")
-        if personal_p1:
-            summary_parts.append(f"\\n**Personal P1 ({len(personal_p1)}):**")
-            for task in personal_p1[:3]:  # Top 3
-                summary_parts.append(f"• {task}")
+        summary_parts.append(f"\n**Personal P1 ({len(personal_p1)}):**")
+        for task in personal_p1[:3]:
+            summary_parts.append(f"• {format_task(task)}")
 
     # 4. Get overdue/today tasks
-    print("\\nFetching overdue/today tasks...")
-    stdout, stderr, returncode = run_command('todoist list --filter "overdue | today"')
-    if returncode == 0 and stdout.strip():
-        urgent = stdout.strip().split("\\n")
+    print("\nFetching overdue/today tasks...")
+    today = datetime.now().date().isoformat()
+    urgent = [
+        t
+        for t in all_tasks
+        if t.get("due") and t.get("due", {}).get("date", "") <= today
+    ]
+    if urgent:
         print(f"Found {len(urgent)} overdue/today tasks")
-        if urgent:
-            summary_parts.append(f"\\n**⚠️ Overdue/Today ({len(urgent)}):**")
-            for task in urgent[:5]:
-                summary_parts.append(f"• {task}")
+        summary_parts.append(f"\n**⚠️ Overdue/Today ({len(urgent)}):**")
+        for task in urgent[:5]:
+            summary_parts.append(f"• {format_task(task)}")
 
     # 5. Check calendar (next 48h)
-    print("\\nChecking calendar...")
+    print("\nChecking calendar...")
     stdout, stderr, returncode = run_command(
         "cd /projects/automations/google-calendar && .venv/bin/python gcal.py list --days 2"
     )
     if returncode == 0 and stdout.strip():
         print("✅ Calendar checked")
-        # Parse calendar output for upcoming events
         if "event" in stdout.lower() or "meeting" in stdout.lower():
-            summary_parts.append(f"\\n**📅 Calendar (next 48h):**\\n{stdout[:300]}")
+            summary_parts.append(f"\n**📅 Calendar (next 48h):**\n{stdout[:300]}")
 
     # Build final message
     if not summary_parts:
-        message = "📋 **Morning Review**\\n\\nNo urgent tasks or Todoist check failed.\\nFallback: Check `/projects/Notes/TODO.md`"
+        message = "📋 **Morning Review**\n\nNo urgent tasks or Todoist check failed.\nFallback: Check `/projects/Notes/TODO.md`"
     else:
-        message = "📋 **Morning Review**\\n\\n" + "\\n".join(summary_parts)
+        message = "📋 **Morning Review**\n\n" + "\n".join(summary_parts)
 
-    print(f"\\nSending summary to Telegram...")
+    print(f"\nSending summary to Telegram...")
     print(message)
-    send_telegram(message)
+    if not send_telegram(message):
+        print("❌ Failed to send Telegram message")
+        sys.exit(1)
+    print("✅ Sent to Telegram")
 
-    print("\\n✅ Morning TODO review complete")
+    print("\n✅ Morning TODO review complete")
 
 
 if __name__ == "__main__":

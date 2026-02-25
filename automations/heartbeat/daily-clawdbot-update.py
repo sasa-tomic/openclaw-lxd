@@ -7,6 +7,11 @@ Runs openclaw update and restarts the gateway service
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib.config import OPENCLAW_BIN
+from lib.telegram_utils import send_telegram
 
 
 def run_command(cmd, timeout=300):
@@ -26,7 +31,7 @@ def main():
 
     # Run openclaw update
     print("Running: openclaw update")
-    stdout, stderr, returncode = run_command("/home/openclaw/.npm-global/bin/openclaw update")
+    stdout, stderr, returncode = run_command(f"{OPENCLAW_BIN} update")
 
     update_applied = False
     if returncode == 0:
@@ -57,10 +62,17 @@ def main():
         print(f"❌ Gateway restart failed: {stderr}")
         message += f"\\n\\n❌ Gateway restart failed: {stderr[:200]}"
 
-    # Send notification (no Telegram target specified in original, so just log)
-    print(f"\\nFinal message:\\n{message}")
+    status_emoji = "✅" if returncode == 0 else "❌"
+    telegram_msg = f"{status_emoji} Daily OpenClaw Update\n\n{message}"
 
-    print("\\nDaily update complete.")
+    if send_telegram(telegram_msg):
+        print("✅ Notification sent via Telegram")
+    else:
+        print("⚠️ Telegram notification failed")
+
+    print(f"\nFinal message:\n{message}")
+
+    print("\nDaily update complete.")
     return 0 if not update_applied or returncode == 0 else 1
 
 

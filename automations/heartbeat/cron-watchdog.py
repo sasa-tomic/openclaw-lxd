@@ -6,11 +6,18 @@ Checks if critical jobs are running on schedule and alerts if stale
 
 import subprocess
 import json
+import logging
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
-# Telegram target from the original cron config
-TELEGRAM_TARGET = "5996479639"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+logger = logging.getLogger(__name__)
+from lib.config import TELEGRAM_TARGET, OPENCLAW_BIN
+from lib.telegram_utils import send_telegram
+
+send_telegram_alert = send_telegram
 
 # Jobs to monitor (from original watchdog config)
 MONITORED_JOBS = [
@@ -36,7 +43,7 @@ def run_command(cmd):
 
 def get_cron_list():
     """Get list of cron jobs via openclaw CLI"""
-    output, returncode = run_command("/home/openclaw/.npm-global/bin/openclaw cron list --json")
+    output, returncode = run_command(f"{OPENCLAW_BIN} cron list --json")
     if returncode != 0:
         return None
 
@@ -78,19 +85,17 @@ def check_job_staleness(jobs):
     return stale_jobs
 
 
-def send_telegram_alert(message):
-    """Send alert to Telegram"""
-    cmd = f'/home/openclaw/.npm-global/bin/openclaw message send --channel telegram --target {TELEGRAM_TARGET} --message "{message}"'
-    run_command(cmd)
-
-
 def main():
-    print("=== CRON WATCHDOG CHECK ===")
-    print(f"Time: {datetime.now().isoformat()}")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
+    logger.info("=== CRON WATCHDOG CHECK ===")
+    logger.info(f"Time: {datetime.now().isoformat()}")
 
     jobs = get_cron_list()
     if jobs is None:
-        print("❌ Failed to get cron job list")
+        logger.error("❌ Failed to get cron job list")
         send_telegram_alert("🚨 Cron watchdog: Failed to fetch cron job list!")
         sys.exit(1)
 
@@ -102,13 +107,12 @@ def main():
             alert += f"• {job}\\n"
         alert += "\\nRecommended action: `systemctl --user restart openclaw-gateway`"
 
-        print(f"⚠️ Stale jobs: {stale_jobs}")
+        logger.warning(f"⚠️ Stale jobs: {stale_jobs}")
         send_telegram_alert(alert)
     else:
-        print("✅ All monitored jobs are healthy")
-        # Don't send message if everything is OK (as per original config)
+        logger.info("✅ All monitored jobs are healthy")
 
-    print("Watchdog check complete.")
+    logger.info("Watchdog check complete.")
 
 
 if __name__ == "__main__":

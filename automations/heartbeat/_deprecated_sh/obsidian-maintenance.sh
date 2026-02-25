@@ -6,6 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OBSIDIAN_DIR="/projects/automations/obsidian"
 NOTES_DIR="/projects/Notes"
 MEMORY_DIR="/home/openclaw/clawd/memory"
 STATE_FILE="$MEMORY_DIR/obsidian-maintenance-state.json"
@@ -169,6 +170,30 @@ if [ "$DAY_OF_WEEK" -eq 5 ]; then
             CHANGES_MADE="$CHANGES_MADE
 - $RECENT_DAILIES daily notes from last 7 days (may contain items for extraction)"
         fi
+    fi
+fi
+
+# 5. opencode-powered maintenance (runs full daily_maintenance rule)
+PICKLE_MAINT="$OBSIDIAN_DIR/pickle_obsidian_maintenance.py"
+if [ -x "$PICKLE_MAINT" ]; then
+    [ "$VERBOSE" -eq 1 ] && {
+      echo ""
+      echo "Running opencode maintenance..."
+    }
+    
+    LLM_OUTPUT=$(timeout 900s python3 "$PICKLE_MAINT" --mode apply --rule-id daily_maintenance --no-telegram 2>&1) || true
+    
+    if [ -n "$LLM_OUTPUT" ]; then
+        # Extract summary for changelog
+        LLM_SUMMARY=$(echo "$LLM_OUTPUT" | grep -A2 "## Summary" | head -3 | tail -1 || true)
+        if [ -n "$LLM_SUMMARY" ]; then
+            CHANGES_MADE="$CHANGES_MADE
+- opencode: $LLM_SUMMARY"
+        else
+            CHANGES_MADE="$CHANGES_MADE
+- opencode maintenance completed"
+        fi
+        [ "$VERBOSE" -eq 1 ] && echo "$LLM_OUTPUT"
     fi
 fi
 
