@@ -605,7 +605,9 @@ def main() -> int:
                 print(f"\nFetching context for {tweet_id} (@{author})...")
                 tweet_context = fetch_tweet_context(tweet_id)
                 if not tweet_context:
-                    print(f"  Skipping {tweet_id} - failed to fetch context", flush=True)
+                    print(
+                        f"  Skipping {tweet_id} - failed to fetch context", flush=True
+                    )
                     continue
 
                 # Mark processed after successful context fetch so a browser failure
@@ -623,7 +625,9 @@ def main() -> int:
                 to_analyze.append((candidate, tweet_context))
 
             # ── Phase B: parallel LLM analysis ───────────────────────────────
-            print(f"\nRunning LLM analysis on {len(to_analyze)} candidates in parallel...")
+            print(
+                f"\nRunning LLM analysis on {len(to_analyze)} candidates in parallel..."
+            )
 
             def _analyze_one(args: tuple[dict, dict]) -> tuple[dict, dict, dict | None]:
                 cand, ctx = args
@@ -641,7 +645,7 @@ def main() -> int:
                     cache_decision(decision_cache, tid, dec)
                 return cand, ctx, dec
 
-            max_workers = min(len(to_analyze), 4)
+            max_workers = min(len(to_analyze), 16)
             analyzed: list[tuple[dict, dict, dict | None]] = []
             if to_analyze:
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
