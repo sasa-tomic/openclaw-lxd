@@ -575,7 +575,7 @@ def main() -> int:
                 print("No suitable candidates after filtering")
                 return 0
 
-            print(f"Selected {len(selected)} for LLM analysis")
+            print(f"Selected {len(selected)} candidates")
 
             # Track candidates per term for hit-rate stats (denominator)
             term_candidate_counts: Counter = Counter(
@@ -590,6 +590,7 @@ def main() -> int:
             # Limit prefetch batch so we don't over-fetch when the cap is low.
             FETCH_BATCH = min(len(selected), 15)
             to_analyze: list[tuple[dict, dict]] = []
+            print(f"Fetching tweet context for {FETCH_BATCH} of {len(selected)} candidates...", flush=True)
 
             for candidate in selected[:FETCH_BATCH]:
                 tweet_id = candidate["tweetId"]
@@ -645,7 +646,7 @@ def main() -> int:
                     cache_decision(decision_cache, tid, dec)
                 return cand, ctx, dec
 
-            max_workers = min(len(to_analyze), 16)
+            max_workers = min(len(to_analyze), 8)
             analyzed: list[tuple[dict, dict, dict | None]] = []
             if to_analyze:
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:

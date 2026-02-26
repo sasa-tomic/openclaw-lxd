@@ -1162,6 +1162,7 @@ def fetch_tweet_context(tweet_id: str) -> dict | None:
 }})()"""
 
     with cdp_lock():
+        print(f"  CDP: navigating to tweet {tweet_id}...", flush=True)
         try:
             with CDPSession.connect() as cdp:
                 if not cdp.navigate(tweet_url, wait_sec=4):
@@ -1391,6 +1392,7 @@ def fetch_user_profile(username: str) -> dict | None:
 })()"""
 
     with cdp_lock():
+        print(f"  CDP: navigating to profile @{username}...", flush=True)
         try:
             with CDPSession.connect() as cdp:
                 if not cdp.navigate(profile_url, wait_sec=5):
@@ -1475,6 +1477,7 @@ def get_follower_count(username: str) -> int | None:
     profile_url = f"https://x.com/{username}"
     count = None
     with cdp_lock():
+        print(f"  CDP: navigating to profile @{username} (follower count)...", flush=True)
         try:
             with CDPSession.connect() as cdp:
                 if not cdp.navigate(profile_url, wait_sec=3):
@@ -1517,7 +1520,7 @@ def follow_user(username: str) -> bool:
     """
     with cdp_lock():
         profile_url = f"https://x.com/{username}"
-
+        print(f"  CDP: navigating to profile @{username} (follow)...", flush=True)
         try:
             with CDPSession.connect() as cdp:
                 if not cdp.navigate(profile_url, wait_sec=2):
@@ -1558,7 +1561,7 @@ def unfollow_user(username: str) -> bool:
     """
     with cdp_lock():
         profile_url = f"https://x.com/{username}"
-
+        print(f"  CDP: navigating to profile @{username} (unfollow)...", flush=True)
         try:
             with CDPSession.connect() as cdp:
                 if not cdp.navigate(profile_url, wait_sec=2):
@@ -1615,6 +1618,7 @@ def check_follows_back(username: str) -> bool | None:
 })()"""
 
     with cdp_lock():
+        print(f"  CDP: navigating to profile @{username} (follows-back check)...", flush=True)
         try:
             with CDPSession.connect() as cdp:
                 if not cdp.navigate(profile_url, wait_sec=3):
@@ -1650,6 +1654,7 @@ def get_latest_own_tweet_id(username: str = "DecentCloud_org") -> str | None:
 })()"""
 
     with cdp_lock():
+        print(f"  CDP: navigating to {url}...", flush=True)
         try:
             with CDPSession.connect() as cdp:
                 if not cdp.navigate(url, wait_sec=4):
@@ -1730,6 +1735,7 @@ def get_tweet_stats(tweet_id: str) -> dict | None:
 })()"""
 
     with cdp_lock():
+        print(f"  CDP: navigating to tweet {tweet_id} (stats)...", flush=True)
         target_id = _get_target_id()
         if not target_id:
             return None

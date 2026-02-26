@@ -270,5 +270,5 @@ def call_llm_simple(prompt: str, timeout: int = 120) -> str | None:
     Returns:
         Response text on success, None on failure
     """
-    success, response = call_llm(prompt, max_retries=1, timeout=timeout)
+    success, response = call_llm(prompt, max_retries=4, timeout=timeout)
     return response if success else None
