@@ -43,6 +43,8 @@ class CDPSession:
         self._id_counter = 0
         # Maps request id -> [response_dict, threading.Event]
         self._pending: dict[int, list] = {}
+        # Maps CDP event method name -> list of callables
+        self._event_handlers: dict[str, list] = {}
         self._lock = threading.Lock()
         self._listener = threading.Thread(target=self._listen, daemon=True)
         self._listener.start()
@@ -79,7 +81,12 @@ class CDPSession:
     # ------------------------------------------------------------------
 
     def _listen(self) -> None:
-        """Background thread: receive CDP messages and resolve pending requests."""
+        """Background thread: receive CDP messages and resolve pending requests.
+
+        Routes two types of messages:
+        - Command responses (have "id"): unblocks the waiting send() caller.
+        - Async events (have "method", no "id"): dispatches to registered handlers.
+        """
         while True:
             try:
                 raw = self._ws.recv()
@@ -93,6 +100,15 @@ class CDPSession:
                     if entry is not None:
                         entry[0].update(msg)
                         entry[1].set()
+                elif "method" in msg:
+                    method = msg["method"]
+                    with self._lock:
+                        handlers = list(self._event_handlers.get(method, []))
+                    for handler in handlers:
+                        try:
+                            handler(msg.get("params", {}))
+                        except Exception as e:
+                            logger.debug(f"CDP event handler error ({method}): {e}")
             except websocket.WebSocketConnectionClosedException:
                 break
             except Exception as e:
@@ -272,6 +288,29 @@ class CDPSession:
         except Exception as e:
             logger.debug(f"CDP type_text insertText failed: {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # Event listener registration
+    # ------------------------------------------------------------------
+
+    def on(self, method: str, handler) -> None:
+        """Register a callback for a CDP event method (e.g. 'Network.responseReceived').
+
+        The callback receives the event's params dict and is called from the
+        listener thread.  Do NOT call send() inside a handler — it will deadlock.
+        Use a ThreadPoolExecutor to dispatch blocking work.
+        """
+        with self._lock:
+            self._event_handlers.setdefault(method, []).append(handler)
+
+    def off(self, method: str, handler) -> None:
+        """Unregister a previously registered event handler."""
+        with self._lock:
+            handlers = self._event_handlers.get(method, [])
+            try:
+                handlers.remove(handler)
+            except ValueError:
+                pass
 
     # ------------------------------------------------------------------
     # Context manager

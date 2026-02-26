@@ -16,9 +16,12 @@ import random
 import re
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from email.utils import parsedate_to_datetime as _parse_twitter_date
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
@@ -142,7 +145,7 @@ SKIP_PATTERNS = [
 # Search term building blocks — max 3-4 options per clause
 # ---------------------------------------------------------------------------
 
-_CLOUD = "(aws OR gcp OR azure OR k8s OR vultr OR linode OR digitalocean OR hetzner OR contabo)"
+_CLOUD = "(aws OR gcp OR azure OR k8s OR vultr OR linode OR digitalocean OR hetzner OR contabo OR cloud)"
 _SUPPORT = "(down OR broken OR unreliable OR 'no support' OR 'bad support' OR trust OR ghost OR ghosted)"
 _P2P = "(runpod OR akash OR 'vast.ai' OR 'lambda labs' OR decentralized)"
 _PAAS = "(fly.io OR heroku OR 'render.com' OR railway)"
@@ -588,12 +591,95 @@ def post_tweet(text: str) -> bool:
         return False
 
 
+def _extract_graphql_tweet_node(node: dict) -> dict | None:
+    """Extract a tweet dict from a Twitter GraphQL result node.
+
+    Handles both direct Tweet nodes and the newer TweetWithVisibilityResults wrapper.
+    Returns None for non-tweet nodes (cursors, users, etc.).
+    """
+    typename = node.get("__typename", "")
+    if typename == "TweetWithVisibilityResults":
+        inner = node.get("tweet")
+        if isinstance(inner, dict):
+            return _extract_graphql_tweet_node(inner)
+        return None
+    if typename != "Tweet":
+        return None
+    try:
+        core = node.get("core", {})
+        user_result = core.get("user_results", {}).get("result", {})
+        # screen_name is under result.core in newer API responses; fall back to legacy
+        user_core = user_result.get("core", {})
+        legacy_user = user_result.get("legacy", {})
+        username = (
+            user_core.get("screen_name")
+            or legacy_user.get("screen_name")
+            or ""
+        )
+        legacy = node.get("legacy", {})
+        tweet_id = legacy.get("id_str") or node.get("rest_id", "")
+        text = legacy.get("full_text", "")
+        created_at = legacy.get("created_at", "")
+        # Twitter's legacy date format ("Thu Feb 27 12:00:00 +0000 2025") is not
+        # ISO 8601 — normalize it so the downstream fromisoformat() recency check works.
+        try:
+            created_at = _parse_twitter_date(created_at).isoformat()
+        except Exception:
+            pass  # keep original if parsing fails; server-side since_time handles freshness
+        likes = legacy.get("favorite_count", 0)
+        retweets = legacy.get("retweet_count", 0)
+        replies = legacy.get("reply_count", 0)
+        if tweet_id:
+            return {
+                "tweetId": tweet_id,
+                "username": username,
+                "text": text[:500],
+                "datetime": created_at,
+                "likes": likes,
+                "retweets": retweets,
+                "replies": replies,
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _parse_graphql_search_body(body: str) -> list[dict]:
+    """Walk a raw SearchTimeline GraphQL response body and return tweet dicts."""
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+    tweets: list[dict] = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            t = _extract_graphql_tweet_node(node)
+            if t is not None:
+                tweets.append(t)
+            else:
+                for v in node.values():
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    return tweets
+
+
 def _cdp_search(
     term: str, limit: int = 15, since_dt: datetime | None = None
 ) -> list[dict]:
-    """Search Twitter for a term via CDP and extract tweet data from page.
+    """Search Twitter for a term by intercepting its SearchTimeline GraphQL responses.
 
-    Uses CDPSession (direct WebSocket). Must be called while holding cdp_lock().
+    Rather than scraping the virtualised DOM (~15-20 visible articles), this enables
+    CDP Network events and reads the raw API responses that Twitter itself uses.
+    Each scroll triggers a new paginated request, typically yielding 20 tweets per
+    response and 5+ responses per search (100+ tweets vs the old ~15-20 cap).
+
+    Must be called while holding cdp_lock().
     """
     if since_dt is None:
         since_dt = datetime.now(timezone.utc) - timedelta(hours=SEARCH_CACHE_TTL_HOURS)
@@ -601,65 +687,80 @@ def _cdp_search(
     encoded = quote(f"{term} since_time:{since_ts}")
     url = f"{TWITTER_BASE_URL}/search?q={encoded}&f=live"
 
-    js = """(() => {
-  const articles = document.querySelectorAll('article[data-testid="tweet"]');
-  const results = [];
-  for (const article of articles) {
-    const links = article.querySelectorAll('a[href*="/status/"]');
-    const statusLink = Array.from(links).find(l => /\\/status\\/\\d+$/.test(l.href));
-    const tweetId = statusLink ? statusLink.href.match(/\\/status\\/(\\d+)/)?.[1] : null;
-    const userLinks = article.querySelectorAll('a[role="link"]');
-    let username = null;
-    for (const ul of userLinks) {
-      const m = ul.href.match(/^https:\\/\\/x\\.com\\/([^/]+)$/);
-      if (m && m[1] !== 'search' && m[1] !== 'explore') { username = m[1]; break; }
-    }
-    const textEl = article.querySelector('[data-testid="tweetText"]');
-    const text = textEl ? textEl.textContent : '';
-    const time = article.querySelector('time');
-    const datetime = time ? time.getAttribute('datetime') : null;
-    // Extract engagement stats from aria-labels
-    let likes = 0, retweets = 0, replies = 0;
-    const buttons = article.querySelectorAll('button');
-    for (const btn of buttons) {
-      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-      const likeM = label.match(/(\\d+)\\s+like/);
-      if (likeM) likes = parseInt(likeM[1]);
-      const rtM = label.match(/(\\d+)\\s+repost/);
-      if (rtM) retweets = parseInt(rtM[1]);
-      const replyM = label.match(/(\\d+)\\s+repl/);
-      if (replyM) replies = parseInt(replyM[1]);
-    }
-    if (tweetId) results.push({ tweetId, username, text: text.slice(0, 500), datetime, likes, retweets, replies });
-  }
-  return JSON.stringify(results);
-})()"""
+    bodies: list[str] = []
+    pending_ids: dict[str, bool] = {}   # requestId -> True for in-flight SearchTimeline reqs
+    _lock = threading.Lock()
+    _shutdown = threading.Event()
+
+    def _fetch_body(cdp, req_id: str) -> None:
+        """Called from a worker thread — safe to call cdp.send() here."""
+        try:
+            resp = cdp.send("Network.getResponseBody", {"requestId": req_id}, timeout=15)
+            body = resp.get("result", {}).get("body") or resp.get("body", "")
+            if body:
+                with _lock:
+                    bodies.append(body)
+        except Exception as e:
+            logger.debug(f"_cdp_search getResponseBody {req_id}: {e}")
 
     try:
         with CDPSession.connect() as cdp:
-            if not cdp.navigate(url, wait_sec=4):
+            executor = ThreadPoolExecutor(max_workers=4)
+
+            cdp.send("Network.enable")
+
+            def on_response(params: dict) -> None:
+                resp_url = params.get("response", {}).get("url", "")
+                req_id = params.get("requestId", "")
+                if req_id and "SearchTimeline" in resp_url:
+                    with _lock:
+                        pending_ids[req_id] = True
+
+            def on_loading_finished(params: dict) -> None:
+                if _shutdown.is_set():
+                    return
+                req_id = params.get("requestId", "")
+                with _lock:
+                    if req_id not in pending_ids:
+                        return
+                    del pending_ids[req_id]
+                try:
+                    executor.submit(_fetch_body, cdp, req_id)
+                except RuntimeError:
+                    pass  # executor already shut down
+
+            cdp.on("Network.responseReceived", on_response)
+            cdp.on("Network.loadingFinished", on_loading_finished)
+
+            if not cdp.navigate(url, wait_sec=5):
+                _shutdown.set()
+                executor.shutdown(wait=False)
                 return []
-            # Scroll 3 times to load more tweets via infinite-scroll
-            for _i in range(3):
-                n_before = cdp.scroll_to_bottom()
+
+            # Each scroll fires a new paginated SearchTimeline request
+            for _ in range(5):
+                cdp.scroll_to_bottom()
                 time.sleep(2)
-                n_after = cdp.scroll_to_bottom()
-                if n_before == n_after:
-                    break
-            raw = cdp.evaluate(js, timeout=20)
+
+            # Signal handlers to stop submitting, then drain the executor
+            _shutdown.set()
+            executor.shutdown(wait=True)
+
     except Exception as e:
         logger.warning(f"_cdp_search CDP failed: {e}")
         return []
 
-    if not raw:
-        return []
+    # Deduplicate across paginated responses
+    tweets: list[dict] = []
+    seen_ids: set[str] = set()
+    for body in bodies:
+        for t in _parse_graphql_search_body(body):
+            tid = t["tweetId"]
+            if tid not in seen_ids:
+                seen_ids.add(tid)
+                tweets.append(t)
 
-    try:
-        tweets = json.loads(raw) if isinstance(raw, str) else raw
-        return tweets[:limit]
-    except (json.JSONDecodeError, TypeError) as e:
-        logger.debug(f"_cdp_search JSON parse failed: {e}")
-        return []
+    return tweets[:limit] if limit else tweets
 
 
 def _term_weight(stats: dict) -> float:
