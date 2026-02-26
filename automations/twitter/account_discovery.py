@@ -21,7 +21,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent.parent / "twitter"))
 
 from lib.llm_utils import call_llm, extract_json
 from twitter_utils import (

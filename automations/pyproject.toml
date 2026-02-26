@@ -12,3 +12,8 @@ dependencies = [
 executionEnvironments = [
   { root = "twitter", extraPaths = [".."] }
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

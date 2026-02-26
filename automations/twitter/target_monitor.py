@@ -30,8 +30,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, "/projects/automations/twitter")
-sys.path.insert(0, "/projects/automations")  # needed for lib.llm_utils
+sys.path.insert(0, "/projects/automations")
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from db import (
     get_conn,

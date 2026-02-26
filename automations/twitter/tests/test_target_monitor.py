@@ -1,4 +1,4 @@
-"""Tests for heartbeat/target_monitor.py.
+"""Tests for twitter/target_monitor.py.
 
 Tests cover:
 - State loading/saving
@@ -40,7 +40,7 @@ sys.modules.setdefault("lib.config", mock.MagicMock())
 
 import importlib.util
 
-TARGET_MONITOR_PATH = Path("/projects/automations/heartbeat/target_monitor.py")
+TARGET_MONITOR_PATH = Path("/projects/automations/twitter/target_monitor.py")
 spec = importlib.util.spec_from_file_location("target_monitor", TARGET_MONITOR_PATH)
 tm = importlib.util.module_from_spec(spec)
 tm.call_llm = _lib_llm_stub.call_llm_simple

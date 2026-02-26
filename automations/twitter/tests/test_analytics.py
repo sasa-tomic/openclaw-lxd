@@ -66,16 +66,16 @@ class TestOurReplyIdCapture:
 
     def test_engagement_script_uses_get_latest_own_tweet_id(self):
         """Verify twitter-engagement.py imports get_latest_own_tweet_id."""
-        engagement_path = Path(__file__).parent.parent.parent / "heartbeat" / "twitter-engagement.py"
+        engagement_path = Path(__file__).parent.parent / "twitter_engagement.py"
         source = engagement_path.read_text()
         assert "get_latest_own_tweet_id" in source, (
-            "twitter-engagement.py must import and call get_latest_own_tweet_id "
+            "twitter_engagement.py must import and call get_latest_own_tweet_id "
             "to capture ourReplyId after posting"
         )
 
     def test_engagement_script_stores_our_reply_id(self):
-        """Verify twitter-engagement.py stores ourReplyId in the state entry."""
-        engagement_path = Path(__file__).parent.parent.parent / "heartbeat" / "twitter-engagement.py"
+        """Verify twitter_engagement.py stores ourReplyId in the state entry."""
+        engagement_path = Path(__file__).parent.parent / "twitter_engagement.py"
         source = engagement_path.read_text()
         assert '"ourReplyId"' in source or "'ourReplyId'" in source, (
             "twitter-engagement.py must store ourReplyId in the engagedPosts state entry"

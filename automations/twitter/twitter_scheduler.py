@@ -23,7 +23,6 @@ from pathlib import Path
 
 from prefect import flow, get_run_logger
 
-HEARTBEAT_DIR = Path("/projects/automations/heartbeat")
 TWITTER_DIR = Path("/projects/automations/twitter")
 PYTHON = sys.executable
 
@@ -98,7 +97,7 @@ def engagement_flow():
     """Autonomous Twitter engagement - 5x daily."""
     logger = get_run_logger()
     logger.info("Starting engagement run")
-    code = run_script(HEARTBEAT_DIR / "twitter-engagement.py", logger=logger)
+    code = run_script(TWITTER_DIR / "twitter_engagement.py", logger=logger)
     logger.info(f"Engagement completed with code {code}")
     return code
 
@@ -138,7 +137,7 @@ def morning_research_flow():
     """Morning research - 8:00 UTC."""
     logger = get_run_logger()
     logger.info("Starting morning research")
-    code = run_script(HEARTBEAT_DIR / "twitter_morning.py", logger=logger)
+    code = run_script(TWITTER_DIR / "twitter_morning.py", logger=logger)
     logger.info(f"Morning research completed with code {code}")
     return code
 
@@ -158,7 +157,7 @@ def reply_monitor_flow():
     """Monitor and respond to replies/mentions — every 5 min."""
     logger = get_run_logger()
     logger.info("Starting reply monitor")
-    code = run_script(HEARTBEAT_DIR / "reply_monitor.py", timeout=300, logger=logger)
+    code = run_script(TWITTER_DIR / "reply_monitor.py", timeout=300, logger=logger)
     logger.info(f"Reply monitor completed with code {code}")
     return code
 
@@ -169,7 +168,7 @@ def target_monitor_flow():
     """Monitor target accounts for fast-reply opportunities -- every 30 min."""
     logger = get_run_logger()
     logger.info("Starting target account monitor")
-    code = run_script(HEARTBEAT_DIR / "target_monitor.py", timeout=600, logger=logger)
+    code = run_script(TWITTER_DIR / "target_monitor.py", timeout=600, logger=logger)
     logger.info(f"Target monitor completed with code {code}")
     return code
 
@@ -179,7 +178,7 @@ def timeline_monitor_flow():
     """Monitor Following feed for near-realtime reply opportunities — every 5 min."""
     logger = get_run_logger()
     logger.info("Starting timeline monitor")
-    code = run_script(HEARTBEAT_DIR / "timeline_monitor.py", timeout=300, logger=logger)
+    code = run_script(TWITTER_DIR / "timeline_monitor.py", timeout=300, logger=logger)
     logger.info(f"Timeline monitor completed with code {code}")
     return code
 
@@ -199,7 +198,7 @@ def account_discovery_flow():
     """Discover and score new candidate accounts — daily."""
     logger = get_run_logger()
     logger.info("Starting account discovery")
-    code = run_script(HEARTBEAT_DIR / "account_discovery.py", timeout=1800, logger=logger)
+    code = run_script(TWITTER_DIR / "account_discovery.py", timeout=1800, logger=logger)
     logger.info(f"Account discovery completed with code {code}")
     return code
 

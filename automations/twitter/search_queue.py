@@ -56,21 +56,24 @@ DEFAULT_SAMPLE_SIZE = len(SEARCH_TERMS)  # search all terms by default
 
 
 def fill_queue(
-    conn,
     terms: list[str],
     term_stats: dict,
     engaged_ids: set[str],
+    already_queued_ids: set[str],
 ) -> list[dict]:
-    """Search via CDP and return new candidates ready to insert into the queue."""
+    """Search via CDP and return new candidates ready to insert into the queue.
+
+    Does not hold a DB connection — callers should close their connection before
+    calling this so the long CDP search doesn't block other DB readers.
+    """
     cdp_candidates = search_candidates(
         terms=terms, term_stats=term_stats, bypass_cache=True, since_hours=2, limit=50
     )
 
-    already_queued = {c["tweetId"] for c in get_queued_candidates(conn, limit=10000)}
     result = []
     for c in cdp_candidates:
         tid = str(c.get("tweetId", ""))
-        if not tid or tid in engaged_ids or tid in already_queued:
+        if not tid or tid in engaged_ids or tid in already_queued_ids:
             continue
         result.append(
             {
@@ -92,24 +95,30 @@ def cmd_fill(args: argparse.Namespace) -> int:
     print("=== SEARCH QUEUE FILL ===", flush=True)
     print(f"Time: {utc_now()}", flush=True)
 
+    # Phase 1: short read — fetch everything needed before the long CDP search.
+    # Connection is released before search so DDL locks don't block other readers.
     with get_conn() as conn:
         ensure_schema(conn)
         engaged_ids = get_engaged_tweet_ids(conn)
         term_stats = get_search_term_stats(conn)
+        already_queued_ids = {c["tweetId"] for c in get_queued_candidates(conn, limit=10000)}
 
-        if args.all:
-            terms = list(SEARCH_TERMS)
-            print(f"Searching all {len(terms)} terms...", flush=True)
-        else:
-            n = args.n or DEFAULT_SAMPLE_SIZE
-            terms = weighted_sample_terms(
-                SEARCH_TERMS, term_stats, min(n, len(SEARCH_TERMS))
-            )
-            print(f"Searching {len(terms)} weighted terms...", flush=True)
+    if args.all:
+        terms = list(SEARCH_TERMS)
+        print(f"Searching all {len(terms)} terms...", flush=True)
+    else:
+        n = args.n or DEFAULT_SAMPLE_SIZE
+        terms = weighted_sample_terms(
+            SEARCH_TERMS, term_stats, min(n, len(SEARCH_TERMS))
+        )
+        print(f"Searching {len(terms)} weighted terms...", flush=True)
 
-        candidates = fill_queue(conn, terms, term_stats, engaged_ids)
+    # Phase 2: long CDP search — no DB connection held.
+    candidates = fill_queue(terms, term_stats, engaged_ids, already_queued_ids)
 
-        print(f"\nFound {len(candidates)} fresh candidates", flush=True)
+    # Phase 3: short write — insert results and report queue size.
+    print(f"\nFound {len(candidates)} fresh candidates", flush=True)
+    with get_conn() as conn:
         if candidates:
             inserted = insert_candidate_queue(conn, candidates)
             print(f"Inserted {inserted} new candidates into queue", flush=True)
@@ -141,7 +150,6 @@ def _tweet_age_str(tweet_id: str, now: datetime) -> str:
 
 def cmd_show(args: argparse.Namespace) -> int:
     with get_conn() as conn:
-        ensure_schema(conn)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
@@ -187,7 +195,6 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 def cmd_stats(_args: argparse.Namespace) -> int:
     with get_conn() as conn:
-        ensure_schema(conn)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
@@ -253,7 +260,6 @@ def cmd_stats(_args: argparse.Namespace) -> int:
 
 def cmd_clear(_args: argparse.Namespace) -> int:
     with get_conn() as conn:
-        ensure_schema(conn)
         size = queue_size(conn)
         if size == 0:
             print("Queue is already empty.")
@@ -284,7 +290,6 @@ def cmd_clear(_args: argparse.Namespace) -> int:
 def cmd_drop(args: argparse.Namespace) -> int:
     ids = args.tweet_ids
     with get_conn() as conn:
-        ensure_schema(conn)
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM candidate_queue WHERE tweet_id = ANY(%s)",

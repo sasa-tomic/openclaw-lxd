@@ -23,8 +23,7 @@ import json
 import sys
 from datetime import datetime, timezone
 
-sys.path.insert(0, "/projects/automations/twitter")
-sys.path.insert(0, "/projects/automations")  # needed for lib.llm_utils
+sys.path.insert(0, "/projects/automations")
 from lib.config import TWITTER_BASE_URL
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from db import (
