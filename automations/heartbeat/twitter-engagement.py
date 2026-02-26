@@ -26,6 +26,7 @@ import re
 import sys
 import time as _time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -578,7 +579,76 @@ def main() -> int:
             results = []
             engaged_count = 0
 
-            for candidate in selected:
+            # ── Phase A: fetch context sequentially (browser/CDP ops) ──────────
+            # Limit prefetch batch so we don't over-fetch when the cap is low.
+            FETCH_BATCH = min(len(selected), 15)
+            to_analyze: list[tuple[dict, dict]] = []
+
+            for candidate in selected[:FETCH_BATCH]:
+                tweet_id = candidate["tweetId"]
+                author = candidate.get("author") or "unknown"
+
+                # Skip if already engaged
+                if is_engaged(conn, str(tweet_id)):
+                    print(f"  Already engaged {tweet_id} in DB — skipping", flush=True)
+                    if using_queue:
+                        mark_queue_processed(conn, [str(tweet_id)])
+                    continue
+
+                print(f"\nFetching context for {tweet_id} (@{author})...")
+                tweet_context = fetch_tweet_context(tweet_id)
+                if not tweet_context:
+                    print(f"  Skipping {tweet_id} - failed to fetch context", flush=True)
+                    continue
+
+                # Mark processed after successful context fetch so a browser failure
+                # doesn't permanently consume the candidate.
+                if using_queue:
+                    mark_queue_processed(conn, [str(tweet_id)])
+
+                # Fetch author profile for context (bio, recent tweets, interests)
+                author_name = tweet_context.get("author", "")
+                if author_name:
+                    author_profile = get_user_profile(author_name)
+                    if author_profile:
+                        tweet_context["authorProfile"] = author_profile
+
+                to_analyze.append((candidate, tweet_context))
+
+            # ── Phase B: parallel LLM analysis ───────────────────────────────
+            print(f"\nRunning LLM analysis on {len(to_analyze)} candidates in parallel...")
+
+            def _analyze_one(args: tuple[dict, dict]) -> tuple[dict, dict, dict | None]:
+                cand, ctx = args
+                tid = cand["tweetId"]
+                cached = get_cached_decision(decision_cache, tid)
+                if cached is not None:
+                    print(f"  [{tid}] Using cached LLM decision", flush=True)
+                    return cand, ctx, cached
+                print(f"  [{tid}] Asking LLM to analyze...", flush=True)
+                dec = draft_reply_with_full_context(
+                    cand, ctx, recent_engagements, recent_posts
+                )
+                if dec is not None:
+                    cache_decision(decision_cache, tid, dec)
+                return cand, ctx, dec
+
+            max_workers = min(len(to_analyze), 4)
+            analyzed: list[tuple[dict, dict, dict | None]] = []
+            if to_analyze:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(_analyze_one, item): item for item in to_analyze
+                    }
+                    # Preserve submission order for deterministic posting
+                    ordered = {item: None for item in to_analyze}
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        ordered[item] = future.result()
+                    analyzed = list(ordered.values())
+
+            # ── Phase C: sequential posting ───────────────────────────────────
+            for candidate, tweet_context, decision in analyzed:
                 if engaged_count >= 8:
                     break
 
@@ -589,57 +659,7 @@ def main() -> int:
 
                 print(f"\nProcessing {tweet_id} (@{author})...")
 
-                # Skip if we've already engaged this tweet (double-check DB)
-                if is_engaged(conn, str(tweet_id)):
-                    print(f"  Already engaged {tweet_id} in DB — skipping", flush=True)
-                    if using_queue:
-                        mark_queue_processed(conn, [str(tweet_id)])
-                    continue
-
-                print("  Fetching thread context...")
-                tweet_context = fetch_tweet_context(tweet_id)
-                if not tweet_context:
-                    print(
-                        f"  Skipping {tweet_id} - failed to fetch context", flush=True
-                    )
-                    continue
-
-                # Mark processed after successful context fetch so a browser failure
-                # doesn't permanently consume the candidate.
-                if using_queue:
-                    mark_queue_processed(conn, [str(tweet_id)])
-
-                # Fetch author profile for context (bio, recent tweets, interests)
-                author_name = tweet_context.get("author", "")
-                author_profile = None
-                if author_name:
-                    author_profile = get_user_profile(author_name)
-                    if author_profile:
-                        tweet_context["authorProfile"] = author_profile
-
-                decision = None
-                cached = get_cached_decision(decision_cache, tweet_id)
-                if cached is not None:
-                    if not cached.get("shouldEngage"):
-                        print(
-                            f"  Cached LLM rejection: {cached.get('reasoning', 'no reason')}",
-                            flush=True,
-                        )
-                        save_encountered_thread(
-                            tweet_context, cached, tweet_id, search_term
-                        )
-                        continue
-                    decision = cached
-                    print("  Using cached LLM approval", flush=True)
-                else:
-                    print("  Asking LLM to analyze (with full thread context)...")
-                    decision = draft_reply_with_full_context(
-                        candidate, tweet_context, recent_engagements, recent_posts
-                    )
-                    if decision is not None:
-                        cache_decision(decision_cache, tweet_id, decision)
-
-                # Save thread regardless of decision
+                # Save encountered thread regardless of decision
                 if decision:
                     save_encountered_thread(
                         tweet_context, decision, tweet_id, search_term
@@ -664,20 +684,37 @@ def main() -> int:
 
                 jitter_sleep()
 
+                # Snapshot our latest tweet ID *before* posting so we can verify
+                # a genuinely new tweet appeared (false positives from CDP are possible).
+                pre_post_id = get_latest_own_tweet_id("DecentCloud_org")
+
                 if not post_reply(tweet_id, reply_text):
                     send_error_alert(f"Failed to post reply to {tweet_id} (@{author})")
                     continue
 
-                print("  Replied", flush=True)
-
-                # Auto-follow the author after successful reply
-                auto_follow_after_engagement(conn, author, tweet_id)
-
-                # Capture the ID of our reply
-                _time.sleep(3)
+                # Verify the reply actually appeared by confirming a higher tweet ID.
+                # Twitter Snowflake IDs are monotonically increasing, so a new reply
+                # must have a strictly larger ID than anything posted before it.
+                _time.sleep(4)
                 our_reply_id = get_latest_own_tweet_id("DecentCloud_org")
+                if our_reply_id and pre_post_id and int(our_reply_id) <= int(pre_post_id):
+                    print(
+                        f"  WARNING: reply ID {our_reply_id} is not newer than pre-post ID "
+                        f"{pre_post_id} — tweet may not have been posted!",
+                        flush=True,
+                    )
+                    send_error_alert(
+                        f"post_reply false positive for {tweet_id} (@{author}): "
+                        f"no new tweet ID observed (pre={pre_post_id}, post={our_reply_id})"
+                    )
+                    continue
+
+                print("  Replied", flush=True)
                 if our_reply_id:
                     print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
+
+                # Auto-follow the author after confirmed reply
+                auto_follow_after_engagement(conn, author, tweet_id)
 
                 # Insert engagement into DB
                 stats = tweet_context.get("stats", {})
@@ -705,7 +742,8 @@ def main() -> int:
                     term_engaged_counts[search_term] += 1
                 results.append(f"{tweet_id} | @{author}")
 
-                # Update voice context in-memory for this run
+                # Update voice context in-memory so subsequent runs in this session
+                # see our latest replies (posting is sequential so no race).
                 recent_engagements = [
                     {
                         "target_username": author,
