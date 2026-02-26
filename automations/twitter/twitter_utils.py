@@ -479,11 +479,20 @@ def post_reply(tweet_id: str, reply_text: str) -> bool:
                     if not cdp.click(REPLY_BTN):
                         print("  CDP: Reply button not found", flush=True)
                         return False
-                    # Poll up to 8s for textarea to clear (confirms post submitted)
+                    # Poll up to 8s for textarea to clear (reply submitted → div resets)
                     deadline = time.time() + 8
                     while time.time() < deadline:
                         still_text = cdp.evaluate(f'document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()')
                         if not still_text:
+                            # Give Twitter a moment to surface any error toast before
+                            # declaring success (errors also clear the textarea).
+                            time.sleep(1.2)
+                            toast = cdp.evaluate(
+                                'document.querySelector(\'[data-testid="toast"]\')?.textContent?.trim()'
+                            )
+                            if toast:
+                                print(f"  CDP: Twitter error toast detected: {toast[:120]}", flush=True)
+                                return False
                             print("  CDP: reply posted successfully", flush=True)
                             return True
                         time.sleep(1)
