@@ -2,7 +2,7 @@
 """Shared utilities for Twitter automation scripts.
 
 Consolidates common functions used across multiple Twitter automation scripts.
-All Twitter interactions go through Chrome CDP via `openclaw browser` (satbox profile).
+All Twitter interactions go through Chrome CDP via CDPSession (direct WebSocket).
 """
 
 from __future__ import annotations
@@ -26,10 +26,11 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.config import OPENCLAW_BIN, TWITTER_BASE_URL
 
+from cdp import CDPSession
+
 THREAD_INDEX_PATH = Path("/home/openclaw/clawd/memory/twitter-thread-index.json")
 STRATEGY_PATH = Path("/projects/automations/twitter/STRATEGY.md")
 HUMANIZE_SCRIPT = Path("/projects/automations/text/humanize.py")
-BROWSER_PROFILE = "satbox"
 
 CDP_LOCK_PATH = Path("/tmp/twitter-cdp.lock")
 CDP_LOCK_TIMEOUT = 300  # seconds
@@ -447,298 +448,50 @@ def humanize(text: str) -> str:
     return p.stdout.strip()
 
 
-def _browser_cmd(
-    args: list[str], timeout: int = 30
-) -> subprocess.CompletedProcess[str]:
-    """Run an openclaw browser command against the satbox profile."""
-    cmd = [
-        OPENCLAW_BIN,
-        "browser",
-        "--browser-profile",
-        BROWSER_PROFILE,
-        "--json",
-    ] + args
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-
-
-def _get_target_id() -> str | None:
-    """Get the target ID of the first satbox browser tab (reuse existing tab)."""
-    try:
-        r = _browser_cmd(["tabs"], timeout=10)
-        if r.returncode != 0:
-            return None
-        # openclaw may print doctor/warning output before the JSON — skip it
-        stdout = r.stdout
-        json_start = stdout.find("{")
-        if json_start == -1:
-            print(f"  _get_target_id: no JSON in output: {stdout[:300]!r}", flush=True)
-            return None
-        try:
-            data = json.loads(stdout[json_start:])
-        except json.JSONDecodeError as e:
-            print(
-                f"  _get_target_id: JSON parse failed ({e}): {stdout[json_start : json_start + 300]!r}",
-                flush=True,
-            )
-            return None
-        tabs = data.get("tabs", [])
-        if tabs:
-            return tabs[0]["targetId"]
-    except Exception as e:
-        print(f"  _get_target_id failed: {e}", flush=True)
-    return None
-
-
-def _navigate_and_wait(url: str, target_id: str, wait_sec: float = 3) -> bool:
-    """Navigate a tab to a URL and wait for page load."""
-    try:
-        r = _browser_cmd(["navigate", url, "--target-id", target_id], timeout=30)
-        if r.returncode != 0:
-            print(f"  CDP navigate failed: {r.stderr.strip()[:200]}", flush=True)
-            return False
-        time.sleep(wait_sec)
-        return True
-    except Exception as e:
-        print(f"  CDP navigate exception: {e}", flush=True)
-        return False
-
-
-def _snapshot(target_id: str) -> str:
-    """Take an efficient snapshot of the page."""
-    try:
-        r = subprocess.run(
-            [
-                OPENCLAW_BIN,
-                "browser",
-                "--browser-profile",
-                BROWSER_PROFILE,
-                "snapshot",
-                "--target-id",
-                target_id,
-                "--efficient",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        return r.stdout if r.returncode == 0 else ""
-    except Exception as e:
-        logger.debug(f"_snapshot failed: {e}")
-        return ""
-
-
-def _find_ref(snapshot: str, pattern: str) -> str | None:
-    """Find a ref ID in a snapshot by matching a pattern against the line."""
-    for line in snapshot.splitlines():
-        if pattern in line:
-            m = re.search(r"\[ref=(\w+)\]", line)
-            if m:
-                return m.group(1)
-    return None
-
-
-def _scroll_into_view(target_id: str, ref: str) -> bool:
-    """Scroll an element into view by ref."""
-    try:
-        r = subprocess.run(
-            [
-                OPENCLAW_BIN,
-                "browser",
-                "--browser-profile",
-                BROWSER_PROFILE,
-                "scrollintoview",
-                ref,
-                "--target-id",
-                target_id,
-                "--timeout-ms",
-                "30000",
-                "--json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=35,
-        )
-        return r.returncode == 0
-    except Exception as e:
-        logger.debug(f"_scroll_into_view failed: {e}")
-        return False
-
-
-def _type_text(target_id: str, ref: str, text: str) -> bool:
-    """Type text into an element by ref."""
-    try:
-        if not _scroll_into_view(target_id, ref):
-            return False
-        # Use --fill instead of --slowly to avoid timeout on long text
-        # --slowly types char by char (8s internal timeout too short for >80 chars)
-        r = subprocess.run(
-            [
-                OPENCLAW_BIN,
-                "browser",
-                "--browser-profile",
-                BROWSER_PROFILE,
-                "type",
-                ref,
-                text,
-                "--target-id",
-                target_id,
-                "--json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if r.returncode != 0:
-            print(f"  CDP type error: {r.stderr.strip()[:200]}", flush=True)
-        return r.returncode == 0
-    except Exception as e:
-        print(f"  CDP type exception: {e}", flush=True)
-        return False
-
-
-def _click(target_id: str, ref: str) -> bool:
-    """Click an element by ref."""
-    try:
-        if not _scroll_into_view(target_id, ref):
-            return False
-        time.sleep(0.5)
-        r = _browser_cmd(["click", ref, "--target-id", target_id], timeout=15)
-        return r.returncode == 0
-    except Exception as e:
-        logger.debug(f"_click failed: {e}")
-        return False
-
-
-def _evaluate(target_id: str, js: str, timeout: int = 15) -> str | None:
-    """Evaluate JavaScript on the page and return the result."""
-    try:
-        js_stripped = js.strip()
-        if not js_stripped.startswith(("(", "function", "async")):
-            if ";" in js_stripped:
-                parts = [p.strip() for p in js_stripped.split(";") if p.strip()]
-                if len(parts) > 1:
-                    js = f"() => {{ {'; '.join(parts[:-1])}; return {parts[-1]}; }}"
-                else:
-                    js = f"() => {{ return {parts[0]}; }}"
-            else:
-                js = f"() => {{ return ({js_stripped}); }}"
-        r = subprocess.run(
-            [
-                OPENCLAW_BIN,
-                "browser",
-                "--browser-profile",
-                BROWSER_PROFILE,
-                "evaluate",
-                "--fn",
-                js,
-                "--target-id",
-                target_id,
-                "--json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if r.returncode != 0:
-            return None
-        data = json.loads(r.stdout)
-        return data.get("result")
-    except Exception as e:
-        logger.debug(f"_evaluate failed: {e}")
-        return None
-
-
 def post_reply(tweet_id: str, reply_text: str) -> bool:
-    """Post a reply via Chrome CDP (openclaw browser, satbox profile).
+    """Post a reply via Chrome CDP (CDPSession direct WebSocket).
 
     Flow: navigate to tweet → find reply textbox → type → click Reply.
     """
     try:
         with cdp_lock():
-            target_id = _get_target_id()
-            if not target_id:
-                print("  CDP: no browser tab available", flush=True)
-                return False
-
             tweet_url = f"{TWITTER_BASE_URL}/i/web/status/{tweet_id}"
             print(f"  CDP: navigating to {tweet_url}", flush=True)
-            if not _navigate_and_wait(tweet_url, target_id, wait_sec=4):
-                return False
 
-            snap = _snapshot(target_id)
-            if not snap:
-                print("  CDP: snapshot failed", flush=True)
-                return False
-
-            # Find the reply textbox (labeled "Post text" on tweet pages)
-            reply_ref = _find_ref(snap, 'textbox "Post text"')
-            if not reply_ref:
-                # Fallback: look for "Post your reply" variant
-                reply_ref = _find_ref(snap, 'textbox "Post your reply"')
-            if not reply_ref:
-                print("  CDP: reply textbox not found in snapshot", flush=True)
-                return False
-
-            # Click textbox first to focus/expand it (required on tweet detail pages)
-            print(
-                f"  CDP: clicking reply textbox to focus (ref={reply_ref})...",
-                flush=True,
-            )
-            _click(target_id, reply_ref)
-            time.sleep(2)
-
-            # Re-snapshot after click — ref may have changed when textbox expanded
-            snap_after_focus = _snapshot(target_id)
-            if snap_after_focus:
-                new_ref = _find_ref(snap_after_focus, 'textbox "Post text"')
-                if not new_ref:
-                    new_ref = _find_ref(snap_after_focus, 'textbox "Post your reply"')
-                if new_ref:
-                    reply_ref = new_ref
-
-            time.sleep(1)  # Wait for element to be stable after potential re-render
-
-            print(f"  CDP: typing reply (ref={reply_ref})...", flush=True)
-            if not _type_text(target_id, reply_ref, reply_text):
-                print("  CDP: typing failed", flush=True)
-                return False
-
-            # Brief pause for UI to update after typing
-            time.sleep(1)
-
-            # Re-snapshot to find the now-enabled Reply button
-            snap2 = _snapshot(target_id)
-            reply_btn = _find_ref(snap2, 'button "Reply"')
-            if not reply_btn:
-                print("  CDP: Reply button not found after typing", flush=True)
-                return False
-
-            print(f"  CDP: clicking Reply (ref={reply_btn})...", flush=True)
-            if not _click(target_id, reply_btn):
-                print("  CDP: click Reply failed", flush=True)
-                return False
-
-            # Wait and verify the reply was posted
-            time.sleep(4)
-            snap3 = _snapshot(target_id)
-            # After successful reply, the reply textbox resets (empty) and the reply appears
-            # If the compose area still has our text, it likely failed
-            if snap3:
-                still_has_reply_btn = _find_ref(snap3, 'button "Reply"')
-                # Check if the reply button is still enabled (would mean text is still there)
-                for line in snap3.splitlines():
-                    if (
-                        'button "Reply"' in line
-                        and "[disabled]" not in line
-                        and still_has_reply_btn
-                    ):
-                        print(
-                            "  CDP: reply may have failed (Reply button still active)",
-                            flush=True,
-                        )
+            try:
+                with CDPSession.connect() as cdp:
+                    if not cdp.navigate(tweet_url, wait_sec=2):
                         return False
-            print("  CDP: reply posted successfully", flush=True)
-            return True
+                    TEXTAREA = '[data-testid="tweetTextarea_0"]'
+                    REPLY_BTN = '[data-testid="tweetButtonInline"]'
+                    if not cdp.wait_for(TEXTAREA, timeout=10):
+                        print("  CDP: reply textbox not found", flush=True)
+                        return False
+                    # Click to focus/expand the reply box
+                    cdp.click(TEXTAREA)
+                    time.sleep(0.5)
+                    print(f"  CDP: typing reply...", flush=True)
+                    if not cdp.type_text(TEXTAREA, reply_text):
+                        print("  CDP: typing failed", flush=True)
+                        return False
+                    time.sleep(0.5)
+                    print(f"  CDP: clicking Reply...", flush=True)
+                    if not cdp.click(REPLY_BTN):
+                        print("  CDP: Reply button not found", flush=True)
+                        return False
+                    # Poll up to 8s for textarea to clear (confirms post submitted)
+                    deadline = time.time() + 8
+                    while time.time() < deadline:
+                        still_text = cdp.evaluate(f'document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()')
+                        if not still_text:
+                            print("  CDP: reply posted successfully", flush=True)
+                            return True
+                        time.sleep(1)
+                    print("  CDP: reply may have failed (textarea still has text)", flush=True)
+                    return False
+            except Exception as e:
+                logger.warning(f"post_reply CDP failed: {e}")
+                return False
 
     except Exception as e:
         print(f"  CDP reply exception: {e}", flush=True)
@@ -746,75 +499,46 @@ def post_reply(tweet_id: str, reply_text: str) -> bool:
 
 
 def post_tweet(text: str) -> bool:
-    """Post a new tweet via Chrome CDP (openclaw browser, satbox profile).
+    """Post a new tweet via Chrome CDP (CDPSession direct WebSocket).
 
     Flow: navigate to compose → find textbox → type → click Post.
     """
     try:
         with cdp_lock():
-            target_id = _get_target_id()
-            if not target_id:
-                print("  CDP: no browser tab available", flush=True)
-                return False
-
+            compose_url = f"{TWITTER_BASE_URL}/compose/post"
             print("  CDP: navigating to compose...", flush=True)
-            if not _navigate_and_wait(
-                f"{TWITTER_BASE_URL}/compose/post", target_id, wait_sec=3
-            ):
-                return False
 
-            snap = _snapshot(target_id)
-            if not snap:
-                print("  CDP: snapshot failed", flush=True)
-                return False
-
-            text_ref = _find_ref(snap, 'textbox "Post text"')
-            if not text_ref:
-                print("  CDP: post textbox not found", flush=True)
-                return False
-
-            print(f"  CDP: typing tweet (ref={text_ref})...", flush=True)
-            if not _type_text(target_id, text_ref, text):
-                print("  CDP: typing failed", flush=True)
-                return False
-
-            time.sleep(1)
-
-            # Re-snapshot to find enabled Post button
-            snap2 = _snapshot(target_id)
-            post_btn = _find_ref(snap2, 'button "Post"')
-            if not post_btn:
-                print("  CDP: Post button not found after typing", flush=True)
-                return False
-
-            # Make sure button is not disabled
-            for line in snap2.splitlines():
-                if 'button "Post"' in line and "[disabled]" in line:
-                    print("  CDP: Post button still disabled", flush=True)
+            try:
+                with CDPSession.connect() as cdp:
+                    if not cdp.navigate(compose_url, wait_sec=2):
+                        return False
+                    TEXTAREA = '[data-testid="tweetTextarea_0"]'
+                    POST_BTN = '[data-testid="tweetButton"]'
+                    if not cdp.wait_for(TEXTAREA, timeout=10):
+                        print("  CDP: compose textbox not found", flush=True)
+                        return False
+                    print(f"  CDP: typing tweet...", flush=True)
+                    if not cdp.type_text(TEXTAREA, text):
+                        print("  CDP: typing failed", flush=True)
+                        return False
+                    time.sleep(0.5)
+                    print(f"  CDP: clicking Post...", flush=True)
+                    if not cdp.click(POST_BTN):
+                        print("  CDP: Post button not found", flush=True)
+                        return False
+                    # Poll up to 8s for compose to close (textarea gone or empty)
+                    deadline = time.time() + 8
+                    while time.time() < deadline:
+                        still_text = cdp.evaluate(f'document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()')
+                        if not still_text:
+                            print("  CDP: tweet posted successfully", flush=True)
+                            return True
+                        time.sleep(1)
+                    print("  CDP: post may have failed (compose still open)", flush=True)
                     return False
-
-            print(f"  CDP: clicking Post (ref={post_btn})...", flush=True)
-            if not _click(target_id, post_btn):
-                print("  CDP: click Post failed", flush=True)
+            except Exception as e:
+                logger.warning(f"post_tweet CDP failed: {e}")
                 return False
-
-            # Wait and verify: after successful post, compose dialog closes
-            time.sleep(4)
-            snap3 = _snapshot(target_id)
-            if snap3:
-                # If compose textbox is still visible with text, posting likely failed
-                still_has_textbox = _find_ref(snap3, 'textbox "Post text"')
-                if still_has_textbox:
-                    # Check if the Post button is still enabled (means text is still there)
-                    for line in snap3.splitlines():
-                        if 'button "Post"' in line and "[disabled]" not in line:
-                            print(
-                                "  CDP: post may have failed (compose still open with text)",
-                                flush=True,
-                            )
-                            return False
-            print("  CDP: tweet posted successfully", flush=True)
-            return True
 
     except Exception as e:
         print(f"  CDP tweet exception: {e}", flush=True)
@@ -822,29 +546,18 @@ def post_tweet(text: str) -> bool:
 
 
 def _cdp_search(
-    term: str, target_id: str, limit: int = 15, since_dt: datetime | None = None
+    term: str, limit: int = 15, since_dt: datetime | None = None
 ) -> list[dict]:
-    """Search Twitter for a term via CDP and extract tweet data from page."""
+    """Search Twitter for a term via CDP and extract tweet data from page.
+
+    Uses CDPSession (direct WebSocket). Must be called while holding cdp_lock().
+    """
     if since_dt is None:
         since_dt = datetime.now(timezone.utc) - timedelta(hours=SEARCH_CACHE_TTL_HOURS)
     since_ts = int(since_dt.timestamp())
     encoded = quote(f"{term} since_time:{since_ts}")
     url = f"{TWITTER_BASE_URL}/search?q={encoded}&f=live"
 
-    if not _navigate_and_wait(url, target_id, wait_sec=4):
-        return []
-
-    # Scroll down 3 times to trigger Twitter's infinite-scroll and load more tweets.
-    # Each scroll+sleep typically adds another screenful (~10 tweets).
-    _scroll_js = "window.scrollTo(0, document.body.scrollHeight); document.querySelectorAll('article[data-testid=\"tweet\"]').length"
-    for _i in range(3):
-        n_before = _evaluate(target_id, _scroll_js, timeout=10)
-        time.sleep(2)
-        n_after = _evaluate(target_id, _scroll_js, timeout=10)
-        if n_before == n_after:
-            break  # no new tweets loaded — stop early
-
-    # Extract tweet data via JavaScript
     js = """(() => {
   const articles = document.querySelectorAll('article[data-testid="tweet"]');
   const results = [];
@@ -879,7 +592,22 @@ def _cdp_search(
   return JSON.stringify(results);
 })()"""
 
-    raw = _evaluate(target_id, js, timeout=20)
+    try:
+        with CDPSession.connect() as cdp:
+            if not cdp.navigate(url, wait_sec=4):
+                return []
+            # Scroll 3 times to load more tweets via infinite-scroll
+            for _i in range(3):
+                n_before = cdp.scroll_to_bottom()
+                time.sleep(2)
+                n_after = cdp.scroll_to_bottom()
+                if n_before == n_after:
+                    break
+            raw = cdp.evaluate(js, timeout=20)
+    except Exception as e:
+        logger.warning(f"_cdp_search CDP failed: {e}")
+        return []
+
     if not raw:
         return []
 
@@ -1024,12 +752,6 @@ def search_candidates(
             return candidates
 
     with cdp_lock():
-        target_id = _get_target_id()
-        if not target_id:
-            print("  CDP: no browser tab for search", flush=True)
-            send_error_alert("CDP search failed: no browser tab available")
-            return candidates
-
         if not bypass_cache:
             print(
                 f"  CDP: searching {len(terms_to_fetch)} uncached term(s)...",
@@ -1069,7 +791,7 @@ def search_candidates(
                     )
 
             try:
-                tweets = _cdp_search(term, target_id, limit=limit, since_dt=since_dt)
+                tweets = _cdp_search(term, limit=limit, since_dt=since_dt)
                 term_candidates = [
                     {
                         "tweetId": t.get("tweetId"),
@@ -1136,138 +858,142 @@ def fetch_tweet_context(tweet_id: str) -> dict | None:
     - otherReplies: visible replies from OTHER users (up to 5)
     - parentChain: tweets this tweet is replying to (conversation ancestry)
     - replyTo: the direct parent tweet (last item in parentChain), if any
+
+    Uses CDPSession (direct WebSocket).
     """
+    tweet_url = f"https://x.com/i/web/status/{tweet_id}"
+
+    # Extract tweet data via JavaScript.
+    # Finds the main tweet by tweet_id match (handles replies where the main tweet
+    # isn't articles[0]), captures parent chain (above), thread continuation
+    # (author's self-replies below), and other visible replies from other users.
+    js = f"""(() => {{
+  const targetId = '{tweet_id}';
+  const articles = document.querySelectorAll('article[data-testid="tweet"]');
+  if (!articles.length) return JSON.stringify(null);
+
+  function getUsername(article) {{
+    const userLinks = article.querySelectorAll('a[role="link"]');
+    for (const ul of userLinks) {{
+      const m = ul.href.match(/^https:\\/\\/x\\.com\\/([^/]+)$/);
+      if (m && m[1] !== 'search' && m[1] !== 'explore' && m[1] !== 'i') return m[1];
+    }}
+    return null;
+  }}
+
+  function getDisplayName(article) {{
+    const userLinks = article.querySelectorAll('a[role="link"]');
+    for (const ul of userLinks) {{
+      const m = ul.href.match(/^https:\\/\\/x\\.com\\/([^/]+)$/);
+      if (m && m[1] !== 'search' && m[1] !== 'explore' && m[1] !== 'i') {{
+        const nameEl = ul.querySelector('span');
+        return nameEl ? nameEl.textContent : null;
+      }}
+    }}
+    return null;
+  }}
+
+  function getStats(article) {{
+    let likes = 0, retweets = 0, replies = 0;
+    const buttons = article.querySelectorAll('button');
+    for (const btn of buttons) {{
+      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+      const likeM = label.match(/(\\d+)\\s+like/);
+      if (likeM) likes = parseInt(likeM[1]);
+      const rtM = label.match(/(\\d+)\\s+repost/);
+      if (rtM) retweets = parseInt(rtM[1]);
+      const replyM = label.match(/(\\d+)\\s+repl/);
+      if (replyM) replies = parseInt(replyM[1]);
+    }}
+    return {{ likes, retweets, replies }};
+  }}
+
+  function getTweetId(article) {{
+    const links = article.querySelectorAll('a[href*="/status/"]');
+    const sl = Array.from(links).find(l => /\\/status\\/\\d+$/.test(l.href));
+    return sl ? sl.href.match(/\\/status\\/(\\d+)/)?.[1] : null;
+  }}
+
+  function getText(article) {{
+    const textEl = article.querySelector('[data-testid="tweetText"]');
+    return textEl ? textEl.textContent.slice(0, 1000) : '';
+  }}
+
+  // Find main article by matching targetId in status links
+  // (needed for replies where parent tweets appear above as articles[0..n-1])
+  let mainIdx = 0;
+  for (let i = 0; i < articles.length; i++) {{
+    const links = articles[i].querySelectorAll('a[href*="/status/' + targetId + '"]');
+    if (links.length > 0) {{ mainIdx = i; break; }}
+  }}
+
+  const main = articles[mainIdx];
+  const username = getUsername(main);
+  const displayName = getDisplayName(main);
+  const text = getText(main);
+  const stats = getStats(main);
+
+  // Quoted tweet: a nested article inside the main article (document.querySelectorAll
+  // returns nested articles too, so we must detect and exclude them from reply loops).
+  let quotedTweet = null;
+  const nestedQtArticle = main.querySelector('article[data-testid="tweet"]');
+  if (nestedQtArticle) {{
+    const qUser = getUsername(nestedQtArticle);
+    const qText = getText(nestedQtArticle);
+    const qId = getTweetId(nestedQtArticle);
+    if (qUser && qText) {{
+      quotedTweet = {{ username: qUser, text: qText.slice(0, 500), tweetId: qId }};
+    }}
+  }}
+
+  // Parent chain: articles BEFORE the main tweet (conversation ancestry)
+  const parentChain = [];
+  for (let i = 0; i < mainIdx && parentChain.length < 3; i++) {{
+    const pUser = getUsername(articles[i]);
+    const pText = getText(articles[i]);
+    if (pText && pUser) {{
+      parentChain.push({{ username: pUser, text: pText.slice(0, 500), tweetId: getTweetId(articles[i]) }});
+    }}
+  }}
+
+  // Articles after the main tweet: thread continuation (self-replies) + other replies.
+  // Skip any article nested inside main (the quoted tweet) — document order places nested
+  // articles after their parent in the NodeList, so they'd otherwise appear here.
+  const threadContinuation = [];
+  const otherReplies = [];
+  for (let i = mainIdx + 1; i < articles.length && i <= mainIdx + 12; i++) {{
+    if (main.contains(articles[i])) continue;
+    const aUser = getUsername(articles[i]);
+    const aText = getText(articles[i]);
+    if (!aUser || !aText) continue;
+    if (aUser === username && threadContinuation.length < 5) {{
+      threadContinuation.push({{ text: aText, id: getTweetId(articles[i]) }});
+    }} else if (aUser !== username && otherReplies.length < 5) {{
+      otherReplies.push({{ username: aUser, text: aText.slice(0, 300), tweetId: getTweetId(articles[i]) }});
+    }}
+    if (threadContinuation.length >= 5 && otherReplies.length >= 5) break;
+  }}
+
+  return JSON.stringify({{
+    username, displayName, text,
+    likes: stats.likes, retweets: stats.retweets, replies: stats.replies,
+    quotedTweet: quotedTweet,
+    threadContinuation: threadContinuation.length ? threadContinuation : null,
+    otherReplies: otherReplies.length ? otherReplies : null,
+    parentChain: parentChain.length ? parentChain : null
+  }});
+}})()"""
+
     with cdp_lock():
-        target_id = _get_target_id()
-        if not target_id:
+        try:
+            with CDPSession.connect() as cdp:
+                if not cdp.navigate(tweet_url, wait_sec=4):
+                    return None
+                raw = cdp.evaluate(js, timeout=20)
+        except Exception as e:
+            logger.warning(f"fetch_tweet_context CDP failed: {e}")
             return None
 
-        tweet_url = f"https://x.com/i/web/status/{tweet_id}"
-        if not _navigate_and_wait(tweet_url, target_id, wait_sec=4):
-            return None
-
-        # Extract tweet data via JavaScript.
-        # Finds the main tweet by tweet_id match (handles replies where the main tweet
-        # isn't articles[0]), captures parent chain (above), thread continuation
-        # (author's self-replies below), and other visible replies from other users.
-        js = f"""(() => {{
-      const targetId = '{tweet_id}';
-      const articles = document.querySelectorAll('article[data-testid="tweet"]');
-      if (!articles.length) return JSON.stringify(null);
-
-      function getUsername(article) {{
-        const userLinks = article.querySelectorAll('a[role="link"]');
-        for (const ul of userLinks) {{
-          const m = ul.href.match(/^https:\\/\\/x\\.com\\/([^/]+)$/);
-          if (m && m[1] !== 'search' && m[1] !== 'explore' && m[1] !== 'i') return m[1];
-        }}
-        return null;
-      }}
-
-      function getDisplayName(article) {{
-        const userLinks = article.querySelectorAll('a[role="link"]');
-        for (const ul of userLinks) {{
-          const m = ul.href.match(/^https:\\/\\/x\\.com\\/([^/]+)$/);
-          if (m && m[1] !== 'search' && m[1] !== 'explore' && m[1] !== 'i') {{
-            const nameEl = ul.querySelector('span');
-            return nameEl ? nameEl.textContent : null;
-          }}
-        }}
-        return null;
-      }}
-
-      function getStats(article) {{
-        let likes = 0, retweets = 0, replies = 0;
-        const buttons = article.querySelectorAll('button');
-        for (const btn of buttons) {{
-          const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-          const likeM = label.match(/(\\d+)\\s+like/);
-          if (likeM) likes = parseInt(likeM[1]);
-          const rtM = label.match(/(\\d+)\\s+repost/);
-          if (rtM) retweets = parseInt(rtM[1]);
-          const replyM = label.match(/(\\d+)\\s+repl/);
-          if (replyM) replies = parseInt(replyM[1]);
-        }}
-        return {{ likes, retweets, replies }};
-      }}
-
-      function getTweetId(article) {{
-        const links = article.querySelectorAll('a[href*="/status/"]');
-        const sl = Array.from(links).find(l => /\\/status\\/\\d+$/.test(l.href));
-        return sl ? sl.href.match(/\\/status\\/(\\d+)/)?.[1] : null;
-      }}
-
-      function getText(article) {{
-        const textEl = article.querySelector('[data-testid="tweetText"]');
-        return textEl ? textEl.textContent.slice(0, 1000) : '';
-      }}
-
-      // Find main article by matching targetId in status links
-      // (needed for replies where parent tweets appear above as articles[0..n-1])
-      let mainIdx = 0;
-      for (let i = 0; i < articles.length; i++) {{
-        const links = articles[i].querySelectorAll('a[href*="/status/' + targetId + '"]');
-        if (links.length > 0) {{ mainIdx = i; break; }}
-      }}
-
-      const main = articles[mainIdx];
-      const username = getUsername(main);
-      const displayName = getDisplayName(main);
-      const text = getText(main);
-      const stats = getStats(main);
-
-      // Quoted tweet: a nested article inside the main article (document.querySelectorAll
-      // returns nested articles too, so we must detect and exclude them from reply loops).
-      let quotedTweet = null;
-      const nestedQtArticle = main.querySelector('article[data-testid="tweet"]');
-      if (nestedQtArticle) {{
-        const qUser = getUsername(nestedQtArticle);
-        const qText = getText(nestedQtArticle);
-        const qId = getTweetId(nestedQtArticle);
-        if (qUser && qText) {{
-          quotedTweet = {{ username: qUser, text: qText.slice(0, 500), tweetId: qId }};
-        }}
-      }}
-
-      // Parent chain: articles BEFORE the main tweet (conversation ancestry)
-      const parentChain = [];
-      for (let i = 0; i < mainIdx && parentChain.length < 3; i++) {{
-        const pUser = getUsername(articles[i]);
-        const pText = getText(articles[i]);
-        if (pText && pUser) {{
-          parentChain.push({{ username: pUser, text: pText.slice(0, 500), tweetId: getTweetId(articles[i]) }});
-        }}
-      }}
-
-      // Articles after the main tweet: thread continuation (self-replies) + other replies.
-      // Skip any article nested inside main (the quoted tweet) — document order places nested
-      // articles after their parent in the NodeList, so they'd otherwise appear here.
-      const threadContinuation = [];
-      const otherReplies = [];
-      for (let i = mainIdx + 1; i < articles.length && i <= mainIdx + 12; i++) {{
-        if (main.contains(articles[i])) continue;
-        const aUser = getUsername(articles[i]);
-        const aText = getText(articles[i]);
-        if (!aUser || !aText) continue;
-        if (aUser === username && threadContinuation.length < 5) {{
-          threadContinuation.push({{ text: aText, id: getTweetId(articles[i]) }});
-        }} else if (aUser !== username && otherReplies.length < 5) {{
-          otherReplies.push({{ username: aUser, text: aText.slice(0, 300), tweetId: getTweetId(articles[i]) }});
-        }}
-        if (threadContinuation.length >= 5 && otherReplies.length >= 5) break;
-      }}
-
-      return JSON.stringify({{
-        username, displayName, text,
-        likes: stats.likes, retweets: stats.retweets, replies: stats.replies,
-        quotedTweet: quotedTweet,
-        threadContinuation: threadContinuation.length ? threadContinuation : null,
-        otherReplies: otherReplies.length ? otherReplies : null,
-        parentChain: parentChain.length ? parentChain : null
-      }});
-    }})()"""
-
-        raw = _evaluate(target_id, js, timeout=20)
         if not raw:
             return None
 
@@ -1396,103 +1122,107 @@ def fetch_user_profile(username: str) -> dict | None:
     - followersCount, followingCount, tweetsCount
     - recentTweets: list of last 5-10 tweet texts
     - isVerified, isBlueVerified
+
+    Uses CDPSession (direct WebSocket).
     """
+    profile_url = f"{TWITTER_BASE_URL}/{username}"
+
+    # Extract profile data + recent tweets
+    js = """(() => {
+  const result = {
+    displayName: null,
+    bio: null,
+    location: null,
+    website: null,
+    followersCount: null,
+    followingCount: null,
+    tweetsCount: null,
+    isVerified: false,
+    isBlueVerified: false,
+    recentTweets: []
+  };
+
+  // Get display name from header
+  const nameSpans = document.querySelectorAll('span');
+  for (const span of nameSpans) {
+    const text = span.textContent || '';
+    if (text.length > 0 && text.length < 100) {
+      // Look for the main name in the profile header
+      const parent = span.closest('[data-testid="UserName"]');
+      if (parent) {
+        result.displayName = text;
+        break;
+      }
+    }
+  }
+
+  // Get bio from the bio/description element
+  const bioEl = document.querySelector('[data-testid="UserDescription"]');
+  if (bioEl) {
+    result.bio = bioEl.textContent.slice(0, 500);
+  }
+
+  // Get location and website
+  const locationEl = document.querySelector('[data-testid="UserLocation"]');
+  if (locationEl) result.location = locationEl.textContent;
+
+  const websiteEl = document.querySelector('[data-testid="UserProfileUrl"]');
+  if (websiteEl) result.website = websiteEl.href;
+
+  // Check verification
+  const verifiedBadge = document.querySelector('[data-testid="icon-verified"]');
+  if (verifiedBadge) result.isVerified = true;
+
+  // Get follower/following/tweets counts from profile stats
+  const statLinks = document.querySelectorAll('a[href*="followers"], a[href*="/following"]');
+  for (const link of statLinks) {
+    const text = link.textContent || '';
+    const numMatch = text.match(/([\\d,.]+[KkMm]?)/);
+    if (!numMatch) continue;
+    let val = numMatch[1].replace(/,/g, '');
+    if (val.endsWith('K') || val.endsWith('k')) val = parseFloat(val) * 1000;
+    else if (val.endsWith('M') || val.endsWith('m')) val = parseFloat(val) * 1000000;
+    else val = parseInt(val);
+
+    if (text.includes('Follower')) result.followersCount = val;
+    else if (text.includes('Following')) result.followingCount = val;
+  }
+
+  // Get tweets count from profile
+  const tweetsTab = document.querySelector('a[href$="/tweets"]');
+  if (tweetsTab) {
+    const text = tweetsTab.textContent || '';
+    const numMatch = text.match(/([\\d,.]+[KkMm]?)/);
+    if (numMatch) {
+      let val = numMatch[1].replace(/,/g, '');
+      if (val.endsWith('K') || val.endsWith('k')) val = parseFloat(val) * 1000;
+      else if (val.endsWith('M') || val.endsWith('m')) val = parseFloat(val) * 1000000;
+      result.tweetsCount = parseInt(val);
+    }
+  }
+
+  // Get recent tweets from timeline
+  const articles = document.querySelectorAll('article[data-testid="tweet"]');
+  for (let i = 0; i < Math.min(articles.length, 8); i++) {
+    const textEl = articles[i].querySelector('[data-testid="tweetText"]');
+    if (textEl) {
+      result.recentTweets.push(textEl.textContent.slice(0, 280));
+    }
+  }
+
+  return result;
+})()"""
+
     with cdp_lock():
-        target_id = _get_target_id()
-        if not target_id:
+        try:
+            with CDPSession.connect() as cdp:
+                if not cdp.navigate(profile_url, wait_sec=5):
+                    return None
+                raw = cdp.evaluate(js, timeout=15)
+        except Exception as e:
+            logger.warning(f"fetch_user_profile CDP failed: {e}")
             return None
 
-        profile_url = f"{TWITTER_BASE_URL}/{username}"
-        if not _navigate_and_wait(profile_url, target_id, wait_sec=4):
-            return None
-
-        # Extract profile data + recent tweets
-        js = """(() => {
-      const result = {
-        displayName: null,
-        bio: null,
-        location: null,
-        website: null,
-        followersCount: null,
-        followingCount: null,
-        tweetsCount: null,
-        isVerified: false,
-        isBlueVerified: false,
-        recentTweets: []
-      };
-
-      // Get display name from header
-      const nameSpans = document.querySelectorAll('span');
-      for (const span of nameSpans) {
-        const text = span.textContent || '';
-        if (text.length > 0 && text.length < 100) {
-          // Look for the main name in the profile header
-          const parent = span.closest('[data-testid="UserName"]');
-          if (parent) {
-            result.displayName = text;
-            break;
-          }
-        }
-      }
-
-      // Get bio from the bio/description element
-      const bioEl = document.querySelector('[data-testid="UserDescription"]');
-      if (bioEl) {
-        result.bio = bioEl.textContent.slice(0, 500);
-      }
-
-      // Get location and website
-      const locationEl = document.querySelector('[data-testid="UserLocation"]');
-      if (locationEl) result.location = locationEl.textContent;
-
-      const websiteEl = document.querySelector('[data-testid="UserProfileUrl"]');
-      if (websiteEl) result.website = websiteEl.href;
-
-      // Check verification
-      const verifiedBadge = document.querySelector('[data-testid="icon-verified"]');
-      if (verifiedBadge) result.isVerified = true;
-
-      // Get follower/following/tweets counts from profile stats
-      const statLinks = document.querySelectorAll('a[href*="/followers"], a[href*="/following"]');
-      for (const link of statLinks) {
-        const text = link.textContent || '';
-        const numMatch = text.match(/([\\d,.]+[KkMm]?)/);
-        if (!numMatch) continue;
-        let val = numMatch[1].replace(/,/g, '');
-        if (val.endsWith('K') || val.endsWith('k')) val = parseFloat(val) * 1000;
-        else if (val.endsWith('M') || val.endsWith('m')) val = parseFloat(val) * 1000000;
-        else val = parseInt(val);
-
-        if (text.includes('Follower')) result.followersCount = val;
-        else if (text.includes('Following')) result.followingCount = val;
-      }
-
-      // Get tweets count from profile
-      const tweetsTab = document.querySelector('a[href$="/tweets"]');
-      if (tweetsTab) {
-        const text = tweetsTab.textContent || '';
-        const numMatch = text.match(/([\\d,.]+[KkMm]?)/);
-        if (numMatch) {
-          let val = numMatch[1].replace(/,/g, '');
-          if (val.endsWith('K') || val.endsWith('k')) val = parseFloat(val) * 1000;
-          else if (val.endsWith('M') || val.endsWith('m')) val = parseFloat(val) * 1000000;
-          result.tweetsCount = parseInt(val);
-        }
-      }
-
-      // Get recent tweets from timeline
-      const articles = document.querySelectorAll('article[data-testid="tweet"]');
-      for (let i = 0; i < Math.min(articles.length, 8); i++) {
-        const textEl = articles[i].querySelector('[data-testid="tweetText"]');
-        if (textEl) {
-          result.recentTweets.push(textEl.textContent.slice(0, 280));
-        }
-      }
-
-      return result;
-    })()"""
-
-        raw = _evaluate(target_id, js, timeout=15)
         if raw is None:
             return None
 
@@ -1547,18 +1277,8 @@ def get_follower_count(username: str) -> int | None:
         _follower_count_run_cache[username_lower] = count
         return count
 
-    # Cache miss — navigate to profile page (existing logic)
-    count = None
-    with cdp_lock():
-        target_id = _get_target_id()
-        if not target_id:
-            return None
-
-        profile_url = f"https://x.com/{username}"
-        if not _navigate_and_wait(profile_url, target_id, wait_sec=3):
-            return None
-
-        js = r"""(() => {
+    # Cache miss — navigate to profile page
+    js = r"""(() => {
   // Look for the followers link which contains the count
   const links = document.querySelectorAll('a[href$="/verified_followers"]');
   for (const link of links) {
@@ -1575,7 +1295,18 @@ def get_follower_count(username: str) -> int | None:
   return null;
 })()"""
 
-        raw = _evaluate(target_id, js, timeout=10)
+    profile_url = f"https://x.com/{username}"
+    count = None
+    with cdp_lock():
+        try:
+            with CDPSession.connect() as cdp:
+                if not cdp.navigate(profile_url, wait_sec=3):
+                    return None
+                raw = cdp.evaluate(js, timeout=10)
+        except Exception as e:
+            logger.warning(f"get_follower_count CDP failed: {e}")
+            return None
+
         if raw is None:
             return None
 
@@ -1603,120 +1334,121 @@ def get_follower_count(username: str) -> int | None:
 
 
 def follow_user(username: str) -> bool:
-    """Follow a user via CDP by navigating to their profile and clicking Follow."""
+    """Follow a user via CDP by navigating to their profile and clicking Follow.
+
+    Uses CDPSession (direct WebSocket).
+    """
     with cdp_lock():
-        target_id = _get_target_id()
-        if not target_id:
-            print("  CDP: no browser tab for follow", flush=True)
-            return False
-
         profile_url = f"https://x.com/{username}"
-        if not _navigate_and_wait(profile_url, target_id, wait_sec=3):
+
+        try:
+            with CDPSession.connect() as cdp:
+                if not cdp.navigate(profile_url, wait_sec=2):
+                    return False
+                FOLLOW_BTN = '[data-testid$="-follow"]'
+                UNFOLLOW_BTN = '[data-testid$="-unfollow"]'
+                # Wait for either button to appear (page loaded)
+                if not cdp.wait_for(f'{FOLLOW_BTN}, {UNFOLLOW_BTN}', timeout=10):
+                    print(f"  CDP: follow/unfollow button not found for @{username}", flush=True)
+                    return False
+                # Check if already following
+                already = cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null')
+                if already:
+                    print(f"  CDP: already following @{username}", flush=True)
+                    return True
+                print(f"  CDP: clicking Follow for @{username}...", flush=True)
+                if not cdp.click(FOLLOW_BTN):
+                    print(f"  CDP: Follow button not found for @{username}", flush=True)
+                    return False
+                # Poll up to 5s for unfollow button to confirm follow took effect
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    if cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
+                        print(f"  CDP: followed @{username}", flush=True)
+                        return True
+                    time.sleep(1)
+                print(f"  CDP: follow @{username} may not have succeeded", flush=True)
+                return False
+        except Exception as e:
+            logger.warning(f"follow_user CDP failed: {e}")
             return False
-
-        snap = _snapshot(target_id)
-        if not snap:
-            print(f"  CDP: snapshot failed on @{username} profile", flush=True)
-            return False
-
-        # Check if already following
-        if _find_ref(snap, 'button "Following"'):
-            print(f"  CDP: already following @{username}", flush=True)
-            return True
-
-        follow_ref = _find_ref(snap, 'button "Follow"')
-        if not follow_ref:
-            print(f"  CDP: Follow button not found for @{username}", flush=True)
-            return False
-
-        print(
-            f"  CDP: clicking Follow for @{username} (ref={follow_ref})...", flush=True
-        )
-        if not _click(target_id, follow_ref):
-            print(f"  CDP: click Follow failed for @{username}", flush=True)
-            return False
-
-        # Verify the follow took effect
-        time.sleep(2)
-        snap2 = _snapshot(target_id)
-        if snap2 and _find_ref(snap2, 'button "Following"'):
-            print(f"  CDP: followed @{username}", flush=True)
-            return True
-
-        print(f"  CDP: follow @{username} may not have succeeded", flush=True)
-        return False
 
 
 def unfollow_user(username: str) -> bool:
-    """Unfollow a user via CDP by clicking Following → confirm Unfollow."""
+    """Unfollow a user via CDP by clicking Following → confirm Unfollow.
+
+    Uses CDPSession (direct WebSocket).
+    """
     with cdp_lock():
-        target_id = _get_target_id()
-        if not target_id:
-            print("  CDP: no browser tab for unfollow", flush=True)
-            return False
-
         profile_url = f"https://x.com/{username}"
-        if not _navigate_and_wait(profile_url, target_id, wait_sec=3):
+
+        try:
+            with CDPSession.connect() as cdp:
+                if not cdp.navigate(profile_url, wait_sec=2):
+                    return False
+                FOLLOW_BTN = '[data-testid$="-follow"]'
+                UNFOLLOW_BTN = '[data-testid$="-unfollow"]'
+                CONFIRM_BTN = '[data-testid="confirmationSheetConfirm"]'
+                # Wait for either button to appear (page loaded)
+                if not cdp.wait_for(f'{FOLLOW_BTN}, {UNFOLLOW_BTN}', timeout=10):
+                    print(f"  CDP: follow/unfollow button not found for @{username}", flush=True)
+                    return False
+                # Check if actually following
+                if not cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
+                    print(f"  CDP: not following @{username} (no unfollow button)", flush=True)
+                    return True  # Already not following
+                print(f"  CDP: clicking Following to unfollow @{username}...", flush=True)
+                if not cdp.click(UNFOLLOW_BTN):
+                    print(f"  CDP: click Following failed for @{username}", flush=True)
+                    return False
+                # Wait for confirmation dialog
+                if not cdp.wait_for(CONFIRM_BTN, timeout=5):
+                    print(f"  CDP: Unfollow confirmation not found for @{username}", flush=True)
+                    return False
+                if not cdp.click(CONFIRM_BTN):
+                    return False
+                # Poll up to 5s for unfollow to confirm
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    if not cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
+                        print(f"  CDP: unfollowed @{username}", flush=True)
+                        return True
+                    time.sleep(1)
+                print(f"  CDP: unfollow @{username} may not have succeeded", flush=True)
+                return False
+        except Exception as e:
+            logger.warning(f"unfollow_user CDP failed: {e}")
             return False
-
-        snap = _snapshot(target_id)
-        if not snap:
-            return False
-
-        following_ref = _find_ref(snap, 'button "Following"')
-        if not following_ref:
-            print(f"  CDP: not following @{username} (no Following button)", flush=True)
-            return True  # Already not following — success
-
-        print(f"  CDP: clicking Following to unfollow @{username}...", flush=True)
-        if not _click(target_id, following_ref):
-            return False
-
-        # Wait for confirmation dialog
-        time.sleep(1)
-        snap2 = _snapshot(target_id)
-
-        unfollow_ref = _find_ref(snap2, 'button "Unfollow"')
-        if not unfollow_ref:
-            print(f"  CDP: Unfollow confirmation not found for @{username}", flush=True)
-            return False
-
-        if not _click(target_id, unfollow_ref):
-            print(f"  CDP: click Unfollow failed for @{username}", flush=True)
-            return False
-
-        time.sleep(2)
-        snap3 = _snapshot(target_id)
-        if snap3 and _find_ref(snap3, 'button "Follow"'):
-            print(f"  CDP: unfollowed @{username}", flush=True)
-            return True
-
-        print(f"  CDP: unfollow @{username} may not have succeeded", flush=True)
-        return False
 
 
 def check_follows_back(username: str) -> bool | None:
     """Check if a user follows us back by looking for 'Follows you' on their profile.
 
     Returns True/False, or None if the check failed.
+    Uses CDPSession (direct WebSocket).
     """
+    profile_url = f"https://x.com/{username}"
+    # JS to detect "Follows you" badge on the profile page
+    js = """(() => {
+  const spans = document.querySelectorAll('span');
+  for (const span of spans) {
+    if (span.textContent && span.textContent.trim() === 'Follows you') return true;
+  }
+  return false;
+})()"""
+
     with cdp_lock():
-        target_id = _get_target_id()
-        if not target_id:
+        try:
+            with CDPSession.connect() as cdp:
+                if not cdp.navigate(profile_url, wait_sec=3):
+                    return None
+                result = cdp.evaluate(js, timeout=10)
+                if result is not None:
+                    return bool(result)
+                return None
+        except Exception as e:
+            logger.warning(f"check_follows_back CDP failed: {e}")
             return None
-
-        profile_url = f"https://x.com/{username}"
-        if not _navigate_and_wait(profile_url, target_id, wait_sec=3):
-            return None
-
-        snap = _snapshot(target_id)
-        if not snap:
-            return None
-
-        for line in snap.splitlines():
-            if "Follows you" in line:
-                return True
-        return False
 
 
 def get_latest_own_tweet_id(username: str = "DecentCloud_org") -> str | None:
@@ -1724,30 +1456,32 @@ def get_latest_own_tweet_id(username: str = "DecentCloud_org") -> str | None:
 
     Navigates to the profile's Replies tab and extracts the first tweet ID.
     Used by thread posting to chain replies.
+    Uses CDPSession (direct WebSocket).
     """
+    url = f"https://x.com/{username}/with_replies"
+    js = """(() => {
+  const articles = document.querySelectorAll('article[data-testid="tweet"]');
+  for (const article of articles) {
+    const links = article.querySelectorAll('a[href*="/status/"]');
+    const statusLink = Array.from(links).find(l => /\\/status\\/\\d+$/.test(l.href));
+    if (statusLink) {
+      const m = statusLink.href.match(/\\/status\\/(\\d+)/);
+      if (m) return m[1];
+    }
+  }
+  return null;
+})()"""
+
     with cdp_lock():
-        target_id = _get_target_id()
-        if not target_id:
+        try:
+            with CDPSession.connect() as cdp:
+                if not cdp.navigate(url, wait_sec=4):
+                    return None
+                raw = cdp.evaluate(js, timeout=10)
+        except Exception as e:
+            logger.warning(f"get_latest_own_tweet_id CDP failed: {e}")
             return None
 
-        url = f"https://x.com/{username}/with_replies"
-        if not _navigate_and_wait(url, target_id, wait_sec=4):
-            return None
-
-        js = """(() => {
-      const articles = document.querySelectorAll('article[data-testid="tweet"]');
-      for (const article of articles) {
-        const links = article.querySelectorAll('a[href*="/status/"]');
-        const statusLink = Array.from(links).find(l => /\\/status\\/\\d+$/.test(l.href));
-        if (statusLink) {
-          const m = statusLink.href.match(/\\/status\\/(\\d+)/);
-          if (m) return m[1];
-        }
-      }
-      return null;
-    })()"""
-
-        raw = _evaluate(target_id, js, timeout=10)
         if not raw:
             return None
 
@@ -1765,14 +1499,9 @@ def get_tweet_stats(tweet_id: str) -> dict | None:
     Returns a dict with keys: likes, retweets, replies (all int).
     Returns None if navigation fails or stats cannot be extracted.
     Used by daily_strategy_eval.py to measure reply performance.
+    Uses CDPSession (direct WebSocket).
     """
-    target_id = _get_target_id()
-    if not target_id:
-        return None
-
     tweet_url = f"https://x.com/i/web/status/{tweet_id}"
-    if not _navigate_and_wait(tweet_url, target_id, wait_sec=4):
-        return None
 
     js = r"""(() => {
   // Twitter renders counts as aria-label on action buttons, e.g.
@@ -1823,25 +1552,34 @@ def get_tweet_stats(tweet_id: str) -> dict | None:
   return JSON.stringify(stats);
 })()"""
 
-    raw = _evaluate(target_id, js, timeout=15)
-    if not raw:
-        return None
-
-    try:
-        # _evaluate may return a JSON-encoded string or the raw value
-        result = json.loads(raw) if isinstance(raw, str) else raw
-        if isinstance(result, str):
-            result = json.loads(result)
-        if not isinstance(result, dict):
+    with cdp_lock():
+        try:
+            with CDPSession.connect() as cdp:
+                if not cdp.navigate(tweet_url, wait_sec=5):
+                    return None
+                raw = cdp.evaluate(js, timeout=15)
+        except Exception as e:
+            logger.warning(f"get_tweet_stats CDP failed: {e}")
             return None
-        return {
-            "likes": int(result.get("likes", 0)),
-            "retweets": int(result.get("retweets", 0)),
-            "replies": int(result.get("replies", 0)),
-        }
-    except (json.JSONDecodeError, TypeError, ValueError) as e:
-        logger.debug(f"get_tweet_stats parse failed for {tweet_id}: {e}")
-        return None
+
+        if not raw:
+            return None
+
+        try:
+            # cdp.evaluate may return a JSON-encoded string or the raw value
+            result = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(result, str):
+                result = json.loads(result)
+            if not isinstance(result, dict):
+                return None
+            return {
+                "likes": int(result.get("likes", 0)),
+                "retweets": int(result.get("retweets", 0)),
+                "replies": int(result.get("replies", 0)),
+            }
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            logger.debug(f"get_tweet_stats parse failed for {tweet_id}: {e}")
+            return None
 
 
 def auto_follow_after_engagement(conn, username: str, tweet_id: str) -> bool:

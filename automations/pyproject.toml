@@ -3,7 +3,9 @@ name = "automations"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "prefect>=3.6.19",
     "psycopg2-binary>=2.9.11",
+    "websocket-client>=1.8.0",
 ]
 
 [tool.pyright]

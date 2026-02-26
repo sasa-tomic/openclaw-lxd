@@ -87,7 +87,7 @@ def extract_json(text: str) -> str | None:
 
 def call_llm(
     prompt: str,
-    max_retries: int = 3,
+    max_retries: int = 4,
     timeout: int = 120,
     model: Optional[str] = None,
     fallback_model: Optional[str] = None,
