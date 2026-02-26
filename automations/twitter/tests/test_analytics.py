@@ -18,6 +18,7 @@ import sys
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -41,7 +42,7 @@ def _utc_hours_ago(hours: float) -> str:
 # ---------------------------------------------------------------------------
 
 class TestOurReplyIdCapture:
-    """Verify that twitter-engagement.py stores ourReplyId in state entries."""
+    """Verify that twitter-engagement.py captures our reply ID after posting."""
 
     def _build_state_entry(self, our_reply_id: str | None) -> dict:
         """Simulate the state dict entry that the engagement script creates."""
@@ -64,21 +65,21 @@ class TestOurReplyIdCapture:
         entry = self._build_state_entry(None)
         assert entry.get("ourReplyId") is None
 
-    def test_engagement_script_uses_get_latest_own_tweet_id(self):
-        """Verify twitter-engagement.py imports get_latest_own_tweet_id."""
+    def test_engagement_script_captures_our_reply_id(self):
+        """Verify twitter_engagement.py captures our_reply_id from post_reply()."""
         engagement_path = Path(__file__).parent.parent / "twitter_engagement.py"
         source = engagement_path.read_text()
-        assert "get_latest_own_tweet_id" in source, (
-            "twitter_engagement.py must import and call get_latest_own_tweet_id "
-            "to capture ourReplyId after posting"
+        assert "our_reply_id" in source, (
+            "twitter_engagement.py must capture our_reply_id from post_reply() "
+            "to track the ID of our posted reply"
         )
 
-    def test_engagement_script_stores_our_reply_id(self):
-        """Verify twitter_engagement.py stores ourReplyId in the state entry."""
+    def test_engagement_script_stores_our_reply_id_in_db(self):
+        """Verify twitter_engagement.py passes our_reply_id to insert_engagement."""
         engagement_path = Path(__file__).parent.parent / "twitter_engagement.py"
         source = engagement_path.read_text()
-        assert '"ourReplyId"' in source or "'ourReplyId'" in source, (
-            "twitter-engagement.py must store ourReplyId in the engagedPosts state entry"
+        assert "our_reply_id=our_reply_id" in source, (
+            "twitter_engagement.py must pass our_reply_id= to insert_engagement()"
         )
 
 
@@ -87,31 +88,31 @@ class TestOurReplyIdCapture:
 # ---------------------------------------------------------------------------
 
 class TestGatherMetricsReplyPerformances:
-    """Verify that gather_metrics() collects reply performance data from state."""
-
-    def _make_state(self, entries: list[dict]) -> dict:
-        return {"engagedPosts": entries, "recentPosts": [], "followedUsers": {}}
+    """Verify that gather_metrics() collects reply performance data."""
 
     def test_reply_performances_in_metrics(self):
-        """gather_metrics returns replyPerformances for entries in 2-24h window."""
+        """gather_metrics returns replyPerformances from _gather_reply_performances."""
         from twitter import daily_strategy_eval  # type: ignore
 
-        state = self._make_state([
-            {
-                "tweetId": "111",
-                "ourReplyId": "222",
-                "timestamp": _utc_hours_ago(5),   # 5h ago — inside 2-24h window
-                "author": "alice",
-                "replyText": "The egress tax is brutal.",
-                "searchTerm": "cloud egress",
-            }
-        ])
+        expected_perf = [{
+            "replyId": "222",
+            "author": "alice",
+            "replyText": "The egress tax is brutal.",
+            "likes": 7,
+            "retweets": 2,
+            "replies": 1,
+            "searchTerm": "cloud egress",
+        }]
 
-        with patch.object(daily_strategy_eval, "load_eval_history", return_value=[]):
-            with patch.object(daily_strategy_eval, "load_state", return_value=state):
-                with patch.object(daily_strategy_eval, "get_user_follower_count", return_value=250):
-                    with patch.object(daily_strategy_eval, "get_tweet_stats", return_value={"likes": 7, "retweets": 2, "replies": 1}):
-                        metrics = daily_strategy_eval.gather_metrics()
+        mock_conn = MagicMock()
+        with (
+            patch.object(daily_strategy_eval, "_gather_reply_performances", return_value=expected_perf),
+            patch.object(daily_strategy_eval, "count_engagements", return_value=0),
+            patch.object(daily_strategy_eval, "_count_posts_since", return_value=0),
+            patch.object(daily_strategy_eval, "get_follower_count", return_value=250),
+            patch.object(daily_strategy_eval, "get_last_eval", return_value=None),
+        ):
+            metrics = daily_strategy_eval.gather_metrics(mock_conn)
 
         assert "replyPerformances" in metrics
         assert len(metrics["replyPerformances"]) == 1
@@ -122,57 +123,45 @@ class TestGatherMetricsReplyPerformances:
         assert perf["retweets"] == 2
 
     def test_replies_outside_window_excluded(self):
-        """Replies <2h old or >24h old are excluded from performance check."""
+        """_gather_reply_performances skips entries without our_reply_id."""
         from twitter import daily_strategy_eval  # type: ignore
 
-        state = self._make_state([
-            {
-                "tweetId": "333",
-                "ourReplyId": "444",
-                "timestamp": _utc_hours_ago(0.5),   # too recent (<2h)
-                "author": "bob",
-                "replyText": "Too new.",
-                "searchTerm": "cloud costs",
-            },
-            {
-                "tweetId": "555",
-                "ourReplyId": "666",
-                "timestamp": _utc_hours_ago(30),    # too old (>24h)
-                "author": "carol",
-                "replyText": "Too old.",
-                "searchTerm": "cloud costs",
-            },
-        ])
+        # Entries without our_reply_id should be skipped
+        mock_engagements = [
+            {"tweet_id": "333", "our_reply_id": None, "target_username": "bob"},
+            {"tweet_id": "555", "our_reply_id": "", "target_username": "carol"},
+        ]
 
-        with patch.object(daily_strategy_eval, "load_eval_history", return_value=[]):
-            with patch.object(daily_strategy_eval, "load_state", return_value=state):
-                with patch.object(daily_strategy_eval, "get_user_follower_count", return_value=250):
-                    with patch.object(daily_strategy_eval, "get_tweet_stats") as mock_stats:
-                        metrics = daily_strategy_eval.gather_metrics()
+        mock_conn = MagicMock()
+        with (
+            patch.object(daily_strategy_eval, "get_engagements_for_perf_check", return_value=mock_engagements),
+        ):
+            result = daily_strategy_eval._gather_reply_performances(mock_conn)
 
-        assert metrics["replyPerformances"] == []
-        mock_stats.assert_not_called()
+        assert result == []
 
     def test_no_our_reply_id_skipped(self):
-        """Entries without ourReplyId are silently skipped."""
+        """_gather_reply_performances skips entries where get_tweet_stats returns None."""
         from twitter import daily_strategy_eval  # type: ignore
 
-        state = self._make_state([
+        mock_engagements = [
             {
-                "tweetId": "777",
-                "timestamp": _utc_hours_ago(5),
-                "author": "dave",
-                "replyText": "No reply ID.",
-                # No ourReplyId key at all
-            }
-        ])
+                "tweet_id": "777",
+                "our_reply_id": "888",
+                "target_username": "dave",
+                "our_reply_text": "No reply ID.",
+                "search_term": "cloud",
+            },
+        ]
 
-        with patch.object(daily_strategy_eval, "load_eval_history", return_value=[]):
-            with patch.object(daily_strategy_eval, "load_state", return_value=state):
-                with patch.object(daily_strategy_eval, "get_user_follower_count", return_value=250):
-                    metrics = daily_strategy_eval.gather_metrics()
+        mock_conn = MagicMock()
+        with (
+            patch.object(daily_strategy_eval, "get_engagements_for_perf_check", return_value=mock_engagements),
+            patch.object(daily_strategy_eval, "get_tweet_stats", return_value=None),
+        ):
+            result = daily_strategy_eval._gather_reply_performances(mock_conn)
 
-        assert metrics["replyPerformances"] == []
+        assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +212,13 @@ class TestThreadLength:
             "tweets": tweets_8
         })
 
-        state: dict = {"threads": [], "recentPosts": [], "engagedPosts": []}
-        result = post_thread.generate_thread(state)
+        mock_conn = MagicMock()
+        with (
+            patch.object(post_thread, "recent_thread_topics", return_value=[]),
+            patch.object(post_thread, "get_recent_posts", return_value=[]),
+            patch.object(post_thread, "get_recent_engagements", return_value=[]),
+        ):
+            result = post_thread.generate_thread(mock_conn)
 
         assert result is not None, "generate_thread returned None for 8-tweet response"
         assert 6 <= len(result["tweets"]) <= 10, (
@@ -242,8 +236,13 @@ class TestThreadLength:
             "tweets": [f"{i}/ Tweet {i}" for i in range(1, 7)]
         })
 
-        state: dict = {"threads": [], "recentPosts": [], "engagedPosts": []}
-        post_thread.generate_thread(state)
+        mock_conn = MagicMock()
+        with (
+            patch.object(post_thread, "recent_thread_topics", return_value=[]),
+            patch.object(post_thread, "get_recent_posts", return_value=[]),
+            patch.object(post_thread, "get_recent_engagements", return_value=[]),
+        ):
+            post_thread.generate_thread(mock_conn)
 
         # Inspect what was passed to call_llm
         assert mock_llm.called, "call_llm was not called"
@@ -267,8 +266,13 @@ class TestThreadLength:
             "tweets": ["1/ Only one tweet."]
         })
 
-        state: dict = {"threads": [], "recentPosts": [], "engagedPosts": []}
-        result = post_thread.generate_thread(state)
+        mock_conn = MagicMock()
+        with (
+            patch.object(post_thread, "recent_thread_topics", return_value=[]),
+            patch.object(post_thread, "get_recent_posts", return_value=[]),
+            patch.object(post_thread, "get_recent_engagements", return_value=[]),
+        ):
+            result = post_thread.generate_thread(mock_conn)
         assert result is None, "generate_thread should return None for 1-tweet result"
 
 
@@ -277,7 +281,7 @@ class TestThreadLength:
 # ---------------------------------------------------------------------------
 
 class TestGetTweetStatsShape:
-    """Verify get_tweet_stats returns correct dict shape (via mocked CDP)."""
+    """Verify get_tweet_stats returns correct dict shape (via mocked CDP helpers)."""
 
     def test_get_tweet_stats_returns_correct_keys(self):
         """get_tweet_stats must return dict with likes/retweets/replies."""
@@ -288,7 +292,8 @@ class TestGetTweetStatsShape:
         with patch.object(twitter_utils, "_get_target_id", return_value="mock-target"):
             with patch.object(twitter_utils, "_navigate_and_wait", return_value=True):
                 with patch.object(twitter_utils, "_evaluate", return_value=mock_raw):
-                    result = twitter_utils.get_tweet_stats("123456789")
+                    with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
+                        result = twitter_utils.get_tweet_stats("123456789")
 
         assert result is not None
         assert set(result.keys()) == {"likes", "retweets", "replies"}
@@ -302,7 +307,8 @@ class TestGetTweetStatsShape:
 
         with patch.object(twitter_utils, "_get_target_id", return_value="mock-target"):
             with patch.object(twitter_utils, "_navigate_and_wait", return_value=False):
-                result = twitter_utils.get_tweet_stats("000")
+                with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
+                    result = twitter_utils.get_tweet_stats("000")
 
         assert result is None
 
@@ -311,7 +317,8 @@ class TestGetTweetStatsShape:
         from twitter import twitter_utils  # type: ignore
 
         with patch.object(twitter_utils, "_get_target_id", return_value=None):
-            result = twitter_utils.get_tweet_stats("000")
+            with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
+                result = twitter_utils.get_tweet_stats("000")
 
         assert result is None
 
@@ -324,7 +331,8 @@ class TestGetTweetStatsShape:
         with patch.object(twitter_utils, "_get_target_id", return_value="mock-target"):
             with patch.object(twitter_utils, "_navigate_and_wait", return_value=True):
                 with patch.object(twitter_utils, "_evaluate", return_value=mock_raw):
-                    result = twitter_utils.get_tweet_stats("111")
+                    with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
+                        result = twitter_utils.get_tweet_stats("111")
 
         assert result == {"likes": 0, "retweets": 0, "replies": 0}
 

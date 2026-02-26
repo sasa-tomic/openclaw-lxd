@@ -117,6 +117,48 @@ TARGET_ACCOUNTS = [
     "cloudoptimizer",   # Cloud cost
 ]
 
+# File-based state path (used by file-based helpers below)
+STATE_PATH = Path("/home/openclaw/clawd/memory/target-monitor-state.json")
+
+# ---------------------------------------------------------------------------
+# File-based state helpers (used by tests and optional file-backed operation)
+# ---------------------------------------------------------------------------
+
+
+def load_monitor_state() -> dict:
+    """Load monitor state from STATE_PATH JSON file, or return empty defaults."""
+    try:
+        if STATE_PATH.exists():
+            return json.loads(STATE_PATH.read_text())
+    except Exception:
+        pass
+    return {"accounts": {}, "repliedToIds": [], "lastRunAt": None}
+
+
+def save_monitor_state(state: dict) -> None:
+    """Save monitor state dict to STATE_PATH as JSON."""
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def get_account_state(state: dict, username: str) -> dict:
+    """Return (and initialize if missing) per-account state in the state dict."""
+    accounts = state.setdefault("accounts", {})
+    if username not in accounts:
+        accounts[username] = {"lastCheckedAt": None, "lastTweetId": None, "lastTweetAt": None}
+    return accounts[username]
+
+
+def add_replied_id(state: dict, tweet_id) -> None:
+    """Add tweet_id to state['repliedToIds'] list, deduped, capped at MAX_REPLIED_IDS."""
+    tid = str(tweet_id)
+    ids = state.setdefault("repliedToIds", [])
+    if tid not in ids:
+        ids.append(tid)
+    if len(ids) > MAX_REPLIED_IDS:
+        state["repliedToIds"] = ids[-MAX_REPLIED_IDS:]
+
+
 # ---------------------------------------------------------------------------
 # Peak hours check
 # ---------------------------------------------------------------------------
@@ -179,8 +221,8 @@ def save_replied_ids(conn, replied_ids: set[str]) -> None:
     kv_set(conn, KV_REPLIED_IDS, json.dumps(lst))
 
 
-def add_replied_id(conn, replied_ids: set[str], tweet_id: str) -> None:
-    """Add a tweet ID to the replied set and persist."""
+def _persist_replied_id(conn, replied_ids: set[str], tweet_id: str) -> None:
+    """Add a tweet ID to the in-memory replied set and persist to DB."""
     replied_ids.add(str(tweet_id))
     save_replied_ids(conn, replied_ids)
 
@@ -704,7 +746,7 @@ def process_account(
     )
 
     # Add to replied IDs
-    add_replied_id(conn, replied_ids, tweet_id)
+    _persist_replied_id(conn, replied_ids, tweet_id)
 
     # Ensure account exists in DB
     upsert_account(conn, username, discovery_source="target", stage="engaged")

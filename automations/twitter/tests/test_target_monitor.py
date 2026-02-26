@@ -203,6 +203,15 @@ class TestPeakHours:
 # ---------------------------------------------------------------------------
 
 
+def _acct(last_tweet_id: str | None = None, last_checked: str | None = None) -> dict:
+    """Helper: build a per-account state dict."""
+    return {
+        "lastCheckedAt": last_checked,
+        "lastTweetId": last_tweet_id,
+        "lastTweetAt": None,
+    }
+
+
 class TestNewTweetDetection:
     def setup_method(self):
         """Reset is_junk mock to False before each test."""
@@ -210,86 +219,109 @@ class TestNewTweetDetection:
 
     def test_skips_same_tweet_id(self):
         """process_account returns False when tweet ID hasn't changed."""
-        state = _make_state(accounts={"simonw": {
-            "lastCheckedAt": None, "lastTweetId": "999", "lastTweetAt": None,
-        }})
-        with mock.patch.object(tm, "get_latest_profile_tweet",
-                               return_value=_fresh_tweet("999", age_min=2)):
-            result = tm.process_account("simonw", state, {}, set(), _real_now())
+        mock_conn = mock.MagicMock()
+        acct = _acct(last_tweet_id="999")
+        with (
+            mock.patch.object(tm, "get_account_kv", return_value=acct),
+            mock.patch.object(tm, "set_account_kv"),
+            mock.patch.object(tm, "get_latest_profile_tweet",
+                               return_value=_fresh_tweet("999", age_min=2)),
+        ):
+            result = tm.process_account(mock_conn, "simonw", set(), [], [], _real_now())
         assert result is False
 
     def test_skips_tweet_already_replied(self):
         """process_account skips a new tweet ID if it is in replied_ids."""
-        state = _make_state(accounts={"simonw": {
-            "lastCheckedAt": None, "lastTweetId": "100", "lastTweetAt": None,
-        }})
-        with mock.patch.object(tm, "get_latest_profile_tweet",
-                               return_value=_fresh_tweet("777", age_min=2)):
-            result = tm.process_account("simonw", state, {}, {"777"}, _real_now())
+        mock_conn = mock.MagicMock()
+        acct = _acct(last_tweet_id="100")
+        with (
+            mock.patch.object(tm, "get_account_kv", return_value=acct),
+            mock.patch.object(tm, "set_account_kv"),
+            mock.patch.object(tm, "get_latest_profile_tweet",
+                               return_value=_fresh_tweet("777", age_min=2)),
+        ):
+            result = tm.process_account(mock_conn, "simonw", {"777"}, [], [], _real_now())
         assert result is False
 
     def test_skips_stale_tweet(self):
         """process_account returns False when tweet is older than MAX_TWEET_AGE_MIN."""
-        state = _make_state(accounts={"simonw": {
-            "lastCheckedAt": None, "lastTweetId": "100", "lastTweetAt": None,
-        }})
+        mock_conn = mock.MagicMock()
+        acct = _acct(last_tweet_id="100")
         stale = _fresh_tweet("888", age_min=60)  # 60 min > MAX_TWEET_AGE_MIN=30
-        with mock.patch.object(tm, "get_latest_profile_tweet", return_value=stale):
-            result = tm.process_account("simonw", state, {}, set(), _real_now())
+        with (
+            mock.patch.object(tm, "get_account_kv", return_value=acct),
+            mock.patch.object(tm, "set_account_kv"),
+            mock.patch.object(tm, "is_engaged", return_value=False),
+            mock.patch.object(tm, "get_latest_profile_tweet", return_value=stale),
+        ):
+            result = tm.process_account(mock_conn, "simonw", set(), [], [], _real_now())
         assert result is False
 
     def test_skips_when_no_cdp_result(self):
         """process_account returns False when CDP returns None."""
-        with mock.patch.object(tm, "get_latest_profile_tweet", return_value=None):
-            result = tm.process_account("simonw", _make_state(), {}, set(), _real_now())
+        mock_conn = mock.MagicMock()
+        with (
+            mock.patch.object(tm, "get_account_kv", return_value=_acct()),
+            mock.patch.object(tm, "set_account_kv"),
+            mock.patch.object(tm, "get_latest_profile_tweet", return_value=None),
+        ):
+            result = tm.process_account(mock_conn, "simonw", set(), [], [], _real_now())
         assert result is False
 
     def test_skips_when_timestamp_unparseable(self):
         """process_account skips tweets with unparseable timestamps for safety."""
-        state = _make_state(accounts={"simonw": {
-            "lastCheckedAt": None, "lastTweetId": "old", "lastTweetAt": None,
-        }})
+        mock_conn = mock.MagicMock()
+        acct = _acct(last_tweet_id="old")
         bad = {"tweetId": "new123", "text": "x", "timestamp": "not-a-real-ts", "href": "h"}
-        with mock.patch.object(tm, "get_latest_profile_tweet", return_value=bad):
-            result = tm.process_account("simonw", state, {}, set(), _real_now())
+        with (
+            mock.patch.object(tm, "get_account_kv", return_value=acct),
+            mock.patch.object(tm, "set_account_kv"),
+            mock.patch.object(tm, "is_engaged", return_value=False),
+            mock.patch.object(tm, "get_latest_profile_tweet", return_value=bad),
+        ):
+            result = tm.process_account(mock_conn, "simonw", set(), [], [], _real_now())
         assert result is False
 
     def test_skips_recently_checked_account(self):
         """process_account skips an account checked within MIN_CHECK_INTERVAL_MIN."""
+        mock_conn = mock.MagicMock()
         recent_check = (_real_now() - timedelta(minutes=5)).isoformat()
-        state = _make_state(accounts={"simonw": {
-            "lastCheckedAt": recent_check, "lastTweetId": None, "lastTweetAt": None,
-        }})
-        with mock.patch.object(tm, "get_latest_profile_tweet") as mock_cdp:
-            result = tm.process_account("simonw", state, {}, set(), _real_now())
+        acct = _acct(last_checked=recent_check)
+        with (
+            mock.patch.object(tm, "get_account_kv", return_value=acct),
+            mock.patch.object(tm, "get_latest_profile_tweet") as mock_cdp,
+        ):
+            result = tm.process_account(mock_conn, "simonw", set(), [], [], _real_now())
         assert result is False
         mock_cdp.assert_not_called()
 
     def test_skips_junk_tweet(self):
         """process_account skips tweets classified as junk."""
-        state = _make_state(accounts={"simonw": {
-            "lastCheckedAt": None, "lastTweetId": "old", "lastTweetAt": None,
-        }})
+        mock_conn = mock.MagicMock()
+        acct = _acct(last_tweet_id="old")
         with (
+            mock.patch.object(tm, "get_account_kv", return_value=acct),
+            mock.patch.object(tm, "set_account_kv"),
+            mock.patch.object(tm, "is_engaged", return_value=False),
             mock.patch.object(tm, "get_latest_profile_tweet",
                                return_value=_fresh_tweet("junk123", age_min=2)),
             mock.patch.object(tm, "is_junk", return_value=True),
         ):
-            result = tm.process_account("simonw", state, {}, set(), _real_now())
+            result = tm.process_account(mock_conn, "simonw", set(), [], [], _real_now())
         assert result is False
 
     def test_no_reply_when_llm_rejects(self):
         """process_account returns False when LLM says shouldEngage=False."""
-        state = _make_state(accounts={"simonw": {
-            "lastCheckedAt": None, "lastTweetId": "old", "lastTweetAt": None,
-        }})
-        ms = {"engagedPosts": [], "recentPosts": []}
-        mon = dict(state); mon["_main_state"] = ms
+        mock_conn = mock.MagicMock()
+        acct = _acct(last_tweet_id="old")
         rejected = {
             "shouldEngage": False, "conversationLikelihood": 4,
             "reasoning": "Generic rant", "reply": None,
         }
         with (
+            mock.patch.object(tm, "get_account_kv", return_value=acct),
+            mock.patch.object(tm, "set_account_kv"),
+            mock.patch.object(tm, "is_engaged", return_value=False),
             mock.patch.object(tm, "get_latest_profile_tweet",
                                return_value=_fresh_tweet("t456", age_min=5)),
             mock.patch.object(tm, "fetch_tweet_context", return_value=_tweet_ctx("t456")),
@@ -298,17 +330,15 @@ class TestNewTweetDetection:
             mock.patch.object(tm, "is_junk", return_value=False),
             mock.patch.object(tm, "post_reply") as mock_post,
         ):
-            result = tm.process_account("simonw", mon, ms, set(), _real_now())
+            result = tm.process_account(mock_conn, "simonw", set(), [], [], _real_now())
         assert result is False
         mock_post.assert_not_called()
 
     def test_full_happy_path_posts_reply(self):
         """process_account posts a reply for a fresh, relevant new tweet."""
-        state = _make_state(accounts={"simonw": {
-            "lastCheckedAt": None, "lastTweetId": "old_id", "lastTweetAt": None,
-        }})
-        ms = {"engagedPosts": [], "recentPosts": []}
-        mon = dict(state); mon["_main_state"] = ms
+        mock_conn = mock.MagicMock()
+        acct = _acct(last_tweet_id="old_id")
+        replied_ids: set[str] = set()
 
         good_decision = {
             "shouldEngage": True,
@@ -318,6 +348,9 @@ class TestNewTweetDetection:
         }
 
         with (
+            mock.patch.object(tm, "get_account_kv", return_value=acct),
+            mock.patch.object(tm, "set_account_kv"),
+            mock.patch.object(tm, "is_engaged", return_value=False),
             mock.patch.object(tm, "get_latest_profile_tweet",
                                return_value=_fresh_tweet("new_tweet", age_min=3)),
             mock.patch.object(tm, "fetch_tweet_context",
@@ -327,24 +360,23 @@ class TestNewTweetDetection:
             mock.patch.object(tm, "draft_target_reply", return_value=good_decision),
             mock.patch.object(tm, "is_junk", return_value=False),
             mock.patch.object(tm, "humanize", side_effect=lambda x: x),
-            mock.patch.object(tm, "post_reply", return_value=True),
+            mock.patch.object(tm, "post_reply", return_value=(True, "our_reply_id")),
             mock.patch.object(tm, "auto_follow_after_engagement"),
-            mock.patch.object(tm, "log_recent"),
+            mock.patch.object(tm, "insert_engagement"),
+            mock.patch.object(tm, "save_replied_ids"),
+            mock.patch.object(tm, "upsert_account"),
         ):
-            result = tm.process_account("simonw", mon, ms, set(), _real_now())
+            result = tm.process_account(mock_conn, "simonw", replied_ids, [], [], _real_now())
 
         assert result is True
-        assert "new_tweet" in mon.get("repliedToIds", [])
-        assert mon["accounts"]["simonw"]["lastTweetId"] == "new_tweet"
-        assert any(e.get("tweetId") == "new_tweet" for e in ms.get("engagedPosts", []))
+        assert "new_tweet" in replied_ids  # _persist_replied_id adds to the set in-place
+        assert acct["lastTweetId"] == "new_tweet"  # modified in-place via get_account_kv
 
     def test_post_reply_failure_does_not_record_id(self):
-        """If post_reply fails, the tweet ID is NOT added to repliedToIds."""
-        state = _make_state(accounts={"simonw": {
-            "lastCheckedAt": None, "lastTweetId": "old_id", "lastTweetAt": None,
-        }})
-        ms = {"engagedPosts": [], "recentPosts": []}
-        mon = dict(state); mon["_main_state"] = ms
+        """If post_reply fails, the tweet ID is NOT added to replied_ids."""
+        mock_conn = mock.MagicMock()
+        acct = _acct(last_tweet_id="old_id")
+        replied_ids: set[str] = set()
 
         good_decision = {
             "shouldEngage": True, "conversationLikelihood": 8,
@@ -352,6 +384,9 @@ class TestNewTweetDetection:
         }
 
         with (
+            mock.patch.object(tm, "get_account_kv", return_value=acct),
+            mock.patch.object(tm, "set_account_kv"),
+            mock.patch.object(tm, "is_engaged", return_value=False),
             mock.patch.object(tm, "get_latest_profile_tweet",
                                return_value=_fresh_tweet("fail_tweet", age_min=3)),
             mock.patch.object(tm, "fetch_tweet_context",
@@ -360,13 +395,13 @@ class TestNewTweetDetection:
             mock.patch.object(tm, "draft_target_reply", return_value=good_decision),
             mock.patch.object(tm, "is_junk", return_value=False),
             mock.patch.object(tm, "humanize", side_effect=lambda x: x),
-            mock.patch.object(tm, "post_reply", return_value=False),
+            mock.patch.object(tm, "post_reply", return_value=(False, None)),
             mock.patch.object(tm, "send_error_alert"),
         ):
-            result = tm.process_account("simonw", mon, ms, set(), _real_now())
+            result = tm.process_account(mock_conn, "simonw", replied_ids, [], [], _real_now())
 
         assert result is False
-        assert "fail_tweet" not in mon.get("repliedToIds", [])
+        assert "fail_tweet" not in replied_ids
 
 
 # ---------------------------------------------------------------------------

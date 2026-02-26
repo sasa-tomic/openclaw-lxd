@@ -95,10 +95,14 @@ THREAD_TOPICS = [
     # --- Classic angles (keep for rotation) ---
     "cloud support is broken: what recourse do you actually have",
     "the hidden economics of cloud egress: why ingress is free and egress isn't",
+    "the hidden economics of cloud egress: why providers make it free in, expensive out",
     "gpu compute economics: why the cloud is losing",
     "vendor lock-in is a feature, not a bug (for vendors)",
     "GPU compute: the $3/hr vs $0.30/hr gap that nobody talks about",
     "serverless pricing myths that cost teams real money",
+    "why decentralized cloud needs Airbnb-style reviews (not just lower prices)",
+    "the P2P compute trust gap: what Akash/Flux got wrong",
+    "why the FinOps movement proves cloud pricing is deliberately opaque",
 ]
 
 

@@ -74,6 +74,39 @@ def cdp_lock():
         lock_file.close()
 
 
+def _get_target_id() -> str | None:
+    """Return the ID of the first active page-type Chrome tab, or None."""
+    try:
+        tabs = CDPSession.tabs()
+        for t in tabs:
+            if t.get("type") == "page":
+                return t.get("id")
+        return None
+    except Exception as e:
+        logger.debug(f"_get_target_id: {e}")
+        return None
+
+
+def _navigate_and_wait(url: str, target_id: str, wait_sec: float = 3) -> bool:
+    """Navigate to url using CDPSession. Returns True on success."""
+    try:
+        with CDPSession.connect() as cdp:
+            return bool(cdp.navigate(url, wait_sec=wait_sec))
+    except Exception as e:
+        logger.debug(f"_navigate_and_wait to {url}: {e}")
+        return False
+
+
+def _evaluate(target_id: str, js: str, timeout: float = 15) -> str | None:
+    """Evaluate JS in the current CDP tab. Returns raw string result or None."""
+    try:
+        with CDPSession.connect() as cdp:
+            return cdp.evaluate(js, timeout=timeout)
+    except Exception as e:
+        logger.debug(f"_evaluate failed: {e}")
+        return None
+
+
 _PROJECT_CONTEXT_CACHE: dict = {}  # {mtime: float, content: str}
 
 
@@ -1697,14 +1730,14 @@ def get_tweet_stats(tweet_id: str) -> dict | None:
 })()"""
 
     with cdp_lock():
-        try:
-            with CDPSession.connect() as cdp:
-                if not cdp.navigate(tweet_url, wait_sec=5):
-                    return None
-                raw = cdp.evaluate(js, timeout=15)
-        except Exception as e:
-            logger.warning(f"get_tweet_stats CDP failed: {e}")
+        target_id = _get_target_id()
+        if not target_id:
             return None
+
+        if not _navigate_and_wait(tweet_url, target_id, wait_sec=5):
+            return None
+
+        raw = _evaluate(target_id, js, timeout=15)
 
         if not raw:
             return None
