@@ -131,7 +131,6 @@ def call_llm(
             print(
                 f"LLM: calling {model_label} model '{model_name}' "
                 f"(attempt {attempt_num}/{max_retries})",
-                file=sys.stderr,
                 flush=True,
             )
 
@@ -169,7 +168,6 @@ def call_llm(
                 if content:
                     print(
                         f"LLM: success with {model_label} model '{model_name}'",
-                        file=sys.stderr,
                         flush=True,
                     )
                     return (True, content)
@@ -189,7 +187,6 @@ def call_llm(
                     print(
                         f"LLM: HTTP 429 rate limit on {model_label} model '{model_name}'. "
                         f"Waiting {wait}s before retry...",
-                        file=sys.stderr,
                         flush=True,
                     )
                     time.sleep(wait)
