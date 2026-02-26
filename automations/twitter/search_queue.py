@@ -125,6 +125,20 @@ def cmd_fill(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+_TWITTER_EPOCH_MS = 1288834974657  # Nov 4 2010 UTC
+
+
+def _tweet_age_str(tweet_id: str, now: datetime) -> str:
+    """Compute human-readable tweet age from its Snowflake ID."""
+    try:
+        ms = (int(tweet_id) >> 22) + _TWITTER_EPOCH_MS
+        created = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        mins = int((now - created).total_seconds() / 60)
+        return f"{mins}m" if mins < 60 else f"{mins // 60}h{mins % 60:02d}m"
+    except Exception:
+        return "?"
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     with get_conn() as conn:
         ensure_schema(conn)
@@ -134,9 +148,10 @@ def cmd_show(args: argparse.Namespace) -> int:
                 SELECT tweet_id, author, search_term, queued_at, text
                 FROM candidate_queue
                 WHERE processed_at IS NULL
-                  AND queued_at > now() - interval '24 hours'
                   AND tweet_id NOT IN (SELECT tweet_id FROM engagements)
-                ORDER BY queued_at DESC
+                  AND to_timestamp(((tweet_id::bigint >> 22) + 1288834974657) / 1000.0)
+                        > now() - interval '24 hours'
+                ORDER BY tweet_id DESC
                 LIMIT %s
                 """,
                 (args.limit,),
@@ -149,17 +164,15 @@ def cmd_show(args: argparse.Namespace) -> int:
         return 0
 
     now = datetime.now(timezone.utc)
-    print(f"{'TWEET_ID':<20} {'AUTHOR':<22} {'TERM':<28} {'AGE':>6}  TEXT")
+    print(f"{'TWEET_ID':<20} {'AUTHOR':<22} {'TERM':<28} {'TWEET AGE':>9}  TEXT")
     print("-" * 160)
     for r in rows:
-        age = now - r["queued_at"].replace(tzinfo=timezone.utc)
-        mins = int(age.total_seconds() / 60)
-        age_str = f"{mins}m" if mins < 60 else f"{mins // 60}h{mins % 60:02d}m"
+        age_str = _tweet_age_str(r["tweet_id"], now)
         search_term = (r["search_term"] or "")[:28]
         text = (r["text"] or "").replace("\n", " ")[:100]
         print(
             f"{r['tweet_id']:<20} @{(r['author'] or ''):<21} "
-            f"{search_term:<28} {age_str:>6}  {text}"
+            f"{search_term:<28} {age_str:>9}  {text}"
         )
 
     shown = len(rows)
@@ -178,12 +191,13 @@ def cmd_stats(_args: argparse.Namespace) -> int:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT search_term, queued_at
+                SELECT tweet_id, search_term
                 FROM candidate_queue
                 WHERE processed_at IS NULL
-                  AND queued_at > now() - interval '24 hours'
                   AND tweet_id NOT IN (SELECT tweet_id FROM engagements)
-                ORDER BY queued_at ASC
+                  AND to_timestamp(((tweet_id::bigint >> 22) + 1288834974657) / 1000.0)
+                        > now() - interval '24 hours'
+                ORDER BY tweet_id ASC
                 """
             )
             rows = cur.fetchall()
@@ -204,9 +218,13 @@ def cmd_stats(_args: argparse.Namespace) -> int:
 
     for r in rows:
         by_term[r["search_term"] or "(none)"] += 1
-        age_h = (
-            now - r["queued_at"].replace(tzinfo=timezone.utc)
-        ).total_seconds() / 3600
+        age_str = _tweet_age_str(r["tweet_id"], now)
+        age_h = 0.0
+        try:
+            ms = (int(r["tweet_id"]) >> 22) + _TWITTER_EPOCH_MS
+            age_h = (now - datetime.fromtimestamp(ms / 1000, tz=timezone.utc)).total_seconds() / 3600
+        except Exception:
+            pass
         if age_h < 1:
             by_age["<1h"] += 1
         elif age_h < 6:

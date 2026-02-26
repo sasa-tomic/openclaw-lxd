@@ -893,10 +893,10 @@ def insert_candidate_queue(conn, candidates: list[dict]) -> int:
 
 
 def get_queued_candidates(conn, limit: int = 100) -> list[dict]:
-    """Fetch unprocessed, fresh (<24h) candidates not yet engaged.
+    """Fetch unprocessed candidates whose tweet is < 6 hours old and not yet engaged.
 
-    Returns dicts in the same format as search_candidates() so the
-    engagement flow can consume them without conversion.
+    Uses the Snowflake ID to compute tweet creation time so stale queue
+    entries (queued but never consumed) are automatically excluded.
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
@@ -905,8 +905,9 @@ def get_queued_candidates(conn, limit: int = 100) -> list[dict]:
                    likes, retweets, replies
             FROM candidate_queue
             WHERE processed_at IS NULL
-              AND queued_at > now() - interval '24 hours'
               AND tweet_id NOT IN (SELECT tweet_id FROM engagements)
+              AND to_timestamp(((tweet_id::bigint >> 22) + 1288834974657) / 1000.0)
+                    > now() - interval '24 hours'
             ORDER BY queued_at DESC
             LIMIT %s
             """,
@@ -940,14 +941,15 @@ def mark_queue_processed(conn, tweet_ids: list[str]) -> None:
 
 
 def queue_size(conn) -> int:
-    """Count unprocessed, fresh (<24h) candidates not yet engaged."""
+    """Count unprocessed candidates whose tweet is < 6 hours old."""
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT COUNT(*) FROM candidate_queue
             WHERE processed_at IS NULL
-              AND queued_at > now() - interval '24 hours'
               AND tweet_id NOT IN (SELECT tweet_id FROM engagements)
+              AND to_timestamp(((tweet_id::bigint >> 22) + 1288834974657) / 1000.0)
+                    > now() - interval '24 hours'
             """
         )
         row = cur.fetchone()

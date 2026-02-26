@@ -545,23 +545,32 @@ def main() -> int:
             random.shuffle(candidates)
 
             selected = []
+            discard_ids: list[str] = []  # queue entries to mark done immediately
+
             for c in candidates:
                 tid = c.get("tweetId")
                 text = c.get("text", "")
 
                 if not tid or str(tid) in engaged_ids:
+                    if tid:
+                        discard_ids.append(str(tid))
                     continue
                 if is_junk(text):
+                    discard_ids.append(str(tid))
                     continue
 
                 author = (c.get("author") or "").lower()
                 if author in {a.lower() for a in BLOCKED_AUTHORS}:
                     print(f"  Skipping blocked author @{author}", flush=True)
+                    discard_ids.append(str(tid))
                     continue
 
                 selected.append(c)
                 if len(selected) >= 50:
                     break
+
+            if using_queue and discard_ids:
+                mark_queue_processed(conn, discard_ids)
 
             if not selected:
                 print("No suitable candidates after filtering")
