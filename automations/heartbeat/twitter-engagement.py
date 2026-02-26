@@ -53,7 +53,6 @@ from twitter_utils import (
     check_follows_back,
     fetch_tweet_context,
     follow_user,
-    get_latest_own_tweet_id,
     get_user_profile,
     humanize,
     is_junk,
@@ -625,7 +624,8 @@ def main() -> int:
                 if cached is not None:
                     print(f"  [{tid}] Using cached LLM decision", flush=True)
                     return cand, ctx, cached
-                print(f"  [{tid}] Asking LLM to analyze...", flush=True)
+                tweet_text = (ctx.get("text") or "")[:120]
+                print(f"  [{tid}] Asking LLM to analyze: {tweet_text!r}", flush=True)
                 dec = draft_reply_with_full_context(
                     cand, ctx, recent_engagements, recent_posts
                 )
@@ -637,15 +637,15 @@ def main() -> int:
             analyzed: list[tuple[dict, dict, dict | None]] = []
             if to_analyze:
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    # Key futures by index so we can reassemble in submission order.
                     futures = {
-                        executor.submit(_analyze_one, item): item for item in to_analyze
+                        executor.submit(_analyze_one, item): i
+                        for i, item in enumerate(to_analyze)
                     }
-                    # Preserve submission order for deterministic posting
-                    ordered = {item: None for item in to_analyze}
+                    results_by_idx: dict[int, tuple] = {}
                     for future in as_completed(futures):
-                        item = futures[future]
-                        ordered[item] = future.result()
-                    analyzed = list(ordered.values())
+                        results_by_idx[futures[future]] = future.result()
+                    analyzed = [results_by_idx[i] for i in range(len(to_analyze))]
 
             # ── Phase C: sequential posting ───────────────────────────────────
             for candidate, tweet_context, decision in analyzed:
@@ -684,29 +684,9 @@ def main() -> int:
 
                 jitter_sleep()
 
-                # Snapshot our latest tweet ID *before* posting so we can verify
-                # a genuinely new tweet appeared (false positives from CDP are possible).
-                pre_post_id = get_latest_own_tweet_id("DecentCloud_org")
-
-                if not post_reply(tweet_id, reply_text):
+                posted, our_reply_id = post_reply(tweet_id, reply_text)
+                if not posted:
                     send_error_alert(f"Failed to post reply to {tweet_id} (@{author})")
-                    continue
-
-                # Verify the reply actually appeared by confirming a higher tweet ID.
-                # Twitter Snowflake IDs are monotonically increasing, so a new reply
-                # must have a strictly larger ID than anything posted before it.
-                _time.sleep(4)
-                our_reply_id = get_latest_own_tweet_id("DecentCloud_org")
-                if our_reply_id and pre_post_id and int(our_reply_id) <= int(pre_post_id):
-                    print(
-                        f"  WARNING: reply ID {our_reply_id} is not newer than pre-post ID "
-                        f"{pre_post_id} — tweet may not have been posted!",
-                        flush=True,
-                    )
-                    send_error_alert(
-                        f"post_reply false positive for {tweet_id} (@{author}): "
-                        f"no new tweet ID observed (pre={pre_post_id}, post={our_reply_id})"
-                    )
                     continue
 
                 print("  Replied", flush=True)

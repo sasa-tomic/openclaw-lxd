@@ -561,13 +561,16 @@ def main() -> int:
 
                 url = mention.get("url") or f"{TWITTER_BASE_URL}/i/web/status/{tid}"
 
-                if not post_reply(tid, reply_text):
+                posted, our_reply_id = post_reply(tid, reply_text)
+                if not posted:
                     send_error_alert(
                         f"Reply monitor: failed to post reply to {tid} (@{author})"
                     )
                     continue
 
                 print("  Replied", flush=True)
+                if our_reply_id:
+                    print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
 
                 # Cache the conversation as a local .md note and update thread index
                 note_path = save_encountered_thread(
@@ -593,6 +596,7 @@ def main() -> int:
                     tweet_id=tid,
                     target_username=author,
                     our_reply_text=reply_text,
+                    our_reply_id=our_reply_id,
                     source="mention" if not is_direct_reply else "direct_reply",
                     conv_likelihood=decision.get("conversationLikelihood"),
                     profile_click_worthy=decision.get("profileClickWorthy"),

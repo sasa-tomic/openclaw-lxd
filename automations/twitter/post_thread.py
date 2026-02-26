@@ -319,20 +319,18 @@ def post_thread(tweets: list[str]) -> tuple[bool, list[str]]:
             f"Thread: posting tweet {i}/{len(tweets)} (replying to {parent_id})...",
             flush=True,
         )
-        if not post_reply(parent_id, tweet_text):
+        posted, reply_id = post_reply(parent_id, tweet_text)
+        if not posted:
             print(f"Thread: failed at tweet {i}/{len(tweets)}", flush=True)
             # Partial thread — still some value
             break
 
-        # Wait and get the reply ID
-        jitter_sleep(8, 15)
-        reply_id = get_latest_own_tweet_id(OUR_USERNAME)
-        if reply_id and reply_id != parent_id:
+        if reply_id:
             posted_ids.append(reply_id)
             print(f"Thread: tweet {i} ID = {reply_id}", flush=True)
         else:
             print(
-                f"Thread: posted tweet {i} but couldn't get its ID, stopping chain",
+                f"Thread: posted tweet {i} but couldn't read its ID, stopping chain",
                 flush=True,
             )
             break

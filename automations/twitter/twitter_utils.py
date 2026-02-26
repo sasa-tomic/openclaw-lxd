@@ -448,11 +448,32 @@ def humanize(text: str) -> str:
     return p.stdout.strip()
 
 
-def post_reply(tweet_id: str, reply_text: str) -> bool:
-    """Post a reply via Chrome CDP (CDPSession direct WebSocket).
+def post_reply(
+    tweet_id: str,
+    reply_text: str,
+    our_username: str = "DecentCloud_org",
+) -> tuple[bool, str | None]:
+    """Post a reply via Chrome CDP.
 
-    Flow: navigate to tweet → find reply textbox → type → click Reply.
+    Returns (success, reply_tweet_id).  reply_tweet_id is the Snowflake ID of
+    the reply we just posted, extracted from the thread DOM while still on the
+    page — no extra navigation needed.  It is None only when the reply was
+    posted but the ID couldn't be read from the page (rare; treated as success).
     """
+    # JS that finds the highest /our_username/status/<ID> link on the page,
+    # i.e. our freshly posted reply (must be > tweet_id since IDs are monotonic).
+    _extract_js = (
+        "(() => {"
+        f"  const pat = /\\/{our_username}\\/status\\/(\\d+)$/;"
+        "  let best = null;"
+        "  for (const a of document.querySelectorAll('a[href]')) {"
+        "    const m = a.href.match(pat);"
+        "    if (m && (!best || BigInt(m[1]) > BigInt(best))) best = m[1];"
+        "  }"
+        "  return best;"
+        "})()"
+    )
+
     try:
         with cdp_lock():
             tweet_url = f"{TWITTER_BASE_URL}/i/web/status/{tweet_id}"
@@ -461,24 +482,24 @@ def post_reply(tweet_id: str, reply_text: str) -> bool:
             try:
                 with CDPSession.connect() as cdp:
                     if not cdp.navigate(tweet_url, wait_sec=2):
-                        return False
+                        return False, None
                     TEXTAREA = '[data-testid="tweetTextarea_0"]'
                     REPLY_BTN = '[data-testid="tweetButtonInline"]'
                     if not cdp.wait_for(TEXTAREA, timeout=10):
                         print("  CDP: reply textbox not found", flush=True)
-                        return False
+                        return False, None
                     # Click to focus/expand the reply box
                     cdp.click(TEXTAREA)
                     time.sleep(0.5)
                     print(f"  CDP: typing reply...", flush=True)
                     if not cdp.type_text(TEXTAREA, reply_text):
                         print("  CDP: typing failed", flush=True)
-                        return False
+                        return False, None
                     time.sleep(0.5)
                     print(f"  CDP: clicking Reply...", flush=True)
                     if not cdp.click(REPLY_BTN):
                         print("  CDP: Reply button not found", flush=True)
-                        return False
+                        return False, None
                     # Poll up to 8s for textarea to clear (reply submitted → div resets)
                     deadline = time.time() + 8
                     while time.time() < deadline:
@@ -492,19 +513,32 @@ def post_reply(tweet_id: str, reply_text: str) -> bool:
                             )
                             if toast:
                                 print(f"  CDP: Twitter error toast detected: {toast[:120]}", flush=True)
-                                return False
-                            print("  CDP: reply posted successfully", flush=True)
-                            return True
+                                return False, None
+                            # Extract our reply ID from the thread DOM (already on this page).
+                            # The new reply renders immediately; its ID must be > tweet_id.
+                            reply_id: str | None = None
+                            for _ in range(5):
+                                raw = cdp.evaluate(_extract_js)
+                                candidate = str(raw) if raw else None
+                                if candidate and int(candidate) > int(tweet_id):
+                                    reply_id = candidate
+                                    break
+                                time.sleep(1)
+                            if reply_id:
+                                print(f"  CDP: reply posted (id={reply_id})", flush=True)
+                            else:
+                                print("  CDP: reply posted (could not read ID from page)", flush=True)
+                            return True, reply_id
                         time.sleep(1)
                     print("  CDP: reply may have failed (textarea still has text)", flush=True)
-                    return False
+                    return False, None
             except Exception as e:
                 logger.warning(f"post_reply CDP failed: {e}")
-                return False
+                return False, None
 
     except Exception as e:
         print(f"  CDP reply exception: {e}", flush=True)
-        return False
+        return False, None
 
 
 def post_tweet(text: str) -> bool:

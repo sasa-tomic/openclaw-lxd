@@ -675,13 +675,16 @@ def process_account(
         return False
 
     # Post the reply
-    if not post_reply(tweet_id, reply_text):
+    posted, our_reply_id = post_reply(tweet_id, reply_text)
+    if not posted:
         send_error_alert(
             f"Target monitor: failed to post reply to {tweet_id} (@{username})"
         )
         return False
 
     print(f"  @{username}: reply posted successfully!", flush=True)
+    if our_reply_id:
+        print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
 
     # Auto-follow after engagement
     auto_follow_after_engagement(conn, username, tweet_id)
@@ -694,6 +697,7 @@ def process_account(
         tweet_id=tweet_id,
         target_username=username,
         our_reply_text=reply_text,
+        our_reply_id=our_reply_id,
         source="target_monitor",
         conv_likelihood=conv_score,
         profile_click_worthy=decision.get("profileClickWorthy"),

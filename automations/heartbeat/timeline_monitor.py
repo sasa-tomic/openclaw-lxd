@@ -588,13 +588,16 @@ def main() -> int:
 
                 url = tweet.get("url") or f"{TWITTER_BASE_URL}/i/web/status/{tid}"
 
-                if not post_reply(tid, reply_text):
+                posted, our_reply_id = post_reply(tid, reply_text)
+                if not posted:
                     send_error_alert(
                         f"Timeline monitor: failed to post reply to {tid} (@{author})"
                     )
                     continue
 
                 print("  Reply posted", flush=True)
+                if our_reply_id:
+                    print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
 
                 # Auto-follow the author
                 auto_follow_after_engagement(conn, author, tid)
@@ -605,6 +608,7 @@ def main() -> int:
                     tweet_id=tid,
                     target_username=author,
                     our_reply_text=reply_text,
+                    our_reply_id=our_reply_id,
                     source="timeline",
                     conv_likelihood=conv_score,
                     profile_click_worthy=decision.get("profileClickWorthy"),
