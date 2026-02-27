@@ -21,7 +21,6 @@ Environment variables:
 from __future__ import annotations
 
 import json
-import random
 import re
 import sys
 import time as _time
@@ -58,7 +57,6 @@ from twitter_utils import (
     follow_user,
     get_user_profile,
     humanize,
-    is_junk,
     jitter_sleep,
     load_project_context,
     lookup_our_thread,
@@ -261,6 +259,7 @@ def draft_reply_with_full_context(
 **Tweet:** {tweet_context["text"]}
 **Found via:** "{candidate.get("searchTerm", "N/A")}"
 **Stats:** {tweet_context["stats"]["likes"]} likes, {tweet_context["stats"]["retweets"]} RTs, {tweet_context["stats"]["replies"]} replies
+**Estimated reply visibility:** ~{tweet_context["stats"]["likes"] * 20 + tweet_context["stats"]["retweets"] * 50:,} impressions (higher = our reply gets more eyeballs)
 
 # Author Profile (determine if they're target audience)
 {author_profile_text}
@@ -512,6 +511,77 @@ def generate_dynamic_keywords(
     return list(new_terms)[:max_terms]
 
 
+def _reach_score(c: dict) -> int:
+    """Simple reach proxy: higher = reply gets more eyeballs.
+
+    Each like implies ~20 impressions; each RT ~50 (amplification to new feeds).
+    We use a simplified ratio: likes × 1 + retweets × 3.
+    """
+    return (c.get("likes") or 0) + (c.get("retweets") or 0) * 3
+
+
+def llm_triage_candidates(candidates: list[dict], top_n: int = 15) -> list[str]:
+    """Single LLM call to rank candidates by engagement potential before CDP fetch.
+
+    Takes tweet text + reach stats (no browser fetch needed). Returns a list of
+    tweet IDs in priority order.  Falls back to reach-sort order on any failure.
+    """
+    fallback = [str(c.get("tweetId") or c.get("tweet_id") or "") for c in candidates]
+
+    lines = []
+    id_set: set[str] = set()
+    for i, c in enumerate(candidates, 1):
+        tid = str(c.get("tweetId") or c.get("tweet_id") or "")
+        if not tid:
+            continue
+        id_set.add(tid)
+        text = (c.get("text") or "")[:200].replace("\n", " ")
+        likes = c.get("likes") or 0
+        rts = c.get("retweets") or 0
+        est = likes * 20 + rts * 50
+        lines.append(f'[{i}] ID:{tid} [{likes}L {rts}RT ~{est:,} est.impressions] "{text}"')
+
+    if not lines:
+        return fallback
+
+    prompt = f"""You are triaging Twitter candidates for @DecentCloud_org to reply to.
+
+Strategy: We reply to devs/engineers frustrated with cloud costs, reliability, support, or lock-in. We build a p2p marketplace for verified compute. Phase 1: build trust, no product pitches.
+
+For each candidate, assess:
+- Content relevance (real infra/cloud pain vs. noise, spam, or crypto)
+- Reach opportunity (estimated impressions = how many people would see our reply)
+- Conversation potential (will the author engage back?)
+
+Candidates (sorted by reach):
+{chr(10).join(lines)}
+
+Return ONLY a JSON array of the top {top_n} tweet IDs, ranked best-first (most worth replying to).
+Include only IDs from the list above.  No explanation, no markdown — just the JSON array.
+Example: ["1234567890", "9876543210"]"""
+
+    try:
+        raw = call_llm(prompt, timeout=60)
+        if not raw:
+            return fallback[:top_n]
+
+        parsed = extract_json(raw)
+        if not isinstance(parsed, list):
+            return fallback[:top_n]
+
+        ranked = [str(x) for x in parsed if str(x) in id_set]
+        # Append any IDs the LLM omitted so we never lose candidates silently
+        seen = set(ranked)
+        for tid in fallback:
+            if tid not in seen:
+                ranked.append(tid)
+
+        return ranked
+    except Exception as e:
+        print(f"  LLM triage failed ({e}) — using reach-sort fallback", flush=True)
+        return fallback[:top_n]
+
+
 def main() -> int:
     print("=== AUTONOMOUS TWITTER ENGAGEMENT ===", flush=True)
     print(f"Time: {utc_now()}", flush=True)
@@ -580,42 +650,57 @@ def main() -> int:
             top_combos = get_top_reply_combos(conn, limit=20)
             bottom_combos = get_bottom_reply_combos(conn, limit=10)
 
-            # Shuffle before filtering so all search terms get equal representation
-            random.shuffle(candidates)
-
-            selected = []
-            discard_ids: list[str] = []  # queue entries to mark done immediately
+            # ── Candidate filtering (hard rules only — no keyword content filter) ──
+            discard_ids: list[str] = []
+            eligible: list[dict] = []
 
             for c in candidates:
                 tid = c.get("tweetId")
-                text = c.get("text", "")
-
                 if not tid or str(tid) in engaged_ids:
                     if tid:
                         discard_ids.append(str(tid))
                     continue
-                if is_junk(text):
-                    discard_ids.append(str(tid))
-                    continue
-
                 author = (c.get("author") or "").lower()
                 if author in {a.lower() for a in BLOCKED_AUTHORS}:
                     print(f"  Skipping blocked author @{author}", flush=True)
                     discard_ids.append(str(tid))
                     continue
-
-                selected.append(c)
-                if len(selected) >= 50:
-                    break
+                eligible.append(c)
 
             if using_queue and discard_ids:
                 mark_queue_processed(conn, discard_ids)
 
-            if not selected:
+            if not eligible:
                 print("No suitable candidates after filtering")
                 return 0
 
-            print(f"Selected {len(selected)} candidates")
+            # ── Layer 1: reach-sort — highest-visibility tweets first ─────────
+            eligible.sort(key=_reach_score, reverse=True)
+
+            # ── Layer 2: LLM batch triage — pick best FETCH_BATCH from top 30 ─
+            TRIAGE_POOL = min(len(eligible), 30)
+            FETCH_BATCH = 15
+            triage_pool = eligible[:TRIAGE_POOL]
+
+            print(
+                f"Triaging {TRIAGE_POOL} reach-sorted candidates (of {len(eligible)} total)...",
+                flush=True,
+            )
+            ranked_ids = llm_triage_candidates(triage_pool, top_n=FETCH_BATCH)
+
+            # Reconstruct ordered list from triage result
+            id_to_candidate = {str(c["tweetId"]): c for c in triage_pool}
+            selected = [id_to_candidate[tid] for tid in ranked_ids if tid in id_to_candidate]
+            if len(selected) < FETCH_BATCH:
+                # Fallback: fill remaining slots from reach-sorted pool
+                seen = {str(c["tweetId"]) for c in selected}
+                for c in triage_pool:
+                    if str(c["tweetId"]) not in seen:
+                        selected.append(c)
+                    if len(selected) >= FETCH_BATCH:
+                        break
+
+            print(f"Selected {len(selected)} candidates for context fetch")
 
             # Track candidates per term for hit-rate stats (denominator)
             term_candidate_counts: Counter = Counter(
@@ -627,12 +712,10 @@ def main() -> int:
             engaged_count = 0
 
             # ── Phase A: fetch context sequentially (browser/CDP ops) ──────────
-            # Limit prefetch batch so we don't over-fetch when the cap is low.
-            FETCH_BATCH = min(len(selected), 15)
             to_analyze: list[tuple[dict, dict]] = []
-            print(f"Fetching tweet context for {FETCH_BATCH} of {len(selected)} candidates...", flush=True)
+            print(f"Fetching tweet context for {len(selected)} candidates...", flush=True)
 
-            for candidate in selected[:FETCH_BATCH]:
+            for candidate in selected:
                 tweet_id = candidate["tweetId"]
                 author = candidate.get("author") or "unknown"
 
