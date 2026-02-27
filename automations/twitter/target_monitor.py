@@ -44,10 +44,8 @@ from db import (
     upsert_account,
 )
 from twitter_utils import (
-    _evaluate,
-    _get_target_id,
-    _navigate_and_wait,
     auto_follow_after_engagement,
+    cdp_tab,
     fetch_tweet_context,
     get_user_profile,
     humanize,
@@ -267,18 +265,18 @@ def get_latest_profile_tweet(username: str) -> dict | None:
     Returns dict with keys: tweetId, text, timestamp, href
     Returns None on any failure.
     """
-    target_id = _get_target_id()
-    if not target_id:
-        print(f"    CDP: no browser tab available for @{username}", flush=True)
-        return None
-
     url = f"https://x.com/{username}/with_replies"
     print(f"    CDP: navigating to {url}", flush=True)
-    if not _navigate_and_wait(url, target_id, wait_sec=4):
-        print(f"    CDP: navigation failed for @{username}", flush=True)
+    try:
+        with cdp_tab() as cdp:
+            if not cdp.navigate(url, wait_sec=4):
+                print(f"    CDP: navigation failed for @{username}", flush=True)
+                return None
+            raw = cdp.evaluate(PROFILE_TWEET_JS, timeout=20)
+    except Exception as e:
+        print(f"    CDP: get_latest_profile_tweet failed for @{username}: {e}", flush=True)
         return None
 
-    raw = _evaluate(target_id, PROFILE_TWEET_JS, timeout=20)
     if not raw or raw == "null":
         print(f"    CDP: no tweet articles found for @{username}", flush=True)
         return None

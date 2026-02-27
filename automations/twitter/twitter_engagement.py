@@ -307,14 +307,18 @@ def draft_reply_with_full_context(
    - Already overcrowded threads (>50 replies) where our reply will be buried
    - No hook at all: our only move would be pure validation with nothing specific to add
 
-3. **Rate engagement potential (1-10):**
-   Ask yourself: will this reply earn likes or follows from *anyone* reading the thread — author or audience?
+3. **Rate AUDIENCE engagement potential (1-10) — this is NOT about whether the author will reply:**
+   Ask yourself: will this reply earn likes or follows from *anyone* reading the thread?
 
-   **High (8-10):** Author asked a question or made a debatable claim we can push back on; expressed specific unresolved pain; the reply would make someone reading the thread want to follow us
-   **Medium (4-7):** High-traffic thread where a sharp specific fact or cut gets seen by the author's audience; author might reply or audience likes it
-   **Low (1-3):** Our only move is pure validation with nothing to add; thread is dead/low-traffic; no one will see or care about the reply
+   **This score measures audience reach and visibility, not author-reply probability.**
+   A Bloomberg thread (9M followers) = score 8-9 even if Bloomberg never replies — thousands of people will see our reply.
+   A dead thread with 2 followers and no engagement = score 1-2.
 
-   **The test:** "Would someone reading this thread see our reply and think 'who is this — I should follow'?" Likes from the audience count just as much as a reply from the author.
+   **High (8-10):** High-follower account or high-engagement thread — our reply is seen by lots of people; OR author made a debatable claim we can push back on with something specific
+   **Medium (4-7):** Moderate-reach thread where a sharp fact or observation gets seen by real audience; might get likes from readers
+   **Low (1-3):** Thread is dead/low-traffic (≤100 followers, zero engagement); our only move is pure validation with nothing specific to add; nobody will see or care about the reply
+
+   **The test:** "Would someone reading this thread see our reply and think 'who is this — I should follow'?" Likes from the audience count far more than a reply from the author. High-follower accounts almost never reply back — that's fine, their AUDIENCE is the prize.
 
 4. **If YES, draft a reply that gets engagement (likes, follows):**
 
@@ -368,17 +372,19 @@ Tweet: "Cloud egress fees are notoriously confusing"
 # Output Format (JSON)
 {{
   "shouldEngage": true/false,
-  "conversationLikelihood": 1-10,
+  "audienceEngagementPotential": 1-10,
   "profileClickWorthy": true/false,
   "reasoning": "brief explanation of decision",
   "reply": "draft reply text here" (or null if shouldEngage is false)
 }}
 
+IMPORTANT: "audienceEngagementPotential" measures how many people will see and like our reply, NOT whether the author will reply to us. Large media accounts (Bloomberg, TechCrunch, etc.) score 8-9 because of audience reach even though they never reply directly.
+
 Output ONLY valid JSON, nothing else.
 """
 
     try:
-        response = call_llm(prompt, timeout=120)
+        response = call_llm(prompt, timeout=120, json_mode=True)
         if not response:
             print("  LLM returned nothing", flush=True)
             return None
@@ -386,28 +392,19 @@ Output ONLY valid JSON, nothing else.
         json_str = extract_json(response)
         if json_str is None:
             print("  Could not extract JSON from LLM response", flush=True)
-            response2 = call_llm(prompt, timeout=120)
-            if response2:
-                json_str = extract_json(response2)
-            if json_str is None:
-                return None
+            return None
 
         decision = json.loads(json_str)
 
-        conv_score = decision.get("conversationLikelihood", 5)
+        audience_score = decision.get("audienceEngagementPotential", 5)
         profile_click_worthy = decision.get("profileClickWorthy", False)
-        if not decision.get("shouldEngage") or conv_score < 3:
-            reason = decision.get("reasoning", "no reason")
-            if conv_score < 3:
-                print(f"  Low engagement potential ({conv_score}/10): {reason}")
-            else:
-                print(f"  LLM decided NOT to engage: {reason}")
+        if not decision.get("shouldEngage") or audience_score < 3:
+            print(f"  LLM skipped: {json.dumps(decision)}")
             decision["shouldEngage"] = False
             return decision
 
         if not profile_click_worthy:
-            reason = decision.get("reasoning", "no reason")
-            print(f"  Not profile-click-worthy (pure validation), skipping")
+            print(f"  Not profile-click-worthy: {json.dumps(decision)}")
             decision["shouldEngage"] = False
             return decision
 
@@ -548,7 +545,7 @@ Include only IDs from the list above.  No explanation, no markdown — just the 
 Example: ["1234567890", "9876543210"]"""
 
     try:
-        raw = call_llm(prompt, timeout=60)
+        raw = call_llm(prompt, timeout=60, json_mode=True)
         if not raw:
             return fallback[:top_n]
 
@@ -804,9 +801,7 @@ def main() -> int:
 
                 if not decision or not decision.get("shouldEngage"):
                     if decision:
-                        print(
-                            f"  LLM skipped: {decision.get('reasoning', 'no reason')}"
-                        )
+                        print(f"  LLM skipped: {json.dumps(decision)}")
                     continue
 
                 reply_text = decision["reply"]
@@ -853,7 +848,7 @@ def main() -> int:
                     our_reply_id=our_reply_id,
                     source="search",
                     search_term=search_term,
-                    conv_likelihood=decision.get("conversationLikelihood"),
+                    conv_likelihood=decision.get("audienceEngagementPotential") or decision.get("conversationLikelihood"),
                     profile_click_worthy=decision.get("profileClickWorthy"),
                     llm_reasoning=decision.get("reasoning"),
                     target_tweet_text=tweet_context.get("text"),

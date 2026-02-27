@@ -1,11 +1,12 @@
 """Unit tests for fetch_tweet_context CDP logic.
 
 Tests the retry / home-warmup path without a real browser by patching
-CDPSession and cdp_lock.  No network required.
+cdp_tab.  No network required.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -62,13 +63,8 @@ def test_happy_path_articles_found_immediately():
     """Articles appear on the first wait_for — no warmup needed."""
     cdp = _make_cdp_mock(first_wait_for=True)
 
-    with (
-        patch("twitter_utils.CDPSession") as MockCDP,
-        patch("twitter_utils.cdp_lock") as mock_lock,
-    ):
-        MockCDP.connect.return_value = cdp
-        mock_lock.return_value.__enter__ = lambda s: s
-        mock_lock.return_value.__exit__ = MagicMock(return_value=False)
+    with patch("twitter_utils.cdp_tab") as mock_tab:
+        mock_tab.return_value = contextlib.contextmanager(lambda: (yield cdp))()
 
         from twitter_utils import fetch_tweet_context
         result = fetch_tweet_context("1234567890")
@@ -79,7 +75,6 @@ def test_happy_path_articles_found_immediately():
     assert result["text"] == "cloud support is terrible"
     assert result["stats"]["likes"] == 10
 
-    # Should have navigated directly to the tweet, no home warmup
     nav_calls = [c.args[0] for c in cdp.navigate.call_args_list]
     assert any("1234567890" in u for u in nav_calls)
     assert not any("home" in u for u in nav_calls), "home warmup should NOT be triggered"
@@ -89,13 +84,8 @@ def test_stuck_tab_triggers_home_warmup():
     """First wait_for times out (stuck tab) → warmup via home → retry succeeds."""
     cdp = _make_cdp_mock(first_wait_for=False, second_wait_for=True)
 
-    with (
-        patch("twitter_utils.CDPSession") as MockCDP,
-        patch("twitter_utils.cdp_lock") as mock_lock,
-    ):
-        MockCDP.connect.return_value = cdp
-        mock_lock.return_value.__enter__ = lambda s: s
-        mock_lock.return_value.__exit__ = MagicMock(return_value=False)
+    with patch("twitter_utils.cdp_tab") as mock_tab:
+        mock_tab.return_value = contextlib.contextmanager(lambda: (yield cdp))()
 
         from twitter_utils import fetch_tweet_context
         result = fetch_tweet_context("1234567890")
@@ -105,7 +95,6 @@ def test_stuck_tab_triggers_home_warmup():
 
     nav_calls = [c.args[0] for c in cdp.navigate.call_args_list]
     assert any("home" in u for u in nav_calls), "Home warmup navigate must be called"
-    # Verify order: tweet → home → tweet
     assert nav_calls.index(next(u for u in nav_calls if "home" in u)) > 0, (
         "Home navigate must come after the first tweet navigate"
     )
@@ -115,19 +104,13 @@ def test_stuck_tab_warmup_also_fails_returns_none():
     """Both wait_for calls fail → returns None without crashing."""
     cdp = _make_cdp_mock(first_wait_for=False, second_wait_for=False)
 
-    with (
-        patch("twitter_utils.CDPSession") as MockCDP,
-        patch("twitter_utils.cdp_lock") as mock_lock,
-    ):
-        MockCDP.connect.return_value = cdp
-        mock_lock.return_value.__enter__ = lambda s: s
-        mock_lock.return_value.__exit__ = MagicMock(return_value=False)
+    with patch("twitter_utils.cdp_tab") as mock_tab:
+        mock_tab.return_value = contextlib.contextmanager(lambda: (yield cdp))()
 
         from twitter_utils import fetch_tweet_context
         result = fetch_tweet_context("1234567890")
 
     assert result is None, "Should return None when articles never appear"
-    # evaluate() must NOT have been called (no point scraping an empty page)
     cdp.evaluate.assert_not_called()
 
 
@@ -135,16 +118,9 @@ def test_navigate_failure_returns_none():
     """navigate() returns False → returns None immediately, no wait_for called."""
     cdp = MagicMock()
     cdp.navigate.return_value = False
-    cdp.__enter__ = lambda s: s
-    cdp.__exit__ = MagicMock(return_value=False)
 
-    with (
-        patch("twitter_utils.CDPSession") as MockCDP,
-        patch("twitter_utils.cdp_lock") as mock_lock,
-    ):
-        MockCDP.connect.return_value = cdp
-        mock_lock.return_value.__enter__ = lambda s: s
-        mock_lock.return_value.__exit__ = MagicMock(return_value=False)
+    with patch("twitter_utils.cdp_tab") as mock_tab:
+        mock_tab.return_value = contextlib.contextmanager(lambda: (yield cdp))()
 
         from twitter_utils import fetch_tweet_context
         result = fetch_tweet_context("1234567890")
@@ -159,13 +135,8 @@ def test_malformed_js_response_returns_none():
     cdp = _make_cdp_mock(first_wait_for=True)
     cdp.evaluate.return_value = "not json at all {{"
 
-    with (
-        patch("twitter_utils.CDPSession") as MockCDP,
-        patch("twitter_utils.cdp_lock") as mock_lock,
-    ):
-        MockCDP.connect.return_value = cdp
-        mock_lock.return_value.__enter__ = lambda s: s
-        mock_lock.return_value.__exit__ = MagicMock(return_value=False)
+    with patch("twitter_utils.cdp_tab") as mock_tab:
+        mock_tab.return_value = contextlib.contextmanager(lambda: (yield cdp))()
 
         from twitter_utils import fetch_tweet_context
         result = fetch_tweet_context("1234567890")

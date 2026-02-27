@@ -76,6 +76,23 @@ class CDPSession:
         ws.connect(ws_url, timeout=10)
         return cls(ws)
 
+    @classmethod
+    def connect_to_tab(cls, ws_url: str) -> "CDPSession":
+        """Connect to a specific tab by its WebSocket debugger URL and return a CDPSession."""
+        ws = websocket.WebSocket()
+        ws.connect(ws_url, timeout=10)
+        return cls(ws)
+
+    @classmethod
+    def create_tab(cls, host: str = "localhost", port: int = 9222) -> dict:
+        """Create a new browser tab via Chrome's HTTP API.
+
+        Returns the new tab's info dict (including webSocketDebuggerUrl).
+        """
+        resp = requests.post(f"http://{host}:{port}/json/new?about:blank", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------

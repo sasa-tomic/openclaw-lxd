@@ -31,6 +31,7 @@ from lib.config import OPENCLAW_BIN, TWITTER_BASE_URL
 
 from cdp import CDPSession
 
+THREAD_INDEX_PATH = Path("/home/openclaw/clawd/memory/twitter-thread-index.json")
 STRATEGY_PATH = Path("/projects/automations/twitter/STRATEGY.md")
 HUMANIZE_SCRIPT = Path("/projects/automations/text/humanize.py")
 
@@ -73,37 +74,95 @@ def cdp_lock():
         lock_file.close()
 
 
-def _get_target_id() -> str | None:
-    """Return the ID of the first active page-type Chrome tab, or None."""
+CDP_POOL_SIZE = 2  # Number of Chrome tabs in the pool
+
+
+def _get_sorted_page_tabs() -> list[dict]:
+    """Return page-type Chrome tabs sorted by ID for stable slot assignment."""
     try:
-        tabs = CDPSession.tabs()
-        for t in tabs:
-            if t.get("type") == "page":
-                return t.get("id")
-        return None
+        all_tabs = CDPSession.tabs()
+        page_tabs = [t for t in all_tabs if t.get("type") == "page"]
+        page_tabs.sort(key=lambda t: t.get("id", ""))
+        return page_tabs
     except Exception as e:
-        logger.debug(f"_get_target_id: {e}")
-        return None
+        logger.debug(f"_get_sorted_page_tabs failed: {e}")
+        return []
 
 
-def _navigate_and_wait(url: str, target_id: str, wait_sec: float = 3) -> bool:
-    """Navigate to url using CDPSession. Returns True on success."""
+def _ensure_tab_pool(n: int) -> None:
+    """Ensure at least n page-type tabs exist in Chrome, creating new ones if needed."""
     try:
-        with CDPSession.connect() as cdp:
-            return bool(cdp.navigate(url, wait_sec=wait_sec))
+        page_tabs = _get_sorted_page_tabs()
+        needed = n - len(page_tabs)
+        for _ in range(needed):
+            CDPSession.create_tab()
+            time.sleep(0.5)
     except Exception as e:
-        logger.debug(f"_navigate_and_wait to {url}: {e}")
-        return False
+        logger.warning(f"CDP pool: failed to ensure {n} tabs: {e}")
 
 
-def _evaluate(target_id: str, js: str, timeout: float = 15) -> str | None:
-    """Evaluate JS in the current CDP tab. Returns raw string result or None."""
-    try:
-        with CDPSession.connect() as cdp:
-            return cdp.evaluate(js, timeout=timeout)
-    except Exception as e:
-        logger.debug(f"_evaluate failed: {e}")
-        return None
+@contextlib.contextmanager
+def cdp_tab(timeout: int = CDP_LOCK_TIMEOUT):
+    """Acquire a free tab from the pool and yield a connected CDPSession.
+
+    Tries tab slots 0..CDP_POOL_SIZE-1 in order; yields the CDPSession for the
+    first free slot. Polls every 0.5s until a slot is available or timeout.
+
+    Replaces cdp_lock() for all browser operations. Use as:
+        with cdp_tab() as cdp:
+            cdp.navigate(url)
+            result = cdp.evaluate(js)
+    """
+    _ensure_tab_pool(CDP_POOL_SIZE)
+    deadline = time.monotonic() + timeout
+    first_wait = True
+
+    while True:
+        page_tabs = _get_sorted_page_tabs()
+        if not page_tabs:
+            if time.monotonic() > deadline:
+                raise TimeoutError("CDP tab pool: no page tabs found (is Chrome running?)")
+            time.sleep(1)
+            continue
+
+        for i in range(min(CDP_POOL_SIZE, len(page_tabs))):
+            lock_path = Path(f"/tmp/twitter-cdp-tab-{i}.lock")
+            lock_file = open(lock_path, "w")
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock_file.close()
+                continue
+
+            # Got slot i — connect to this specific tab
+            try:
+                ws_url = page_tabs[i]["webSocketDebuggerUrl"]
+                cdp = CDPSession.connect_to_tab(ws_url)
+            except Exception as e:
+                logger.warning(f"CDP pool: failed to connect to tab slot {i}: {e}")
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                lock_file.close()
+                continue
+
+            try:
+                yield cdp
+            finally:
+                try:
+                    cdp.close()
+                except Exception:
+                    pass
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                lock_file.close()
+            return  # Done — generator exits
+
+        # All slots busy
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"CDP tab pool: no free tab available after {timeout}s")
+
+        if first_wait:
+            print(f"  Waiting for a free CDP tab (pool={CDP_POOL_SIZE})...", flush=True)
+            first_wait = False
+        time.sleep(0.5)
 
 
 _PROJECT_CONTEXT_CACHE: dict = {}  # {mtime: float, content: str}
@@ -126,15 +185,14 @@ def load_project_context() -> str:
         content = STRATEGY_PATH.read_text().strip()
         _PROJECT_CONTEXT_CACHE["mtime"] = mtime
         _PROJECT_CONTEXT_CACHE["content"] = content
+        return content
     except Exception as e:
         logger.debug(f"load_project_context failed: {e}")
-        content = (
+        return (
             "Account: @DecentCloud_org — building a P2P cloud compute marketplace "
             "(like Airbnb for compute/GPUs). Founder voice. Phase 1: no product "
             "mentions, no links, no hashtags. Build reply reputation first."
         )
-
-    return content
 
 
 # AI bots and known noise accounts — engaging wastes quota and builds no reputation
@@ -147,6 +205,33 @@ BLOCKED_AUTHORS = {
     "hackernoon",  # content farm, never replies
 }
 
+SKIP_PATTERNS = [
+    r"\bairdrop\b",
+    r"\bgiveaway\b",
+    r"\bfree\s+nft\b",
+    r"\b(buy|sell)\s+(my|our)\b",
+    r"\bclick\s+here\b",
+    r"\.sol\b",
+    # Crypto / token noise — mostly irrelevant and LLM-expensive to analyze
+    r"\bnft\b",
+    r"\bdefi\b",
+    r"\bweb3\b",
+    r"\bhodl\b",
+    r"\btokenomics\b",
+    r"\bsolana\b",
+    r"\bstaking\b",
+    r"\bpresale\b",
+    r"\bcoin\s+launch\b",
+    r"\btoken\s+launch\b",
+    # DePIN / crypto project signals not caught above
+    r"\btestnet\b",
+    r"\bdepin\b",
+    r"\bwhitelist\b",
+    r"\bplay.to.earn\b",
+    r"\bearn\s+crypto\b",
+    r"\$[A-Za-z]{2,10}\b",  # token tickers: $SOL $ETH $RNDR $GPU etc.
+]
+
 # ---------------------------------------------------------------------------
 # Search term building blocks — max 3-4 options per clause
 # ---------------------------------------------------------------------------
@@ -158,6 +243,9 @@ _PAAS = "(fly.io OR heroku OR 'render.com' OR railway)"
 _GPU = "(h100 OR a100 OR gpu OR B100 OR B300)"
 _PAIN = "(terrible OR useless OR ghosted OR broken)"
 _COST = "(expensive OR insane OR overpriced OR scam OR overpaying)"
+
+# Kept for backwards-compat with generate_dynamic_keywords()
+PROVIDERS = _CLOUD
 
 SEARCH_TERMS = [
     # Provider support failures — named providers anchor to real incidents
@@ -187,6 +275,10 @@ SEARCH_TERMS = [
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +328,164 @@ def lookup_our_thread(tweet_ids: list[str]) -> str | None:
     return None
 
 
+ENCOUNTERED_THREADS_DIR = Path("/projects/Notes/Pickle/Twitter/encountered")
+
+
+def save_encountered_thread(
+    tweet_context: dict,
+    decision: dict | None,
+    tweet_id: str,
+    search_term: str = "",
+) -> Path | None:
+    """Save a thread we analyzed for later analysis.
+
+    Stores the full conversation context + LLM decision (engaged or not).
+    File: /projects/Notes/Pickle/Twitter/encountered/YYYY-MM-DD-{tweet_id}-@author.md
+    """
+    try:
+        ENCOUNTERED_THREADS_DIR.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now(timezone.utc)
+        date_str = now.date().isoformat()
+        author = tweet_context.get("author", "unknown")
+        filename = f"{date_str}-{tweet_id}-@{author}.md"
+        path = ENCOUNTERED_THREADS_DIR / filename
+
+        tweet_url = f"{TWITTER_BASE_URL}/{author}/status/{tweet_id}"
+        stats = tweet_context.get("stats", {})
+
+        should_engage = decision.get("shouldEngage", False) if decision else False
+        our_reply = decision.get("reply", "") if decision else ""
+        reasoning = decision.get("reasoning", "") if decision else "No LLM decision"
+
+        engagement_status = "ENGAGED" if should_engage else "SKIPPED"
+
+        profile = tweet_context.get("authorProfile")
+        profile_bio = profile.get("bio", "") if profile else ""
+        profile_followers = profile.get("followersCount", 0) if profile else 0
+
+        lines = [
+            "---",
+            f"date: {date_str}",
+            f"author: @{author}",
+            f'tweetId: "{tweet_id}"',
+            f'url: "{tweet_url}"',
+            f"likes: {stats.get('likes', 0)}",
+            f"retweets: {stats.get('retweets', 0)}",
+            f"replies: {stats.get('replies', 0)}",
+            f"engagement: {engagement_status}",
+            f'searchTerm: "{search_term}"',
+            f"authorFollowers: {profile_followers}",
+            "tags: [twitter, engagement, encountered]",
+            "---",
+            "",
+            f"# @{author}: {tweet_context.get('text', '')[:60]}...",
+            "",
+            f"*Encountered: {date_str} | Status: **{engagement_status}***",
+            "",
+            "---",
+            "",
+            "## Original Tweet",
+            "",
+            f"**@{author}** ({tweet_context.get('authorName', '')})",
+            "",
+            f"> {tweet_context.get('text', '')}",
+            "",
+            f"*Stats: {stats.get('likes', 0)} likes, {stats.get('retweets', 0)} RTs, {stats.get('replies', 0)} replies*",
+            "",
+        ]
+
+        if profile:
+            lines += [
+                "---",
+                "",
+                "## Author Profile",
+                "",
+            ]
+            if profile.get("bio"):
+                lines.append(f"**Bio:** {profile['bio']}")
+                lines.append("")
+            if profile.get("location"):
+                lines.append(f"**Location:** {profile['location']}")
+                lines.append("")
+            if profile.get("followersCount"):
+                lines.append(f"**Followers:** {profile['followersCount']:,}")
+                lines.append("")
+            if profile.get("recentTweets"):
+                lines.append("**Recent tweets:**")
+                lines.append("")
+                for i, t in enumerate(profile["recentTweets"][:5], 1):
+                    lines.append(f"{i}. {t[:150]}")
+                lines.append("")
+
+        if tweet_context.get("parentChain"):
+            lines += [
+                "---",
+                "",
+                "## Conversation Context (tweets above)",
+                "",
+            ]
+            for p in tweet_context["parentChain"]:
+                p_user = p.get("username", "?")
+                p_text = p.get("text", "")
+                lines.append(f"**@{p_user}:**")
+                lines.append(f"> {p_text}")
+                lines.append("")
+
+        if tweet_context.get("threadContinuation"):
+            lines += [
+                "---",
+                "",
+                "## Thread Continuation (author's follow-ups)",
+                "",
+            ]
+            for t in tweet_context["threadContinuation"]:
+                t_text = t.get("text", "") if isinstance(t, dict) else str(t)
+                lines.append(f"> {t_text}")
+                lines.append("")
+
+        if tweet_context.get("otherReplies"):
+            lines += [
+                "---",
+                "",
+                "## Other Replies",
+                "",
+            ]
+            for r in tweet_context["otherReplies"][:5]:
+                r_user = r.get("username", "?")
+                r_text = r.get("text", "")
+                lines.append(f"**@{r_user}:** {r_text}")
+                lines.append("")
+
+        if our_reply:
+            lines += [
+                "---",
+                "",
+                "## Our Reply",
+                "",
+                f"> {our_reply}",
+                "",
+            ]
+
+        lines += [
+            "---",
+            "",
+            "## LLM Decision",
+            "",
+            f"**Should engage:** {should_engage}",
+            "",
+            "### Reasoning",
+            "",
+            reasoning,
+            "",
+        ]
+
+        path.write_text("\n".join(lines))
+        return path
+
+    except Exception as e:
+        print(f"  WARNING: Failed to save encountered thread: {e}", flush=True)
+        return None
 
 
 def send_error_alert(message: str) -> None:
@@ -263,6 +513,14 @@ def send_error_alert(message: str) -> None:
             )
     except Exception as e:
         print(f"  WARNING: Telegram alert failed: {e}", flush=True)
+
+
+def is_junk(text: str) -> bool:
+    text_lower = text.lower()
+    for pattern in SKIP_PATTERNS:
+        if re.search(pattern, text_lower, re.IGNORECASE):
+            return True
+    return False
 
 
 def jitter_sleep(min_sec: int = 30, max_sec: int = 120) -> None:
@@ -311,71 +569,62 @@ def post_reply(
     )
 
     try:
-        with cdp_lock():
+        with cdp_tab() as cdp:
             tweet_url = f"{TWITTER_BASE_URL}/i/web/status/{tweet_id}"
             print(f"  CDP: navigating to {tweet_url}", flush=True)
-
-            try:
-                with CDPSession.connect() as cdp:
-                    if not cdp.navigate(tweet_url, wait_sec=2):
-                        return False, None
-                    TEXTAREA = '[data-testid="tweetTextarea_0"]'
-                    REPLY_BTN = '[data-testid="tweetButtonInline"]'
-                    if not cdp.wait_for(TEXTAREA, timeout=10):
-                        print("  CDP: reply textbox not found", flush=True)
-                        return False, None
-                    # Click to focus/expand the reply box
-                    cdp.click(TEXTAREA)
-                    time.sleep(0.5)
-                    print(f"  CDP: typing reply...", flush=True)
-                    if not cdp.type_text(TEXTAREA, reply_text):
-                        print("  CDP: typing failed", flush=True)
-                        return False, None
-                    time.sleep(0.5)
-                    print(f"  CDP: clicking Reply...", flush=True)
-                    if not cdp.click(REPLY_BTN):
-                        print("  CDP: Reply button not found", flush=True)
-                        return False, None
-                    # Poll up to 8s for textarea to clear (reply submitted → div resets)
-                    deadline = time.time() + 8
-                    while time.time() < deadline:
-                        still_text = cdp.evaluate(f'document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()')
-                        if not still_text:
-                            # Give Twitter a moment to surface any error toast before
-                            # declaring success (errors also clear the textarea).
-                            time.sleep(1.2)
-                            toast = cdp.evaluate(
-                                'document.querySelector(\'[data-testid="toast"]\')?.textContent?.trim()'
-                            )
-                            if toast and "Your post was sent" not in toast:
-                                print(f"  CDP: Twitter error toast detected: {toast[:120]}", flush=True)
-                                return False, None
-                            if toast:
-                                print(f"  CDP: Twitter success toast: {toast[:120]}", flush=True)
-                            # Extract our reply ID from the thread DOM (already on this page).
-                            # The new reply renders immediately; its ID must be > tweet_id.
-                            reply_id: str | None = None
-                            for _ in range(5):
-                                raw = cdp.evaluate(_extract_js)
-                                candidate = str(raw) if raw else None
-                                if candidate and int(candidate) > int(tweet_id):
-                                    reply_id = candidate
-                                    break
-                                time.sleep(1)
-                            if reply_id:
-                                print(f"  CDP: reply posted (id={reply_id})", flush=True)
-                            else:
-                                print("  CDP: reply posted (could not read ID from page)", flush=True)
-                            return True, reply_id
-                        time.sleep(1)
-                    print("  CDP: reply may have failed (textarea still has text)", flush=True)
-                    return False, None
-            except Exception as e:
-                logger.warning(f"post_reply CDP failed: {e}")
+            if not cdp.navigate(tweet_url, wait_sec=2):
                 return False, None
-
+            TEXTAREA = '[data-testid="tweetTextarea_0"]'
+            REPLY_BTN = '[data-testid="tweetButtonInline"]'
+            if not cdp.wait_for(TEXTAREA, timeout=10):
+                print("  CDP: reply textbox not found", flush=True)
+                return False, None
+            # Click to focus/expand the reply box
+            cdp.click(TEXTAREA)
+            time.sleep(0.5)
+            print(f"  CDP: typing reply...", flush=True)
+            if not cdp.type_text(TEXTAREA, reply_text):
+                print("  CDP: typing failed", flush=True)
+                return False, None
+            time.sleep(0.5)
+            print(f"  CDP: clicking Reply...", flush=True)
+            if not cdp.click(REPLY_BTN):
+                print("  CDP: Reply button not found", flush=True)
+                return False, None
+            # Poll up to 8s for textarea to clear (reply submitted → div resets)
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                still_text = cdp.evaluate(f'document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()')
+                if not still_text:
+                    # Give Twitter a moment to surface any error toast before
+                    # declaring success (errors also clear the textarea).
+                    time.sleep(1.2)
+                    toast = cdp.evaluate(
+                        'document.querySelector(\'[data-testid="toast"]\')?.textContent?.trim()'
+                    )
+                    if toast:
+                        print(f"  CDP: Twitter error toast detected: {toast[:120]}", flush=True)
+                        return False, None
+                    # Extract our reply ID from the thread DOM (already on this page).
+                    # The new reply renders immediately; its ID must be > tweet_id.
+                    reply_id: str | None = None
+                    for _ in range(5):
+                        raw = cdp.evaluate(_extract_js)
+                        candidate = str(raw) if raw else None
+                        if candidate and int(candidate) > int(tweet_id):
+                            reply_id = candidate
+                            break
+                        time.sleep(1)
+                    if reply_id:
+                        print(f"  CDP: reply posted (id={reply_id})", flush=True)
+                    else:
+                        print("  CDP: reply posted (could not read ID from page)", flush=True)
+                    return True, reply_id
+                time.sleep(1)
+            print("  CDP: reply may have failed (textarea still has text)", flush=True)
+            return False, None
     except Exception as e:
-        print(f"  CDP reply exception: {e}", flush=True)
+        logger.warning(f"post_reply CDP failed: {e}")
         return False, None
 
 
@@ -385,44 +634,37 @@ def post_tweet(text: str) -> bool:
     Flow: navigate to compose → find textbox → type → click Post.
     """
     try:
-        with cdp_lock():
+        with cdp_tab() as cdp:
             compose_url = f"{TWITTER_BASE_URL}/compose/post"
             print("  CDP: navigating to compose...", flush=True)
-
-            try:
-                with CDPSession.connect() as cdp:
-                    if not cdp.navigate(compose_url, wait_sec=2):
-                        return False
-                    TEXTAREA = '[data-testid="tweetTextarea_0"]'
-                    POST_BTN = '[data-testid="tweetButton"]'
-                    if not cdp.wait_for(TEXTAREA, timeout=10):
-                        print("  CDP: compose textbox not found", flush=True)
-                        return False
-                    print(f"  CDP: typing tweet...", flush=True)
-                    if not cdp.type_text(TEXTAREA, text):
-                        print("  CDP: typing failed", flush=True)
-                        return False
-                    time.sleep(0.5)
-                    print(f"  CDP: clicking Post...", flush=True)
-                    if not cdp.click(POST_BTN):
-                        print("  CDP: Post button not found", flush=True)
-                        return False
-                    # Poll up to 8s for compose to close (textarea gone or empty)
-                    deadline = time.time() + 8
-                    while time.time() < deadline:
-                        still_text = cdp.evaluate(f'document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()')
-                        if not still_text:
-                            print("  CDP: tweet posted successfully", flush=True)
-                            return True
-                        time.sleep(1)
-                    print("  CDP: post may have failed (compose still open)", flush=True)
-                    return False
-            except Exception as e:
-                logger.warning(f"post_tweet CDP failed: {e}")
+            if not cdp.navigate(compose_url, wait_sec=2):
                 return False
-
+            TEXTAREA = '[data-testid="tweetTextarea_0"]'
+            POST_BTN = '[data-testid="tweetButton"]'
+            if not cdp.wait_for(TEXTAREA, timeout=10):
+                print("  CDP: compose textbox not found", flush=True)
+                return False
+            print(f"  CDP: typing tweet...", flush=True)
+            if not cdp.type_text(TEXTAREA, text):
+                print("  CDP: typing failed", flush=True)
+                return False
+            time.sleep(0.5)
+            print(f"  CDP: clicking Post...", flush=True)
+            if not cdp.click(POST_BTN):
+                print("  CDP: Post button not found", flush=True)
+                return False
+            # Poll up to 8s for compose to close (textarea gone or empty)
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                still_text = cdp.evaluate(f'document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()')
+                if not still_text:
+                    print("  CDP: tweet posted successfully", flush=True)
+                    return True
+                time.sleep(1)
+            print("  CDP: post may have failed (compose still open)", flush=True)
+            return False
     except Exception as e:
-        print(f"  CDP tweet exception: {e}", flush=True)
+        logger.warning(f"post_tweet CDP failed: {e}")
         return False
 
 
@@ -505,7 +747,7 @@ def _parse_graphql_search_body(body: str) -> list[dict]:
 
 
 def _cdp_search(
-    term: str, limit: int = 15, since_dt: datetime | None = None
+    cdp: "CDPSession", term: str, limit: int = 15, since_dt: datetime | None = None
 ) -> list[dict]:
     """Search Twitter for a term by intercepting its SearchTimeline GraphQL responses.
 
@@ -514,7 +756,7 @@ def _cdp_search(
     Each scroll triggers a new paginated request, typically yielding 20 tweets per
     response and 5+ responses per search (100+ tweets vs the old ~15-20 cap).
 
-    Must be called while holding cdp_lock().
+    Must be called with a CDPSession acquired from cdp_tab().
     """
     if since_dt is None:
         since_dt = datetime.now(timezone.utc) - timedelta(hours=SEARCH_CACHE_TTL_HOURS)
@@ -539,34 +781,34 @@ def _cdp_search(
             logger.debug(f"_cdp_search getResponseBody {req_id}: {e}")
 
     try:
-        with CDPSession.connect() as cdp:
-            executor = ThreadPoolExecutor(max_workers=4)
+        executor = ThreadPoolExecutor(max_workers=4)
 
-            cdp.send("Network.enable")
+        cdp.send("Network.enable")
 
-            def on_response(params: dict) -> None:
-                resp_url = params.get("response", {}).get("url", "")
-                req_id = params.get("requestId", "")
-                if req_id and "SearchTimeline" in resp_url:
-                    with _lock:
-                        pending_ids[req_id] = True
-
-            def on_loading_finished(params: dict) -> None:
-                if _shutdown.is_set():
-                    return
-                req_id = params.get("requestId", "")
+        def on_response(params: dict) -> None:
+            resp_url = params.get("response", {}).get("url", "")
+            req_id = params.get("requestId", "")
+            if req_id and "SearchTimeline" in resp_url:
                 with _lock:
-                    if req_id not in pending_ids:
-                        return
-                    del pending_ids[req_id]
-                try:
-                    executor.submit(_fetch_body, cdp, req_id)
-                except RuntimeError:
-                    pass  # executor already shut down
+                    pending_ids[req_id] = True
 
-            cdp.on("Network.responseReceived", on_response)
-            cdp.on("Network.loadingFinished", on_loading_finished)
+        def on_loading_finished(params: dict) -> None:
+            if _shutdown.is_set():
+                return
+            req_id = params.get("requestId", "")
+            with _lock:
+                if req_id not in pending_ids:
+                    return
+                del pending_ids[req_id]
+            try:
+                executor.submit(_fetch_body, cdp, req_id)
+            except RuntimeError:
+                pass  # executor already shut down
 
+        cdp.on("Network.responseReceived", on_response)
+        cdp.on("Network.loadingFinished", on_loading_finished)
+
+        try:
             if not cdp.navigate(url, wait_sec=5):
                 _shutdown.set()
                 executor.shutdown(wait=False)
@@ -580,6 +822,10 @@ def _cdp_search(
             # Signal handlers to stop submitting, then drain the executor
             _shutdown.set()
             executor.shutdown(wait=True)
+        finally:
+            # Deregister handlers so the cdp session can be reused cleanly
+            cdp.off("Network.responseReceived", on_response)
+            cdp.off("Network.loadingFinished", on_loading_finished)
 
     except Exception as e:
         logger.warning(f"_cdp_search CDP failed: {e}")
@@ -730,7 +976,7 @@ def search_candidates(
             )
             return candidates
 
-    with cdp_lock():
+    with cdp_tab() as cdp:
         if not bypass_cache:
             print(
                 f"  CDP: searching {len(terms_to_fetch)} uncached term(s)...",
@@ -770,7 +1016,7 @@ def search_candidates(
                     )
 
             try:
-                tweets = _cdp_search(term, limit=limit, since_dt=since_dt)
+                tweets = _cdp_search(cdp, term, limit=limit, since_dt=since_dt)
                 term_candidates = [
                     {
                         "tweetId": t.get("tweetId"),
@@ -938,32 +1184,20 @@ def fetch_tweet_context(tweet_id: str) -> dict | None:
   // Articles after the main tweet: thread continuation (self-replies) + other replies.
   // Skip any article nested inside main (the quoted tweet) — document order places nested
   // articles after their parent in the NodeList, so they'd otherwise appear here.
-  // Collect up to 15 replies so we can re-sort by engagement and take the top ones.
   const threadContinuation = [];
-  const otherRepliesRaw = [];
-  for (let i = mainIdx + 1; i < articles.length && i <= mainIdx + 20; i++) {{
+  const otherReplies = [];
+  for (let i = mainIdx + 1; i < articles.length && i <= mainIdx + 12; i++) {{
     if (main.contains(articles[i])) continue;
     const aUser = getUsername(articles[i]);
     const aText = getText(articles[i]);
     if (!aUser || !aText) continue;
     if (aUser === username && threadContinuation.length < 5) {{
       threadContinuation.push({{ text: aText, id: getTweetId(articles[i]) }});
-    }} else if (aUser !== username && otherRepliesRaw.length < 15) {{
-      const aStats = getStats(articles[i]);
-      otherRepliesRaw.push({{
-        username: aUser,
-        text: aText.slice(0, 300),
-        tweetId: getTweetId(articles[i]),
-        likes: aStats.likes,
-        retweets: aStats.retweets,
-        replies: aStats.replies,
-      }});
+    }} else if (aUser !== username && otherReplies.length < 5) {{
+      otherReplies.push({{ username: aUser, text: aText.slice(0, 300), tweetId: getTweetId(articles[i]) }});
     }}
-    if (threadContinuation.length >= 5 && otherRepliesRaw.length >= 15) break;
+    if (threadContinuation.length >= 5 && otherReplies.length >= 5) break;
   }}
-  // Sort by total engagement descending so the highest-signal replies surface first
-  otherRepliesRaw.sort((a, b) => (b.likes + b.retweets) - (a.likes + a.retweets));
-  const otherReplies = otherRepliesRaw.slice(0, 8);
 
   return JSON.stringify({{
     username, displayName, text,
@@ -975,63 +1209,45 @@ def fetch_tweet_context(tweet_id: str) -> dict | None:
   }});
 }})()"""
 
-    with cdp_lock():
-        print(f"  CDP: navigating to tweet {tweet_id}...", flush=True)
-        try:
-            with CDPSession.connect() as cdp:
-                if not cdp.navigate(tweet_url, wait_sec=2):
-                    return None
-                # Wait for React to finish rendering tweet articles.
-                # readyState fires before the SPA makes its API calls, so a flat
-                # sleep is unreliable. Poll the DOM instead.
-                if not cdp.wait_for('article[data-testid="tweet"]', timeout=12, poll=0.5):
-                    # Tab may be stuck in a loading loop (happens when a previous
-                    # run left the tab on a broken /i/web/status/ URL).
-                    # Warm up via the home timeline to reset the SPA, then retry.
-                    print("  CDP: articles not found, warming up via home...", flush=True)
-                    cdp.navigate("https://x.com/home", wait_sec=2)
-                    if not cdp.navigate(tweet_url, wait_sec=2):
-                        return None
-                    if not cdp.wait_for(
-                        'article[data-testid="tweet"]', timeout=12, poll=0.5
-                    ):
-                        print("  CDP: articles still not found after warmup", flush=True)
-                        return None
-                raw = cdp.evaluate(js, timeout=20)
-        except Exception as e:
-            logger.warning(f"fetch_tweet_context CDP failed: {e}")
-            return None
-
-        if not raw:
-            return None
-
-        try:
-            data = json.loads(raw) if isinstance(raw, str) else raw
-            if not data or not data.get("username"):
+    try:
+        with cdp_tab() as cdp:
+            if not cdp.navigate(tweet_url, wait_sec=4):
                 return None
+            raw = cdp.evaluate(js, timeout=20)
+    except Exception as e:
+        logger.warning(f"fetch_tweet_context CDP failed: {e}")
+        return None
 
-            parent_chain = data.get("parentChain") or []
-            reply_to = parent_chain[-1] if parent_chain else None
+    if not raw:
+        return None
 
-            return {
-                "tweetId": tweet_id,
-                "author": data["username"],
-                "authorName": data.get("displayName", ""),
-                "text": data.get("text", ""),
-                "quotedTweet": data.get("quotedTweet"),
-                "replyTo": reply_to,
-                "parentChain": parent_chain if parent_chain else None,
-                "stats": {
-                    "likes": data.get("likes", 0),
-                    "retweets": data.get("retweets", 0),
-                    "replies": data.get("replies", 0),
-                },
-                "threadContinuation": data.get("threadContinuation"),
-                "otherReplies": data.get("otherReplies"),
-            }
-        except (json.JSONDecodeError, TypeError) as e:
-            print(f"  CDP fetch_tweet_context parse error: {e}", flush=True)
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        if not data or not data.get("username"):
             return None
+
+        parent_chain = data.get("parentChain") or []
+        reply_to = parent_chain[-1] if parent_chain else None
+
+        return {
+            "tweetId": tweet_id,
+            "author": data["username"],
+            "authorName": data.get("displayName", ""),
+            "text": data.get("text", ""),
+            "quotedTweet": data.get("quotedTweet"),
+            "replyTo": reply_to,
+            "parentChain": parent_chain if parent_chain else None,
+            "stats": {
+                "likes": data.get("likes", 0),
+                "retweets": data.get("retweets", 0),
+                "replies": data.get("replies", 0),
+            },
+            "threadContinuation": data.get("threadContinuation"),
+            "otherReplies": data.get("otherReplies"),
+        }
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"  CDP fetch_tweet_context parse error: {e}", flush=True)
+        return None
 
 
 PROFILE_CACHE_PATH = Path("/home/openclaw/clawd/memory/twitter-profile-cache.json")
@@ -1221,28 +1437,27 @@ def fetch_user_profile(username: str) -> dict | None:
   return result;
 })()"""
 
-    with cdp_lock():
-        print(f"  CDP: navigating to profile @{username}...", flush=True)
-        try:
-            with CDPSession.connect() as cdp:
-                if not cdp.navigate(profile_url, wait_sec=5):
-                    return None
-                raw = cdp.evaluate(js, timeout=15)
-        except Exception as e:
-            logger.warning(f"fetch_user_profile CDP failed: {e}")
-            return None
+    try:
+        with cdp_tab() as cdp:
+            print(f"  CDP: navigating to profile @{username}...", flush=True)
+            if not cdp.navigate(profile_url, wait_sec=5):
+                return None
+            raw = cdp.evaluate(js, timeout=15)
+    except Exception as e:
+        logger.warning(f"fetch_user_profile CDP failed: {e}")
+        return None
 
-        if raw is None:
-            return None
+    if raw is None:
+        return None
 
-        try:
-            profile = json.loads(raw) if isinstance(raw, str) else raw
-            if profile and isinstance(profile, dict):
-                return profile
-            return None
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.debug(f"fetch_user_profile JSON parse failed: {e}")
-            return None
+    try:
+        profile = json.loads(raw) if isinstance(raw, str) else raw
+        if profile and isinstance(profile, dict):
+            return profile
+        return None
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.debug(f"fetch_user_profile JSON parse failed: {e}")
+        return None
 
 
 def get_user_profile(username: str, use_cache: bool = True) -> dict | None:
@@ -1306,26 +1521,25 @@ def get_follower_count(username: str) -> int | None:
 
     profile_url = f"https://x.com/{username}"
     count = None
-    with cdp_lock():
-        print(f"  CDP: navigating to profile @{username} (follower count)...", flush=True)
-        try:
-            with CDPSession.connect() as cdp:
-                if not cdp.navigate(profile_url, wait_sec=3):
-                    return None
-                raw = cdp.evaluate(js, timeout=10)
-        except Exception as e:
-            logger.warning(f"get_follower_count CDP failed: {e}")
-            return None
+    try:
+        with cdp_tab() as cdp:
+            print(f"  CDP: navigating to profile @{username} (follower count)...", flush=True)
+            if not cdp.navigate(profile_url, wait_sec=3):
+                return None
+            raw = cdp.evaluate(js, timeout=10)
+    except Exception as e:
+        logger.warning(f"get_follower_count CDP failed: {e}")
+        return None
 
-        if raw is None:
-            return None
+    if raw is None:
+        return None
 
-        try:
-            result = json.loads(raw) if isinstance(raw, str) else raw
-            count = int(result) if result is not None else None
-        except (json.JSONDecodeError, TypeError, ValueError) as e:
-            logger.debug(f"get_follower_count parse failed for @{username}: {e}")
-            return None
+    try:
+        result = json.loads(raw) if isinstance(raw, str) else raw
+        count = int(result) if result is not None else None
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.debug(f"get_follower_count parse failed for @{username}: {e}")
+        return None
 
     if count is not None:
         # Populate both cache layers so subsequent calls are free
@@ -1348,40 +1562,39 @@ def follow_user(username: str) -> bool:
 
     Uses CDPSession (direct WebSocket).
     """
-    with cdp_lock():
-        profile_url = f"https://x.com/{username}"
-        print(f"  CDP: navigating to profile @{username} (follow)...", flush=True)
-        try:
-            with CDPSession.connect() as cdp:
-                if not cdp.navigate(profile_url, wait_sec=2):
-                    return False
-                FOLLOW_BTN = '[data-testid$="-follow"]'
-                UNFOLLOW_BTN = '[data-testid$="-unfollow"]'
-                # Wait for either button to appear (page loaded)
-                if not cdp.wait_for(f'{FOLLOW_BTN}, {UNFOLLOW_BTN}', timeout=10):
-                    print(f"  CDP: follow/unfollow button not found for @{username}", flush=True)
-                    return False
-                # Check if already following
-                already = cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null')
-                if already:
-                    print(f"  CDP: already following @{username}", flush=True)
-                    return True
-                print(f"  CDP: clicking Follow for @{username}...", flush=True)
-                if not cdp.click(FOLLOW_BTN):
-                    print(f"  CDP: Follow button not found for @{username}", flush=True)
-                    return False
-                # Poll up to 5s for unfollow button to confirm follow took effect
-                deadline = time.time() + 5
-                while time.time() < deadline:
-                    if cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
-                        print(f"  CDP: followed @{username}", flush=True)
-                        return True
-                    time.sleep(1)
-                print(f"  CDP: follow @{username} may not have succeeded", flush=True)
+    try:
+        with cdp_tab() as cdp:
+            profile_url = f"https://x.com/{username}"
+            print(f"  CDP: navigating to profile @{username} (follow)...", flush=True)
+            if not cdp.navigate(profile_url, wait_sec=2):
                 return False
-        except Exception as e:
-            logger.warning(f"follow_user CDP failed: {e}")
+            FOLLOW_BTN = '[data-testid$="-follow"]'
+            UNFOLLOW_BTN = '[data-testid$="-unfollow"]'
+            # Wait for either button to appear (page loaded)
+            if not cdp.wait_for(f'{FOLLOW_BTN}, {UNFOLLOW_BTN}', timeout=10):
+                print(f"  CDP: follow/unfollow button not found for @{username}", flush=True)
+                return False
+            # Check if already following
+            already = cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null')
+            if already:
+                print(f"  CDP: already following @{username}", flush=True)
+                return True
+            print(f"  CDP: clicking Follow for @{username}...", flush=True)
+            if not cdp.click(FOLLOW_BTN):
+                print(f"  CDP: Follow button not found for @{username}", flush=True)
+                return False
+            # Poll up to 5s for unfollow button to confirm follow took effect
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
+                    print(f"  CDP: followed @{username}", flush=True)
+                    return True
+                time.sleep(1)
+            print(f"  CDP: follow @{username} may not have succeeded", flush=True)
             return False
+    except Exception as e:
+        logger.warning(f"follow_user CDP failed: {e}")
+        return False
 
 
 def unfollow_user(username: str) -> bool:
@@ -1389,46 +1602,45 @@ def unfollow_user(username: str) -> bool:
 
     Uses CDPSession (direct WebSocket).
     """
-    with cdp_lock():
-        profile_url = f"https://x.com/{username}"
-        print(f"  CDP: navigating to profile @{username} (unfollow)...", flush=True)
-        try:
-            with CDPSession.connect() as cdp:
-                if not cdp.navigate(profile_url, wait_sec=2):
-                    return False
-                FOLLOW_BTN = '[data-testid$="-follow"]'
-                UNFOLLOW_BTN = '[data-testid$="-unfollow"]'
-                CONFIRM_BTN = '[data-testid="confirmationSheetConfirm"]'
-                # Wait for either button to appear (page loaded)
-                if not cdp.wait_for(f'{FOLLOW_BTN}, {UNFOLLOW_BTN}', timeout=10):
-                    print(f"  CDP: follow/unfollow button not found for @{username}", flush=True)
-                    return False
-                # Check if actually following
-                if not cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
-                    print(f"  CDP: not following @{username} (no unfollow button)", flush=True)
-                    return True  # Already not following
-                print(f"  CDP: clicking Following to unfollow @{username}...", flush=True)
-                if not cdp.click(UNFOLLOW_BTN):
-                    print(f"  CDP: click Following failed for @{username}", flush=True)
-                    return False
-                # Wait for confirmation dialog
-                if not cdp.wait_for(CONFIRM_BTN, timeout=5):
-                    print(f"  CDP: Unfollow confirmation not found for @{username}", flush=True)
-                    return False
-                if not cdp.click(CONFIRM_BTN):
-                    return False
-                # Poll up to 5s for unfollow to confirm
-                deadline = time.time() + 5
-                while time.time() < deadline:
-                    if not cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
-                        print(f"  CDP: unfollowed @{username}", flush=True)
-                        return True
-                    time.sleep(1)
-                print(f"  CDP: unfollow @{username} may not have succeeded", flush=True)
+    try:
+        with cdp_tab() as cdp:
+            profile_url = f"https://x.com/{username}"
+            print(f"  CDP: navigating to profile @{username} (unfollow)...", flush=True)
+            if not cdp.navigate(profile_url, wait_sec=2):
                 return False
-        except Exception as e:
-            logger.warning(f"unfollow_user CDP failed: {e}")
+            FOLLOW_BTN = '[data-testid$="-follow"]'
+            UNFOLLOW_BTN = '[data-testid$="-unfollow"]'
+            CONFIRM_BTN = '[data-testid="confirmationSheetConfirm"]'
+            # Wait for either button to appear (page loaded)
+            if not cdp.wait_for(f'{FOLLOW_BTN}, {UNFOLLOW_BTN}', timeout=10):
+                print(f"  CDP: follow/unfollow button not found for @{username}", flush=True)
+                return False
+            # Check if actually following
+            if not cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
+                print(f"  CDP: not following @{username} (no unfollow button)", flush=True)
+                return True  # Already not following
+            print(f"  CDP: clicking Following to unfollow @{username}...", flush=True)
+            if not cdp.click(UNFOLLOW_BTN):
+                print(f"  CDP: click Following failed for @{username}", flush=True)
+                return False
+            # Wait for confirmation dialog
+            if not cdp.wait_for(CONFIRM_BTN, timeout=5):
+                print(f"  CDP: Unfollow confirmation not found for @{username}", flush=True)
+                return False
+            if not cdp.click(CONFIRM_BTN):
+                return False
+            # Poll up to 5s for unfollow to confirm
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if not cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
+                    print(f"  CDP: unfollowed @{username}", flush=True)
+                    return True
+                time.sleep(1)
+            print(f"  CDP: unfollow @{username} may not have succeeded", flush=True)
             return False
+    except Exception as e:
+        logger.warning(f"unfollow_user CDP failed: {e}")
+        return False
 
 
 def check_follows_back(username: str) -> bool | None:
@@ -1447,19 +1659,18 @@ def check_follows_back(username: str) -> bool | None:
   return false;
 })()"""
 
-    with cdp_lock():
-        print(f"  CDP: navigating to profile @{username} (follows-back check)...", flush=True)
-        try:
-            with CDPSession.connect() as cdp:
-                if not cdp.navigate(profile_url, wait_sec=3):
-                    return None
-                result = cdp.evaluate(js, timeout=10)
-                if result is not None:
-                    return bool(result)
+    try:
+        with cdp_tab() as cdp:
+            print(f"  CDP: navigating to profile @{username} (follows-back check)...", flush=True)
+            if not cdp.navigate(profile_url, wait_sec=3):
                 return None
-        except Exception as e:
-            logger.warning(f"check_follows_back CDP failed: {e}")
+            result = cdp.evaluate(js, timeout=10)
+            if result is not None:
+                return bool(result)
             return None
+    except Exception as e:
+        logger.warning(f"check_follows_back CDP failed: {e}")
+        return None
 
 
 def get_latest_own_tweet_id(username: str = "DecentCloud_org") -> str | None:
@@ -1483,26 +1694,25 @@ def get_latest_own_tweet_id(username: str = "DecentCloud_org") -> str | None:
   return null;
 })()"""
 
-    with cdp_lock():
-        print(f"  CDP: navigating to {url}...", flush=True)
-        try:
-            with CDPSession.connect() as cdp:
-                if not cdp.navigate(url, wait_sec=4):
-                    return None
-                raw = cdp.evaluate(js, timeout=10)
-        except Exception as e:
-            logger.warning(f"get_latest_own_tweet_id CDP failed: {e}")
-            return None
+    try:
+        with cdp_tab() as cdp:
+            print(f"  CDP: navigating to {url}...", flush=True)
+            if not cdp.navigate(url, wait_sec=4):
+                return None
+            raw = cdp.evaluate(js, timeout=10)
+    except Exception as e:
+        logger.warning(f"get_latest_own_tweet_id CDP failed: {e}")
+        return None
 
-        if not raw:
-            return None
+    if not raw:
+        return None
 
-        try:
-            result = json.loads(raw) if isinstance(raw, str) else raw
-            return str(result) if result else None
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.debug(f"get_latest_own_tweet_id JSON parse failed: {e}")
-            return None
+    try:
+        result = json.loads(raw) if isinstance(raw, str) else raw
+        return str(result) if result else None
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.debug(f"get_latest_own_tweet_id JSON parse failed: {e}")
+        return None
 
 
 def get_tweet_stats(tweet_id: str) -> dict | None:
@@ -1564,35 +1774,34 @@ def get_tweet_stats(tweet_id: str) -> dict | None:
   return JSON.stringify(stats);
 })()"""
 
-    with cdp_lock():
-        print(f"  CDP: navigating to tweet {tweet_id} (stats)...", flush=True)
-        try:
-            with CDPSession.connect() as cdp:
-                if not cdp.navigate(tweet_url, wait_sec=5):
-                    return None
-                raw = cdp.evaluate(js, timeout=15)
-        except Exception as e:
-            logger.warning(f"get_tweet_stats CDP failed: {e}")
-            return None
-
-        if not raw:
-            return None
-
-        try:
-            # cdp.evaluate may return a JSON-encoded string or the raw value
-            result = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(result, str):
-                result = json.loads(result)
-            if not isinstance(result, dict):
+    try:
+        with cdp_tab() as cdp:
+            print(f"  CDP: navigating to tweet {tweet_id} (stats)...", flush=True)
+            if not cdp.navigate(tweet_url, wait_sec=5):
                 return None
-            return {
-                "likes": int(result.get("likes", 0)),
-                "retweets": int(result.get("retweets", 0)),
-                "replies": int(result.get("replies", 0)),
-            }
-        except (json.JSONDecodeError, TypeError, ValueError) as e:
-            logger.debug(f"get_tweet_stats parse failed for {tweet_id}: {e}")
+            raw = cdp.evaluate(js, timeout=15)
+    except Exception as e:
+        logger.warning(f"get_tweet_stats CDP failed: {e}")
+        return None
+
+    if not raw:
+        return None
+
+    try:
+        # cdp.evaluate may return a JSON-encoded string or the raw value
+        result = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(result, str):
+            result = json.loads(result)
+        if not isinstance(result, dict):
             return None
+        return {
+            "likes": int(result.get("likes", 0)),
+            "retweets": int(result.get("retweets", 0)),
+            "replies": int(result.get("replies", 0)),
+        }
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.debug(f"get_tweet_stats parse failed for {tweet_id}: {e}")
+        return None
 
 
 def auto_follow_after_engagement(conn, username: str, tweet_id: str) -> bool:

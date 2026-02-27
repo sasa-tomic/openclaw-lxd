@@ -91,6 +91,7 @@ def call_llm(
     timeout: int = 120,
     model: Optional[str] = None,
     fallback_model: Optional[str] = None,
+    json_mode: bool = False,
 ) -> tuple[bool, str]:
     """Call LLM with prompt, return (success, response).
 
@@ -146,6 +147,7 @@ def call_llm(
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.7,
                         "max_tokens": 2000,
+                        **({"response_format": {"type": "json_object"}} if json_mode else {}),
                     },
                     timeout=timeout,
                 )
@@ -258,7 +260,7 @@ def _call_llm_via_opencode(prompt: str, timeout: int) -> tuple[bool, str]:
         return (False, f"opencode call failed: {e}")
 
 
-def call_llm_simple(prompt: str, timeout: int = 120) -> str | None:
+def call_llm_simple(prompt: str, timeout: int = 120, json_mode: bool = False) -> str | None:
     """Simple LLM call returning just the response string (for backward compatibility).
 
     Deprecated: Use call_llm() instead for better error handling.
@@ -270,5 +272,5 @@ def call_llm_simple(prompt: str, timeout: int = 120) -> str | None:
     Returns:
         Response text on success, None on failure
     """
-    success, response = call_llm(prompt, max_retries=4, timeout=timeout)
+    success, response = call_llm(prompt, max_retries=4, timeout=timeout, json_mode=json_mode)
     return response if success else None

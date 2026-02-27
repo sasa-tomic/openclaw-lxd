@@ -41,10 +41,8 @@ from db import (
 )
 from twitter_utils import (
     BLOCKED_AUTHORS,
-    _evaluate,
-    _get_target_id,
-    _navigate_and_wait,
     auto_follow_after_engagement,
+    cdp_tab,
     fetch_tweet_context,
     humanize,
     jitter_sleep,
@@ -168,29 +166,30 @@ def scrape_timeline() -> list[dict]:
     """Navigate to /home and extract tweet articles from the Following feed."""
     import time
 
-    target_id = _get_target_id()
-    if not target_id:
-        print("  CDP: no browser tab available", flush=True)
-        return []
-
     url = f"{TWITTER_BASE_URL}/home"
     print(f"  CDP: navigating to {url}", flush=True)
-    if not _navigate_and_wait(url, target_id, wait_sec=4):
-        print("  CDP: navigation failed", flush=True)
+    try:
+        with cdp_tab() as cdp:
+            if not cdp.navigate(url, wait_sec=4):
+                print("  CDP: navigation failed", flush=True)
+                return []
+
+            # Try to click the Following tab so we get the chronological feed
+            tab_result = cdp.evaluate(CLICK_FOLLOWING_TAB_JS)
+            if tab_result == "clicked":
+                print("  CDP: clicked Following tab — waiting for feed update", flush=True)
+                time.sleep(2)
+            else:
+                print(
+                    "  CDP: Following tab not found — proceeding with default feed",
+                    flush=True,
+                )
+
+            raw = cdp.evaluate(TIMELINE_JS, timeout=20)
+    except Exception as e:
+        print(f"  CDP: scrape_timeline failed: {e}", flush=True)
         return []
 
-    # Try to click the Following tab so we get the chronological feed
-    tab_result = _evaluate(target_id, CLICK_FOLLOWING_TAB_JS, timeout=10)
-    if tab_result == "clicked":
-        print("  CDP: clicked Following tab — waiting for feed update", flush=True)
-        time.sleep(2)
-    else:
-        print(
-            "  CDP: Following tab not found — proceeding with default feed",
-            flush=True,
-        )
-
-    raw = _evaluate(target_id, TIMELINE_JS, timeout=20)
     if not raw:
         print("  CDP: JS evaluation returned nothing", flush=True)
         return []

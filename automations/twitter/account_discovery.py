@@ -26,10 +26,7 @@ from lib.llm_utils import call_llm, extract_json
 from twitter_utils import (
     BLOCKED_AUTHORS,
     TWITTER_BASE_URL,
-    _evaluate,
-    _get_target_id,
-    _navigate_and_wait,
-    cdp_lock,
+    cdp_tab,
     fetch_user_profile,
     follow_user,
     jitter_sleep,
@@ -120,18 +117,15 @@ _REPLY_TARGETS_JS = """
 def _scrape_following(username: str) -> list[str]:
     """Return usernames from the /following page of an account."""
     try:
-        with cdp_lock():
-            target_id = _get_target_id()
-            if not target_id:
-                return []
+        with cdp_tab() as cdp:
             url = f"{TWITTER_BASE_URL}/{username}/following"
-            if not _navigate_and_wait(url, target_id, wait_sec=4):
+            if not cdp.navigate(url, wait_sec=4):
                 return []
             time.sleep(2)
             for _ in range(3):
-                _evaluate(target_id, "window.scrollBy(0, 800)")
+                cdp.evaluate("window.scrollBy(0, 800)")
                 time.sleep(1.2)
-            raw = _evaluate(target_id, _FOLLOWING_JS, timeout=15)
+            raw = cdp.evaluate(_FOLLOWING_JS, timeout=15)
             if not raw:
                 return []
             result = json.loads(raw)
@@ -144,18 +138,15 @@ def _scrape_following(username: str) -> list[str]:
 def _scrape_reply_targets(username: str) -> list[str]:
     """Return @handles that an account replies to (from /with_replies feed)."""
     try:
-        with cdp_lock():
-            target_id = _get_target_id()
-            if not target_id:
-                return []
+        with cdp_tab() as cdp:
             url = f"{TWITTER_BASE_URL}/{username}/with_replies"
-            if not _navigate_and_wait(url, target_id, wait_sec=4):
+            if not cdp.navigate(url, wait_sec=4):
                 return []
             time.sleep(2)
             for _ in range(4):
-                _evaluate(target_id, "window.scrollBy(0, 800)")
+                cdp.evaluate("window.scrollBy(0, 800)")
                 time.sleep(1.0)
-            raw = _evaluate(target_id, _REPLY_TARGETS_JS, timeout=15)
+            raw = cdp.evaluate(_REPLY_TARGETS_JS, timeout=15)
             if not raw:
                 return []
             result = json.loads(raw)
