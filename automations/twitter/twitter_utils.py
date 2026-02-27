@@ -160,9 +160,6 @@ _GPU = "(h100 OR a100 OR gpu OR B100 OR B300)"
 _PAIN = "(terrible OR useless OR ghosted OR broken)"
 _COST = "(expensive OR insane OR overpriced OR scam OR overpaying)"
 
-# Kept for backwards-compat with generate_dynamic_keywords()
-PROVIDERS = _CLOUD
-
 SEARCH_TERMS = [
     # Provider support failures — named providers anchor to real incidents
     f"({_CLOUD} OR {_P2P} OR {_PAAS}) AND {_SUPPORT}",
@@ -191,10 +188,6 @@ SEARCH_TERMS = [
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
