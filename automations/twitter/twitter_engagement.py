@@ -697,9 +697,19 @@ def main() -> int:
 
                 jitter_sleep()
 
-                posted, our_reply_id = post_reply(tweet_id, reply_text)
+                MAX_REPLY_ATTEMPTS = 3
+                posted = False
+                our_reply_id = None
+                for attempt in range(1, MAX_REPLY_ATTEMPTS + 1):
+                    posted, our_reply_id = post_reply(tweet_id, reply_text)
+                    if posted:
+                        break
+                    if attempt < MAX_REPLY_ATTEMPTS:
+                        print(f"  Reply attempt {attempt} failed, retrying in 5s...", flush=True)
+                        _time.sleep(5)
+
                 if not posted:
-                    send_error_alert(f"Failed to post reply to {tweet_id} (@{author})")
+                    send_error_alert(f"Failed to post reply to {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
                     continue
 
                 print("  Replied", flush=True)
