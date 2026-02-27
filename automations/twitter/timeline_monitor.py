@@ -213,6 +213,7 @@ def draft_timeline_reply(
     tweet_context: dict,
     recent_engagements: list[dict],
     recent_posts: list[dict],
+    conn=None,
 ) -> dict | None:
     """Draft a reply to a Following-feed tweet via LLM.
 
@@ -523,7 +524,7 @@ def main() -> int:
                 # LLM decision
                 print("  Asking LLM to draft reply...", flush=True)
                 decision = draft_timeline_reply(
-                    tweet, tweet_context, recent_engagements, recent_posts
+                    tweet, tweet_context, recent_engagements, recent_posts, conn=conn
                 )
 
                 if not decision or not decision.get("shouldEngage"):

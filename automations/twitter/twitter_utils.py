@@ -101,68 +101,55 @@ def _ensure_tab_pool(n: int) -> None:
         logger.warning(f"CDP pool: failed to ensure {n} tabs: {e}")
 
 
+def _acquire_tab_slot(deadline: float) -> tuple[int, object]:
+    """Block until one of CDP_POOL_SIZE slot lock files is free.
+
+    Tries slots 0..CDP_POOL_SIZE-1 in order on each poll cycle.
+    Returns (slot_index, open_lock_file) with LOCK_EX held.
+    The caller must release the lock: fcntl.flock(lf, LOCK_UN); lf.close().
+    Raises TimeoutError if deadline passes before any slot is free.
+    """
+    logged_wait = False
+    while True:
+        for slot in range(CDP_POOL_SIZE):
+            lf = open(f"/tmp/twitter-cdp-tab-{slot}.lock", "w")
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return slot, lf
+            except BlockingIOError:
+                lf.close()
+
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"CDP tab pool: all {CDP_POOL_SIZE} slots busy after timeout"
+            )
+        if not logged_wait:
+            print(f"  Waiting for a free CDP tab (pool={CDP_POOL_SIZE})...", flush=True)
+            logged_wait = True
+        time.sleep(0.5)
+
+
 @contextlib.contextmanager
 def cdp_tab(timeout: int = CDP_LOCK_TIMEOUT):
     """Acquire a free tab from the pool and yield a connected CDPSession.
 
-    Tries tab slots 0..CDP_POOL_SIZE-1 in order; yields the CDPSession for the
-    first free slot. Polls every 0.5s until a slot is available or timeout.
-
-    Replaces cdp_lock() for all browser operations. Use as:
+    Use as:
         with cdp_tab() as cdp:
             cdp.navigate(url)
             result = cdp.evaluate(js)
     """
     _ensure_tab_pool(CDP_POOL_SIZE)
-    deadline = time.monotonic() + timeout
-    first_wait = True
-
-    while True:
-        page_tabs = _get_sorted_page_tabs()
-        if not page_tabs:
-            if time.monotonic() > deadline:
-                raise TimeoutError("CDP tab pool: no page tabs found (is Chrome running?)")
-            time.sleep(1)
-            continue
-
-        for i in range(min(CDP_POOL_SIZE, len(page_tabs))):
-            lock_path = Path(f"/tmp/twitter-cdp-tab-{i}.lock")
-            lock_file = open(lock_path, "w")
-            try:
-                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                lock_file.close()
-                continue
-
-            # Got slot i — connect to this specific tab
-            try:
-                ws_url = page_tabs[i]["webSocketDebuggerUrl"]
-                cdp = CDPSession.connect_to_tab(ws_url)
-            except Exception as e:
-                logger.warning(f"CDP pool: failed to connect to tab slot {i}: {e}")
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-                lock_file.close()
-                continue
-
-            try:
-                yield cdp
-            finally:
-                try:
-                    cdp.close()
-                except Exception:
-                    pass
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-                lock_file.close()
-            return  # Done — generator exits
-
-        # All slots busy
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"CDP tab pool: no free tab available after {timeout}s")
-
-        if first_wait:
-            print(f"  Waiting for a free CDP tab (pool={CDP_POOL_SIZE})...", flush=True)
-            first_wait = False
-        time.sleep(0.5)
+    slot, lf = _acquire_tab_slot(time.monotonic() + timeout)
+    try:
+        tabs = _get_sorted_page_tabs()
+        cdp = CDPSession.connect_to_tab(tabs[slot]["webSocketDebuggerUrl"])
+        try:
+            yield cdp
+        finally:
+            cdp.close()
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
 
 
 _PROJECT_CONTEXT_CACHE: dict = {}  # {mtime: float, content: str}
