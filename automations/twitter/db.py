@@ -623,6 +623,32 @@ def get_bottom_reply_combos(conn, limit: int = 5) -> list[dict]:
         return [dict(row) for row in cur.fetchall()]
 
 
+def get_our_thread_context(conn, tweet_ids: list[str]) -> str | None:
+    """Return our own post texts if any tweet_id matches posts we've made.
+
+    Used by engagement monitors to give the LLM context when someone replies to
+    one of our threads.  Returns a newline-separated string ordered by post time,
+    or None if none of the IDs match our posts.
+    """
+    if not tweet_ids:
+        return None
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT tweet_id, text, posted_at
+            FROM posts
+            WHERE tweet_id = ANY(%s)
+            ORDER BY posted_at ASC
+            """,
+            (tweet_ids,),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return None
+    lines = [f"Tweet {i + 1}: {row['text']}" for i, row in enumerate(rows)]
+    return "\n".join(lines)
+
+
 def get_popular_candidate_tweets(conn, days: int = 30, limit: int = 25) -> list[dict]:
     """Fetch high-engagement tweets from candidate_queue as topic inspiration.
 

@@ -35,6 +35,7 @@ from db import (
     ensure_schema,
     get_conn,
     get_engaged_tweet_ids,
+    get_our_thread_context,
     get_queued_candidates,
     get_recent_engagements,
     get_recent_posts,
@@ -59,7 +60,6 @@ from twitter_utils import (
     humanize,
     jitter_sleep,
     load_project_context,
-    lookup_our_thread,
     post_reply,
     send_error_alert,
     unfollow_user,
@@ -188,15 +188,8 @@ def draft_reply_with_full_context(
         ]
         other_replies_text = "\n".join(lines)
 
-    # Check if this tweet touches one of our own posted threads
-    all_visible_ids = [tweet_context.get("tweetId", "")]
-    for p in tweet_context.get("parentChain") or []:
-        if p.get("tweetId"):
-            all_visible_ids.append(p["tweetId"])
-    for t in tweet_context.get("threadContinuation") or []:
-        if t.get("id"):
-            all_visible_ids.append(t["id"])
-    our_thread_note = lookup_our_thread([i for i in all_visible_ids if i])
+    # Thread context pre-fetched in Phase A and stored on tweet_context
+    our_thread_note = tweet_context.get("ourThreadContext")
 
     project_context = load_project_context()
 
@@ -293,51 +286,45 @@ def draft_reply_with_full_context(
    - Use parent chain + thread continuation to understand the full picture
    - Check other replies — don't duplicate what's already been said in the thread
    - Check our recent replies — don't repeat the same angle we already used recently
-   - Check author profile — are they target audience? Do their interests align with Decent Cloud?
-   - If it's spam/promo/crypto, SKIP IT
-   - If it's vague/generic with no real substance, SKIP IT
+   - Check author profile — do they have followers? Zero followers = SKIP (no reach benefit)
+   - If it's a spam/scam account with no real discussion happening, SKIP IT
 
 2. **PRIORITIZE engagement opportunities (score 8-10 = must engage):**
    - Provider support horror stories ("cloud support terrible", "provider ghosted")
-   - P2P marketplace trust complaints ("akash reliability", "decentralized compute issues")
-   - "I tried [p2p service] and got ghosted/no response"
-   - Questions about provider reliability/accountability
-   - **Author is target audience** (DevOps, SRE, infra builder, self-hoster, p2p/marketplace builder)
+   - Marketplace trust/accountability pain ("can't find a reliable provider", "no way to vet providers")
+   - The matching problem: hard to find the right provider (buy side) or hard to find users (sell side)
+   - Manual work that AI should be automating but isn't yet
    - **Author likely to engage back** (active account, replies to others, not a content farm)
 
    **GOOD (score 6-7):**
-   - Cloud cost complaints (still relevant but not primary)
-   - Infrastructure philosophy debates
-   - GPU availability/demand
-   - Author tangentially related to target audience
+   - Cloud cost complaints, infrastructure philosophy debates, GPU availability/demand
+   - High-traffic rant or observation thread — even if author won't reply, a sharp specific fact gets seen by everyone reading
+   - Any thread where we can drop a specific fact or honest take that earns likes from the audience
 
-   **SKIP (score <5):**
-   - Generic AWS dunking without specific pain
-   - Crypto price speculation
-   - Already overcrowded threads (>50 replies)
-   - Author is content farm, bot, or unlikely to engage
-   - Author's interests completely unrelated to cloud/infra/marketplace
-   - Cynical rant/observation that everyone already agrees with — our only move is pure validation ("so true!"), author won't reply back
-   - No specific hook: our reply would be generic and forgettable
+   **SKIP (score <3):**
+   - Author has zero followers
+   - Already overcrowded threads (>50 replies) where our reply will be buried
+   - No hook at all: our only move would be pure validation with nothing specific to add
 
-3. **Rate conversation likelihood (1-10):**
-   Ask yourself: if we reply, will the author actually write back to US specifically?
+3. **Rate engagement potential (1-10):**
+   Ask yourself: will this reply earn likes or follows from *anyone* reading the thread — author or audience?
 
-   **High (8-10):** Author asked a question (explicit or implicit); made a debatable claim we can push back on; expressed specific unresolved pain; wants an answer
-   **Medium (5-7):** Author made an observation we can sharpen or extend with a non-obvious take; might engage if our reply is interesting
-   **Low (1-4):** Author is broadcasting/venting, not looking for discussion; our reply would purely validate ("yeah support sucks") with nothing new; author seems done with the topic
+   **High (8-10):** Author asked a question or made a debatable claim we can push back on; expressed specific unresolved pain; the reply would make someone reading the thread want to follow us
+   **Medium (4-7):** High-traffic thread where a sharp specific fact or cut gets seen by the author's audience; author might reply or audience likes it
+   **Low (1-3):** Our only move is pure validation with nothing to add; thread is dead/low-traffic; no one will see or care about the reply
 
-   **The test:** "Would the author see our reply and think 'oh, interesting — I want to respond to that'?" If the honest answer is "they'd just like it and scroll on", that's a low score.
+   **The test:** "Would someone reading this thread see our reply and think 'who is this — I should follow'?" Likes from the audience count just as much as a reply from the author.
 
 4. **If YES, draft a reply that gets engagement (likes, follows):**
 
    **Voice:**
-   - 1 sentence. Borderline rude cynicism. Sounds like someone who's seen this a hundred times and is mildly annoyed you're only noticing now.
+   - **Primary rule: write like a human expert tweets, not like an AI generating cynicism.** Study the high-engagement examples in the "Reply style" section above — match that register exactly.
+   - 1-2 sentences. Direct, specific, zero performance. Just what a senior engineer fires off in 5 seconds when they know the answer.
    - No setup, no punchline structure — just the plain thing, stated plainly
    - Standard sentence capitalization: capitalize the first word and proper nouns (AWS, GCP, Stripe, etc.). No trailing punctuation if it feels unnatural.
-   - The fact itself carries the cynicism — don't editorialize on top of it
+   - The fact itself carries the weight — don't editorialize on top of it
    - NEVER use template anchors: "wild that", "funny how", "almost like", "turns out", "weird that" — these read as AI tells
-   - Do NOT construct a clever observation. Just say the thing a tired infra engineer would fire off in 5 seconds.
+   - Do NOT construct a clever observation. Just say the thing, plainly.
 
    **What gets likes/follows:**
    - Dropping a specific fact that makes their situation sound worse than they described
@@ -360,7 +347,7 @@ def draft_reply_with_full_context(
 
 5. **If NO (not worth engaging), explain why**
 
-# Example Replies (Study the Voice — Blunt, Cynical, 1-2 Sentences)
+# Example Replies (Study the Voice — Direct, Specific, Human)
 
 Tweet: "Tried Akash for GPU compute, provider just stopped responding mid-job"
 -> "Anonymous providers have zero skin in the game, which is fine until your job disappears mid-run"
@@ -408,10 +395,10 @@ Output ONLY valid JSON, nothing else.
 
         conv_score = decision.get("conversationLikelihood", 5)
         profile_click_worthy = decision.get("profileClickWorthy", False)
-        if not decision.get("shouldEngage") or conv_score < 6:
+        if not decision.get("shouldEngage") or conv_score < 3:
             reason = decision.get("reasoning", "no reason")
-            if conv_score < 6:
-                print(f"  Low conversation likelihood ({conv_score}/10): {reason}")
+            if conv_score < 3:
+                print(f"  Low engagement potential ({conv_score}/10): {reason}")
             else:
                 print(f"  LLM decided NOT to engage: {reason}")
             decision["shouldEngage"] = False
@@ -545,12 +532,12 @@ def llm_triage_candidates(candidates: list[dict], top_n: int = 15) -> list[str]:
 
     prompt = f"""You are triaging Twitter candidates for @DecentCloud_org to reply to.
 
-Strategy: We reply to devs/engineers frustrated with cloud costs, reliability, support, or lock-in. We build a p2p marketplace for verified compute. Phase 1: build trust, no product pitches.
+Strategy: We build a p2p AI-driven marketplace where providers earn reputation that's hard to build and easy to lose, and AI helps users and providers achieve their objectives. Goal: grow follower base by dropping sharp, human-sounding takes in high-visibility threads. Phase 1: no product pitches — just point out the pain.
 
 For each candidate, assess:
-- Content relevance (real infra/cloud pain vs. noise, spam, or crypto)
-- Reach opportunity (estimated impressions = how many people would see our reply)
-- Conversation potential (will the author engage back?)
+- Reach opportunity (estimated impressions = how many people would see our reply) — this is the primary signal
+- Hook potential: is there a specific fact, stat, or honest observation we could drop that earns likes from people reading this thread?
+- Skip only: accounts with zero followers (no reach benefit)
 
 Candidates (sorted by reach):
 {chr(10).join(lines)}
@@ -732,6 +719,18 @@ def main() -> int:
                         f"  Skipping {tweet_id} - failed to fetch context", flush=True
                     )
                     continue
+
+                # Check if this tweet is part of one of our own threads (DB lookup).
+                # Done here (conn in scope) so draft_reply_with_full_context can run
+                # safely in the thread pool without needing a DB connection.
+                visible_ids = [str(tweet_id)]
+                for p in tweet_context.get("parentChain") or []:
+                    if p.get("tweetId"):
+                        visible_ids.append(str(p["tweetId"]))
+                for t in tweet_context.get("threadContinuation") or []:
+                    if t.get("id"):
+                        visible_ids.append(str(t["id"]))
+                tweet_context["ourThreadContext"] = get_our_thread_context(conn, visible_ids)
 
                 # Persist high-engagement replies we observed while fetching context.
                 other_replies = tweet_context.get("otherReplies") or []

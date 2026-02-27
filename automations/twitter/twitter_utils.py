@@ -31,7 +31,6 @@ from lib.config import OPENCLAW_BIN, TWITTER_BASE_URL
 
 from cdp import CDPSession
 
-THREAD_INDEX_PATH = Path("/home/openclaw/clawd/memory/twitter-thread-index.json")
 STRATEGY_PATH = Path("/projects/automations/twitter/STRATEGY.md")
 HUMANIZE_SCRIPT = Path("/projects/automations/text/humanize.py")
 

@@ -160,7 +160,7 @@ Engagement Runs (13:00, 17:00, 20:00, 23:00, 02:00 UTC)
     -> Fetch tweet context (full parentChain + otherReplies for conversation awareness)
     -> Fetch author profile (bio, followers, recent tweets) for LLM context
     -> LLM analyze with full context: conversation thread, our recent 8 replies, voice samples
-    -> LLM must score conversationLikelihood >= 6 to proceed
+    -> LLM must score engagementPotential >= 3 to proceed (profileClickWorthy required)
     -> Humanize approved replies
     -> CDP click-focus reply box -> type -> click Reply (with post verification)
     -> Auto-follow author via CDP (tracked in followedUsers)
@@ -266,7 +266,7 @@ Candidates go through multiple layers before LLM analysis:
 2. **Blocked authors**: Skip accounts in BLOCKED_AUTHORS list
 3. **Already-engaged**: Skip tweet IDs already in engagedPosts
 4. **LLM analysis**: Full context analysis with conversationLikelihood score
-   - Requires `shouldEngage: true` AND `conversationLikelihood >= 6`
+   - Requires `shouldEngage: true` AND `conversationLikelihood >= 3` AND `profileClickWorthy: true`
    - LLM given author profile (bio, followers, recent tweets) for context
    - LLM given full parentChain + otherReplies for conversation awareness
    - LLM given our own recent 8 replies + 5 posts for voice consistency

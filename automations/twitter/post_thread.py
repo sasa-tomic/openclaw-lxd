@@ -13,7 +13,7 @@ Flow:
 4. Post first tweet via post_tweet()
 5. Get the tweet ID from our profile
 6. Chain subsequent tweets via post_reply() with jitter delays
-7. Log thread to DB (posts table) and save Obsidian note
+7. Log thread to DB (posts table)
 
 Runs weekly (Wednesday 15:00 UTC) via systemd timer.
 """
@@ -38,7 +38,6 @@ from twitter_utils import (
     post_reply,
     post_tweet,
     send_error_alert,
-    update_thread_index,
     utc_now,
 )
 from db import (
@@ -51,7 +50,6 @@ from db import (
 )
 
 OUR_USERNAME = "DecentCloud_org"
-OBSIDIAN_THREADS_DIR = Path("/projects/Notes/Pickle/Twitter/threads")
 
 # Phase 1 hard rules
 PRODUCT_MENTION_PATTERNS = [
@@ -344,87 +342,6 @@ def post_thread(tweets: list[str]) -> tuple[bool, list[str]]:
     return success, posted_ids
 
 
-def save_thread_note(
-    topic: str,
-    tweets: list[str],
-    tweet_ids: list[str],
-    posted_count: int,
-) -> Path | None:
-    """Save a posted thread as a markdown note in the Obsidian vault.
-
-    File: /projects/Notes/Pickle/Twitter/threads/YYYY-MM-DD-{root_id}-slug.md
-    The root tweet ID is embedded in the filename so any thread tweet can be
-    located instantly:
-      - Human:      find .../threads -name "*1234567890*"
-      - Python:     OBSIDIAN_THREADS_DIR.glob(f"*{tweet_id}*")
-      - Shell:      ls threads/*1234567890*
-    The JSON index (twitter-thread-index.json) maps ALL tweet IDs in the thread
-    to this file for O(1) programmatic lookup of non-root tweets.
-    Returns the path written, or None on failure.
-    """
-    try:
-        OBSIDIAN_THREADS_DIR.mkdir(parents=True, exist_ok=True)
-
-        now = datetime.now(timezone.utc)
-        date_str = now.date().isoformat()
-        root_id = tweet_ids[0] if tweet_ids else "unknown"
-        slug = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")[:50]
-        filename = f"{date_str}-{root_id}-{slug}.md"
-        path = OBSIDIAN_THREADS_DIR / filename
-
-        thread_url = (
-            f"https://x.com/{OUR_USERNAME}/status/{tweet_ids[0]}" if tweet_ids else ""
-        )
-
-        lines = [
-            "---",
-            f"date: {date_str}",
-            f'topic: "{topic}"',
-            f'url: "{thread_url}"',
-            f"tweetCount: {len(tweets)}",
-            f"postedCount: {posted_count}",
-            f"tweetIds: {json.dumps(tweet_ids)}",
-            "tags: [twitter, thread]",
-            "---",
-            "",
-            f"# Thread: {topic}",
-            "",
-            f"*Posted: {date_str} | [{OUR_USERNAME}]({thread_url})*",
-            "",
-            "---",
-            "",
-        ]
-
-        for i, (tweet, tid) in enumerate(zip(tweets, tweet_ids), 1):
-            tweet_url = f"https://x.com/{OUR_USERNAME}/status/{tid}"
-            lines.append(f"**{i}/{len(tweets)}** — [{tweet_url}]({tweet_url})")
-            lines.append("")
-            lines.append(f"> {tweet}")
-            lines.append("")
-
-        # Add any tweets that didn't get IDs (partial post)
-        for i, tweet in enumerate(tweets[len(tweet_ids) :], len(tweet_ids) + 1):
-            lines.append(f"**{i}/{len(tweets)}** — *(not posted)*")
-            lines.append("")
-            lines.append(f"> {tweet}")
-            lines.append("")
-
-        lines.append("")
-        path.write_text("\n".join(lines))
-        print(f"  Saved thread note: {path}", flush=True)
-
-        # Update tweet_id → note_path index for O(1) lookup during engagement
-        if tweet_ids:
-            update_thread_index(tweet_ids, str(path))
-            print(f"  Indexed {len(tweet_ids)} tweet IDs → {path.name}", flush=True)
-
-        return path
-
-    except Exception as e:
-        print(f"  WARNING: Failed to save thread note: {e}", flush=True)
-        return None
-
-
 def main() -> int:
     print("=== TWITTER WEEKLY THREAD POSTER ===", flush=True)
     print(f"Time: {utc_now()}", flush=True)
@@ -518,9 +435,6 @@ def main() -> int:
 
             # Store topic in kv_state for dedup on next run
             save_thread_topics(conn, topic)
-
-        # Save to Obsidian vault for analytics and review (outside conn block — file I/O)
-        save_thread_note(topic, humanized_tweets, tweet_ids, len(tweet_ids))
 
         return 0
 

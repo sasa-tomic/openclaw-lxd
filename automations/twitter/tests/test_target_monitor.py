@@ -66,7 +66,6 @@ for _key, _orig in _saved_modules.items():
 del _saved_modules, _key, _stub, _orig
 
 # Patch module-level helpers that call external services
-tm.lookup_our_thread = mock.MagicMock(return_value=None)
 tm.load_project_context = mock.MagicMock(return_value="DecentCloud is a p2p cloud marketplace.")
 tm.utc_now = mock.MagicMock(return_value="2026-02-22T15:00:00Z")
 

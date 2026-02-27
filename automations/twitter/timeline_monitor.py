@@ -29,6 +29,7 @@ from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from db import (
     get_conn,
     get_engaged_tweet_ids,
+    get_our_thread_context,
     get_recent_engagements,
     get_recent_posts,
     increment_engagement_count,
@@ -48,7 +49,6 @@ from twitter_utils import (
     humanize,
     jitter_sleep,
     load_project_context,
-    lookup_our_thread,
     post_reply,
     send_error_alert,
     utc_now,
@@ -267,7 +267,7 @@ def draft_timeline_reply(
     for t in tweet_context.get("threadContinuation") or []:
         if t.get("id"):
             all_visible_ids.append(t["id"])
-    our_thread_note = lookup_our_thread([i for i in all_visible_ids if i])
+    our_thread_note = get_our_thread_context(conn, [i for i in all_visible_ids if i])
 
     project_context = load_project_context()
 
