@@ -39,9 +39,11 @@ from db import (
     get_last_eval,
     get_search_term_stats,
     get_engagements_for_perf_check,
+    get_posts_for_stats_update,
     insert_eval,
     update_search_term_perf,
     update_engagement_perf,
+    update_post_stats,
 )
 
 
@@ -80,7 +82,10 @@ def gather_metrics(conn) -> dict:
     if follower_count and prev_followers:
         follower_growth = follower_count - prev_followers
 
-    # Check performance of recent replies (2-24h old, not yet perf-checked)
+    # Refresh stats for recent original posts so get_top_posts() has real numbers
+    _refresh_post_stats(conn)
+
+    # Check/refresh performance stats for recent replies (up to 7 days old)
     reply_performances = _gather_reply_performances(conn)
 
     return {
@@ -110,9 +115,12 @@ def _count_posts_since(conn, since: datetime) -> int:
 
 
 def _gather_reply_performances(conn) -> list[dict]:
-    """Fetch performance stats for replies that are 2-24h old.
+    """Fetch and refresh performance stats for recent replies (up to 7 days old).
 
-    Also persists the performance data into engagements and search_term_stats tables.
+    Re-checks on every daily run so stats stay current throughout a reply's
+    lifecycle, not just as a one-shot snapshot in the first 24h.
+
+    search_term_perf is only updated on the FIRST check to avoid double-counting.
     """
     candidates = get_engagements_for_perf_check(conn)
     reply_performances = []
@@ -130,8 +138,9 @@ def _gather_reply_performances(conn) -> list[dict]:
         rts = stats.get("retweets", 0)
         replies = stats.get("replies", 0)
         got_reply_back = replies > 0
+        is_first_check = eng.get("perf_checked_at") is None
 
-        # Persist perf back to engagements row
+        # Always refresh engagement row stats
         update_engagement_perf(
             conn,
             tweet_id=eng["tweet_id"],
@@ -141,17 +150,19 @@ def _gather_reply_performances(conn) -> list[dict]:
             got_reply_back=got_reply_back,
         )
 
-        # Persist perf into search_term_stats if the engagement had a term
-        term = eng.get("search_term")
-        if term:
-            zero_perf = 1 if likes == 0 and replies == 0 else 0
-            update_search_term_perf(
-                conn,
-                term=term,
-                likes=likes,
-                reply_backs=1 if got_reply_back else 0,
-                zero_perf=zero_perf,
-            )
+        # Only update search_term_perf on first check — it accumulates, so
+        # re-counting on every daily run would inflate the totals.
+        if is_first_check:
+            term = eng.get("search_term")
+            if term:
+                zero_perf = 1 if likes == 0 and replies == 0 else 0
+                update_search_term_perf(
+                    conn,
+                    term=term,
+                    likes=likes,
+                    reply_backs=1 if got_reply_back else 0,
+                    zero_perf=zero_perf,
+                )
 
         reply_performances.append({
             "replyId": reply_id,
@@ -160,11 +171,38 @@ def _gather_reply_performances(conn) -> list[dict]:
             "likes": likes,
             "retweets": rts,
             "replies": replies,
-            "searchTerm": term,
+            "searchTerm": eng.get("search_term"),
+            "isFirstCheck": is_first_check,
         })
 
-    print(f"  Perf-checked {len(reply_performances)} reply(ies)", flush=True)
+    first = sum(1 for r in reply_performances if r["isFirstCheck"])
+    rechecked = len(reply_performances) - first
+    print(f"  Reply perf: {first} first-check, {rechecked} re-checked", flush=True)
     return reply_performances
+
+
+def _refresh_post_stats(conn) -> int:
+    """Fetch current likes/rts for recent original posts and write them to DB.
+
+    Runs on every daily_strategy_eval so get_top_posts() returns accurate data
+    for the LLM candidate ranking prompt.
+    """
+    posts = get_posts_for_stats_update(conn)
+    updated = 0
+    for post in posts:
+        stats = get_tweet_stats(post["tweet_id"])
+        if not stats:
+            continue
+        update_post_stats(
+            conn,
+            tweet_id=post["tweet_id"],
+            likes=stats.get("likes", 0),
+            rts=stats.get("retweets", 0),
+        )
+        updated += 1
+
+    print(f"  Post stats refreshed: {updated}/{len(posts)}", flush=True)
+    return updated
 
 
 def evaluate_with_llm(metrics: dict, history: list) -> str | None:

@@ -455,20 +455,28 @@ def get_recent_engagements(conn, hours: int = 24, limit: int = 100) -> list[dict
 
 
 def get_engagements_for_perf_check(conn) -> list[dict]:
-    """Fetch engagements that are 2-24h old, not yet perf-checked, with a reply ID."""
+    """Fetch engagements that need a performance stats refresh.
+
+    Covers:
+    - First check: any reply 2h–7 days old that has never been perf-checked.
+    - Re-checks: any reply < 7 days old whose stats were last fetched > 23h ago,
+      so daily_strategy_eval keeps the numbers fresh throughout the engagement's
+      lifecycle (not just a single one-shot snapshot in the first 24h).
+    """
     now = datetime.now(timezone.utc)
     two_hours_ago = now - timedelta(hours=2)
-    one_day_ago = now - timedelta(hours=24)
+    seven_days_ago = now - timedelta(days=7)
+    twenty_three_hours_ago = now - timedelta(hours=23)
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
             SELECT * FROM engagements
             WHERE replied_at BETWEEN %s AND %s
-              AND perf_checked_at IS NULL
               AND our_reply_id IS NOT NULL
+              AND (perf_checked_at IS NULL OR perf_checked_at < %s)
             ORDER BY replied_at DESC
             """,
-            (one_day_ago, two_hours_ago),
+            (seven_days_ago, two_hours_ago, twenty_three_hours_ago),
         )
         return [dict(row) for row in cur.fetchall()]
 
@@ -553,6 +561,48 @@ def get_top_posts(conn, limit: int = 20) -> list[dict]:
             (limit,),
         )
         return [dict(row) for row in cur.fetchall()]
+
+
+def get_posts_for_stats_update(conn, days: int = 30) -> list[dict]:
+    """Return posts that need a stats refresh.
+
+    Covers posts up to `days` old that are at least 2h old (enough time for
+    the tweet to appear in the API) and whose stats were never fetched or were
+    last fetched more than 23h ago (so daily_strategy_eval keeps them current).
+    Excludes placeholder tweet_ids written when the real ID wasn't available.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    two_hours_ago = now - timedelta(hours=2)
+    twenty_three_hours_ago = now - timedelta(hours=23)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT tweet_id, text, likes, rts, posted_at
+            FROM posts
+            WHERE posted_at BETWEEN %s AND %s
+              AND tweet_id NOT LIKE 'unknown-%%'
+              AND (perf_checked_at IS NULL OR perf_checked_at < %s)
+            ORDER BY posted_at DESC
+            """,
+            (cutoff, two_hours_ago, twenty_three_hours_ago),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def update_post_stats(conn, tweet_id: str, likes: int, rts: int) -> None:
+    """Update likes/rts for an original post and stamp perf_checked_at."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE posts
+            SET likes = %s,
+                rts = %s,
+                perf_checked_at = now()
+            WHERE tweet_id = %s
+            """,
+            (likes, rts, tweet_id),
+        )
 
 
 def get_recent_posts(conn, days: int = 7, limit: int = 50) -> list[dict]:
