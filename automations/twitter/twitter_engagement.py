@@ -646,7 +646,7 @@ def main() -> int:
                     cache_decision(decision_cache, tid, dec)
                 return cand, ctx, dec
 
-            max_workers = min(len(to_analyze), 8)
+            max_workers = min(len(to_analyze), 3)  # GLM-5 parallelism limit
             analyzed: list[tuple[dict, dict, dict | None]] = []
             if to_analyze:
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:

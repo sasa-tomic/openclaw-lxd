@@ -14,3 +14,8 @@ dependencies = [
 dev = [
     "pytest>=9.0.2",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: slow tests that use real CDP, LLM, and DB (deselect with -m 'not integration')",
+]
