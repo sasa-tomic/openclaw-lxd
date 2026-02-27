@@ -1211,8 +1211,25 @@ def fetch_tweet_context(tweet_id: str) -> dict | None:
 
     try:
         with cdp_tab() as cdp:
-            if not cdp.navigate(tweet_url, wait_sec=4):
+            print(f"  CDP: navigating to tweet {tweet_id}...", flush=True)
+            if not cdp.navigate(tweet_url, wait_sec=2):
                 return None
+            # Wait for React to finish rendering tweet articles.
+            # readyState fires before the SPA makes its API calls, so a flat
+            # sleep is unreliable. Poll the DOM instead.
+            if not cdp.wait_for('article[data-testid="tweet"]', timeout=12, poll=0.5):
+                # Tab may be stuck in a loading loop (happens when a previous
+                # run left the tab on a broken /i/web/status/ URL).
+                # Warm up via the home timeline to reset the SPA, then retry.
+                print("  CDP: articles not found, warming up via home...", flush=True)
+                cdp.navigate("https://x.com/home", wait_sec=2)
+                if not cdp.navigate(tweet_url, wait_sec=2):
+                    return None
+                if not cdp.wait_for(
+                    'article[data-testid="tweet"]', timeout=12, poll=0.5
+                ):
+                    print("  CDP: articles still not found after warmup", flush=True)
+                    return None
             raw = cdp.evaluate(js, timeout=20)
     except Exception as e:
         logger.warning(f"fetch_tweet_context CDP failed: {e}")
