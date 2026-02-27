@@ -286,7 +286,7 @@ def draft_reply_with_full_context(
    - Use parent chain + thread continuation to understand the full picture
    - Check other replies — don't duplicate what's already been said in the thread
    - Check our recent replies — don't repeat the same angle we already used recently
-   - Check author profile — do they have followers? Zero followers = SKIP (no reach benefit)
+   - Check author profile — do they have followers? **Our own account has ~15 followers, so any account with more than 10 followers is a valid target.** Only skip accounts with ≤10 followers. Do NOT dismiss accounts for having "only" hundreds or even low thousands of followers — that's fine at our stage.
    - If it's a spam/scam account with no real discussion happening, SKIP IT
 
 2. **PRIORITIZE engagement opportunities (score 8-10 = must engage):**
@@ -295,14 +295,15 @@ def draft_reply_with_full_context(
    - The matching problem: hard to find the right provider (buy side) or hard to find users (sell side)
    - Manual work that AI should be automating but isn't yet
    - **Author likely to engage back** (active account, replies to others, not a content farm)
+   - **Tweet has zero replies** — being first means our reply is pinned at the top and gets maximum visibility
 
    **GOOD (score 6-7):**
    - Cloud cost complaints, infrastructure philosophy debates, GPU availability/demand
-   - High-traffic rant or observation thread — even if author won't reply, a sharp specific fact gets seen by everyone reading
+   - Low or zero engagement on the tweet is fine — **zero replies is actually ideal**, we get top position
    - Any thread where we can drop a specific fact or honest take that earns likes from the audience
 
    **SKIP (score <3):**
-   - Author has zero followers
+   - Author has ≤10 followers (we ourselves have only ~15, so anything above that is real reach)
    - Already overcrowded threads (>50 replies) where our reply will be buried
    - No hook at all: our only move would be pure validation with nothing specific to add
 
