@@ -213,9 +213,8 @@ Use as inspiration for fresh angles only — don't repeat same framing.
 - YES: "Stripe can hold 10% of your revenue for 6 months. Rapid growth often triggers it."
 
 ## Constraints
-- 1-2 sentences max per tweet
-- Under 260 characters each
-- Mostly lowercase — start lowercase unless it's a proper noun (AWS, GCP, etc.)
+- Up to 280 characters per post
+- Standard sentence capitalization: capitalize the first word and proper nouns (AWS, GCP, Stripe, etc.)
 - Each tweet distinctly different in topic and angle
 
 Output as JSON array: ["tweet1", "tweet2", "tweet3", "tweet4"]
@@ -377,9 +376,9 @@ Use as inspiration for fresh angles, but don't repeat the same framing.
 ## Constraints
 - 1-2 sentences max
 - Under 260 characters
-- Mostly lowercase — start lowercase unless it's a proper noun (AWS, GCP, etc.)
+- Standard sentence capitalization: capitalize the first word and proper nouns (AWS, GCP, Stripe, etc.)
 
-Output ONLY the tweet text. No quotes, no JSON, no markdown. Start with lowercase.
+Output ONLY the tweet text. No quotes, no JSON, no markdown.
 
 Tweet:"""
 
@@ -436,10 +435,10 @@ def main() -> int:
         with get_conn() as conn:
             # Check if we've already posted enough today
             count = count_posts_today(conn)
-            print(f"Posts today: {count}/3", flush=True)
+            print(f"Posts today: {count}/5", flush=True)
 
-            if count >= 3:
-                print("Already posted 2 original tweets today, skipping")
+            if count >= 5:
+                print("Already posted 5 original tweets today, skipping")
                 return 0
 
             # Load queue and clean up old posted entries (>7 days)
@@ -453,8 +452,8 @@ def main() -> int:
             unposted = [entry for entry in queue if not entry.get("posted")]
             print(f"Queue: {len(queue)} total, {len(unposted)} unposted", flush=True)
 
-            # If <2 unposted entries, draft a batch
-            if len(unposted) < 2:
+            # If <3 unposted entries, draft a batch (keep buffer ahead of 5/day demand)
+            if len(unposted) < 3:
                 print("Queue low, drafting batch...", flush=True)
                 new_entries = draft_batch(conn)
                 if new_entries:

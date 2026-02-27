@@ -301,7 +301,7 @@ def draft_reply_with_full_context(
    **Voice:**
    - 1 sentence. Borderline rude cynicism. Sounds like someone who's seen this a hundred times and is mildly annoyed you're only noticing now.
    - No setup, no punchline structure — just the plain thing, stated plainly
-   - Lowercase preferred. No trailing punctuation if it feels unnatural.
+   - Standard sentence capitalization: capitalize the first word and proper nouns (AWS, GCP, Stripe, etc.). No trailing punctuation if it feels unnatural.
    - The fact itself carries the cynicism — don't editorialize on top of it
    - NEVER use template anchors: "wild that", "funny how", "almost like", "turns out", "weird that" — these read as AI tells
    - Do NOT construct a clever observation. Just say the thing a tired infra engineer would fire off in 5 seconds.
@@ -330,19 +330,19 @@ def draft_reply_with_full_context(
 # Example Replies (Study the Voice — Blunt, Cynical, 1-2 Sentences)
 
 Tweet: "Tried Akash for GPU compute, provider just stopped responding mid-job"
--> "anonymous providers have zero skin in the game, which is fine until your job disappears mid-run"
+-> "Anonymous providers have zero skin in the game, which is fine until your job disappears mid-run"
 
 Tweet: "Cloud support is terrible, been waiting 3 days for a response"
--> "nobody at AWS is losing sleep over your ticket"
+-> "Nobody at AWS is losing sleep over your ticket"
 
 Tweet: "Egress fees are such a scam"
--> "$0 in. $90/TB out. totally fine."
+-> "$0 in. $90/TB out. Totally fine."
 
 Tweet: "Accountability cannot be delegated. When a cloud provider manages your data, the liability stays with you."
--> "they take the contract, you take the fine"
+-> "They take the contract, you take the fine"
 
 Tweet: "Cloud egress fees are notoriously confusing"
--> "in: $0. out: $90/TB. not that confusing actually"
+-> "In: $0. Out: $90/TB. Not that confusing actually"
 
 # Output Format (JSON)
 {{
