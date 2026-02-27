@@ -39,6 +39,8 @@ from db import (
     get_recent_engagements,
     get_recent_posts,
     get_search_term_stats,
+    get_top_reply_combos,
+    get_bottom_reply_combos,
     insert_engagement,
     is_engaged,
     mark_queue_processed,
@@ -161,6 +163,8 @@ def draft_reply_with_full_context(
     tweet_context: dict,
     recent_engagements: list[dict],
     recent_posts: list[dict],
+    top_combos: list[dict] | None = None,
+    bottom_combos: list[dict] | None = None,
 ) -> dict | None:
     recent_our_replies, recent_our_posts = _build_voice_context(
         recent_engagements, recent_posts
@@ -196,6 +200,35 @@ def draft_reply_with_full_context(
     our_thread_note = lookup_our_thread([i for i in all_visible_ids if i])
 
     project_context = load_project_context()
+
+    # Build few-shot style anchors from real engagement data
+    combos_section = ""
+    if top_combos and len(top_combos) >= 3:
+        top_lines = []
+        for c in top_combos:
+            tweet_snippet = (c.get("target_tweet_text") or "")[:120].replace("\n", " ")
+            reply_snippet = (c.get("our_reply_text") or "")[:200].replace("\n", " ")
+            likes = c.get("reply_likes", 0)
+            rts = c.get("reply_rts", 0) or 0
+            back = " + reply back" if c.get("got_reply_back") else ""
+            top_lines.append(f'  [{likes}L {rts}RT{back}] Tweet: "{tweet_snippet}"\n  → Our reply: "{reply_snippet}"')
+
+        combos_section = (
+            "\n\n## Reply style — copy what works, avoid what doesn't\n\n"
+            "**These got real engagement — match this style and voice (don't copy verbatim):**\n\n"
+            + "\n\n".join(top_lines)
+        )
+
+        if bottom_combos:
+            bottom_lines = []
+            for c in bottom_combos:
+                tweet_snippet = (c.get("target_tweet_text") or "")[:120].replace("\n", " ")
+                reply_snippet = (c.get("our_reply_text") or "")[:200].replace("\n", " ")
+                bottom_lines.append(f'  Tweet: "{tweet_snippet}"\n  → Our reply (0 engagement): "{reply_snippet}"')
+            combos_section += (
+                "\n\n**These got zero engagement — avoid this style:**\n\n"
+                + "\n\n".join(bottom_lines)
+            )
 
     # Build author profile section
     author_profile_text = "No profile data available"
@@ -253,7 +286,7 @@ def draft_reply_with_full_context(
 {recent_our_replies or "  (none yet)"}
 
 **Our recent original posts:**
-{recent_our_posts or "  (none yet)"}
+{recent_our_posts or "  (none yet)"}{combos_section}
 
 # Your Task
 1. **Read the FULL conversation context above.** What is the author ACTUALLY saying?
@@ -540,6 +573,9 @@ def main() -> int:
                         )
                         return 0
 
+            top_combos = get_top_reply_combos(conn, limit=20)
+            bottom_combos = get_bottom_reply_combos(conn, limit=10)
+
             # Shuffle before filtering so all search terms get equal representation
             random.shuffle(candidates)
 
@@ -640,7 +676,7 @@ def main() -> int:
                 tweet_text = (ctx.get("text") or "")[:120]
                 print(f"  [{tid}] Asking LLM to analyze: {tweet_text!r}", flush=True)
                 dec = draft_reply_with_full_context(
-                    cand, ctx, recent_engagements, recent_posts
+                    cand, ctx, recent_engagements, recent_posts, top_combos, bottom_combos
                 )
                 if dec is not None:
                     cache_decision(decision_cache, tid, dec)

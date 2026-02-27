@@ -41,6 +41,7 @@ from db import (
     get_recent_posts,
     get_recent_engagements,
     get_top_posts,
+    get_popular_candidate_tweets,
     insert_post,
 )
 
@@ -219,11 +220,40 @@ def draft_batch(conn) -> list[dict]:
     research = load_morning_research()
     recent_posts_db = get_recent_posts(conn, days=14, limit=12)
     recent_engagements_db = get_recent_engagements(conn, hours=168, limit=15)
+    top_posts_db = get_top_posts(conn, limit=20)
+    popular_candidates_db = get_popular_candidate_tweets(conn, days=30, limit=25)
 
     # Extended history: last 12 posts for better dedup and thematic continuity
     recent_posts = [p.get("text", "")[:200] for p in recent_posts_db]
     recent_commits = get_recent_commits(6)
     engagement_themes = _get_engagement_themes(recent_engagements_db, n=15)
+
+    # Build top-posts style anchor (only include entries with real engagement data)
+    top_posts_with_stats = [p for p in top_posts_db if (p.get("likes") or 0) + (p.get("rts") or 0) > 0]
+    top_posts_section = ""
+    if top_posts_with_stats:
+        lines = []
+        for p in top_posts_with_stats:
+            likes = p.get("likes") or 0
+            rts = p.get("rts") or 0
+            text = (p.get("text") or "").replace("\n", " ")
+            lines.append(f"  [{likes}L {rts}RT] {text}")
+        top_posts_section = "\n## Posts that got the most engagement — write in this style and voice:\n" + "\n".join(lines)
+
+    # Build popular candidate tweets section (trending topics in our target space)
+    popular_candidates_section = ""
+    if popular_candidates_db:
+        lines = []
+        for c in popular_candidates_db:
+            likes = c.get("likes") or 0
+            rts = c.get("retweets") or 0
+            text = (c.get("text") or "").replace("\n", " ")
+            lines.append(f"  [{likes}L {rts}RT] {text}")
+        popular_candidates_section = (
+            "\n## What's getting traction in the space right now"
+            " — use as angle/topic inspiration only, don't copy verbatim:\n"
+            + "\n".join(lines)
+        )
 
     project_context = load_project_context()
 
@@ -271,7 +301,8 @@ Bad: "Should you rewrite a clearly broken system?" Good: "300ms P99, 2 engineers
 
 ## Recent posts — AVOID repeating these angles (last 12):
 {json.dumps(recent_posts, indent=2)}
-
+{top_posts_section}
+{popular_candidates_section}
 ## Audience engagement signal — active topics recently:
 {json.dumps(engagement_themes, indent=2) if engagement_themes else "  (no data yet)"}
 Use as inspiration for fresh angles only — don't repeat same framing.
@@ -399,10 +430,38 @@ def draft_single(conn) -> dict | None:
     """Draft a single tweet using the proven single-tweet prompt. Fallback for batch failures."""
     recent_posts_db = get_recent_posts(conn, days=14, limit=12)
     recent_engagements_db = get_recent_engagements(conn, hours=168, limit=10)
+    top_posts_db = get_top_posts(conn, limit=20)
+    popular_candidates_db = get_popular_candidate_tweets(conn, days=30, limit=25)
 
     recent_posts = [p.get("text", "")[:200] for p in recent_posts_db]
     engagement_themes = _get_engagement_themes(recent_engagements_db, n=10)
     research = load_morning_research()
+
+    top_posts_with_stats = [p for p in top_posts_db if (p.get("likes") or 0) + (p.get("rts") or 0) > 0]
+    top_posts_section = ""
+    if top_posts_with_stats:
+        lines = []
+        for p in top_posts_with_stats:
+            likes = p.get("likes") or 0
+            rts = p.get("rts") or 0
+            text = (p.get("text") or "").replace("\n", " ")
+            lines.append(f"  [{likes}L {rts}RT] {text}")
+        top_posts_section = "\n## Posts that got the most engagement — write in this style and voice:\n" + "\n".join(lines) + "\n"
+
+    popular_candidates_section = ""
+    if popular_candidates_db:
+        lines = []
+        for c in popular_candidates_db:
+            likes = c.get("likes") or 0
+            rts = c.get("retweets") or 0
+            text = (c.get("text") or "").replace("\n", " ")
+            lines.append(f"  [{likes}L {rts}RT] {text}")
+        popular_candidates_section = (
+            "\n## What's getting traction in the space right now"
+            " — use as angle/topic inspiration only, don't copy verbatim:\n"
+            + "\n".join(lines)
+            + "\n"
+        )
 
     project_context = load_project_context()
 
@@ -439,7 +498,8 @@ A realistic scenario with no obvious correct answer. Forces the reader to pick a
 
 ## Recent posts — avoid repeating these angles (last 12):
 {json.dumps(recent_posts, indent=2)}
-
+{top_posts_section}
+{popular_candidates_section}
 ## Audience engagement signal:
 {json.dumps(engagement_themes, indent=2) if engagement_themes else "  (no data yet)"}
 

@@ -563,6 +563,90 @@ def get_top_posts(conn, limit: int = 20) -> list[dict]:
         return [dict(row) for row in cur.fetchall()]
 
 
+def get_top_reply_combos(conn, limit: int = 20) -> list[dict]:
+    """Fetch top-performing (tweet → our reply) pairs ranked by reply engagement.
+
+    Used as few-shot style anchors in the reply drafting prompt — the LLM copies
+    what already worked rather than following abstract rules.
+
+    Only returns rows where we have actual positive engagement (reply_likes > 0)
+    and both tweet text and our reply text are stored.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT target_tweet_text,
+                   our_reply_text,
+                   target_username,
+                   reply_likes,
+                   reply_rts,
+                   got_reply_back
+            FROM engagements
+            WHERE reply_likes > 0
+              AND our_reply_text IS NOT NULL
+              AND target_tweet_text IS NOT NULL
+            ORDER BY (reply_likes + COALESCE(reply_rts, 0)) DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def get_bottom_reply_combos(conn, limit: int = 5) -> list[dict]:
+    """Fetch zero-engagement (tweet → our reply) pairs as negative examples.
+
+    Random sample of perf-checked replies that got no likes, no RTs, and no
+    reply back — shown alongside top combos so the LLM can see what falls flat.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT target_tweet_text,
+                   our_reply_text,
+                   target_username,
+                   reply_likes,
+                   reply_rts,
+                   got_reply_back
+            FROM engagements
+            WHERE perf_checked_at IS NOT NULL
+              AND (reply_likes IS NULL OR reply_likes = 0)
+              AND (reply_rts IS NULL OR reply_rts = 0)
+              AND got_reply_back = FALSE
+              AND our_reply_text IS NOT NULL
+              AND target_tweet_text IS NOT NULL
+            ORDER BY RANDOM()
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def get_popular_candidate_tweets(conn, days: int = 30, limit: int = 25) -> list[dict]:
+    """Fetch high-engagement tweets from candidate_queue as topic inspiration.
+
+    These are tweets by others in our target space that got real traction —
+    useful as angle/topic inspiration when drafting original posts.
+    Only returns tweets with at least 1 like to filter noise.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT author, text, search_term, likes, retweets, replies, tweet_datetime
+            FROM candidate_queue
+            WHERE tweet_datetime >= %s
+              AND likes > 0
+              AND text IS NOT NULL
+            ORDER BY (likes + retweets) DESC
+            LIMIT %s
+            """,
+            (cutoff, limit),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
 def get_posts_for_stats_update(conn, days: int = 30) -> list[dict]:
     """Return posts that need a stats refresh.
 

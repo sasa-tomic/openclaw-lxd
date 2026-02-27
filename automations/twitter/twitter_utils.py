@@ -127,14 +127,15 @@ def load_project_context() -> str:
         content = STRATEGY_PATH.read_text().strip()
         _PROJECT_CONTEXT_CACHE["mtime"] = mtime
         _PROJECT_CONTEXT_CACHE["content"] = content
-        return content
     except Exception as e:
         logger.debug(f"load_project_context failed: {e}")
-        return (
+        content = (
             "Account: @DecentCloud_org — building a P2P cloud compute marketplace "
             "(like Airbnb for compute/GPUs). Founder voice. Phase 1: no product "
             "mentions, no links, no hashtags. Build reply reputation first."
         )
+
+    return content
 
 
 # AI bots and known noise accounts — engaging wastes quota and builds no reputation
