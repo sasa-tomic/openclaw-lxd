@@ -8,3 +8,4 @@ chrome-openclaw/
 .vscode/
 **/_debug/
 **/__pycache__/
+worktrees/
