@@ -40,6 +40,7 @@ from db import (
     count_posts_today,
     get_recent_posts,
     get_recent_engagements,
+    get_top_posts,
     insert_post,
 )
 
@@ -89,36 +90,93 @@ def save_queue(queue: list[dict]) -> None:
     tmp.replace(QUEUE_PATH)
 
 
-def score_tweet(text: str) -> float:
-    """Score a tweet draft with simple quality heuristics. Returns 0.0-1.0."""
-    score = 0.5  # baseline
-    # Specificity signals (numbers, comparisons)
-    if re.search(r"\d", text):
-        score += 0.15
-    # Shorter is punchier
-    if len(text) < 180:
-        score += 0.1
-    elif len(text) > 250:
-        score -= 0.1
-    # Controversial/opinion markers
-    if any(
-        w in text.lower()
-        for w in [
-            "nobody",
-            "everyone",
-            "myth",
-            "scam",
-            "lie",
-            "truth",
-            "wrong",
-            "actually",
-        ]
-    ):
-        score += 0.1
-    # Questions score lower (less viral)
-    if "?" in text:
-        score -= 0.1
-    return min(1.0, max(0.0, score))
+def llm_rank_candidates(candidates: list[dict], top_posts: list[dict]) -> list[dict]:
+    """Rank unposted candidates by predicted engagement using a single LLM call.
+
+    Returns candidates sorted best-first, each with an 'llm_score' (0-10) added.
+    Falls back to original order if the LLM call fails.
+    """
+    if not candidates:
+        return candidates
+
+    # Format top posts as engagement reference
+    top_posts_text = ""
+    if top_posts:
+        lines = []
+        for p in top_posts:
+            likes = p.get("likes") or 0
+            rts = p.get("rts") or 0
+            text = (p.get("text") or "").replace("\n", " ")
+            lines.append(f"  [{likes}L {rts}RT] {text}")
+        top_posts_text = "\n".join(lines)
+
+    # Format candidates with IDs
+    candidate_lines = []
+    for i, c in enumerate(candidates):
+        label = f"C{i+1}"
+        text = (c.get("text") or "").replace("\n", " ")
+        candidate_lines.append(f"[{label}] {text}")
+    candidates_text = "\n\n".join(candidate_lines)
+
+    prompt = f"""You are scoring tweet drafts for @DecentCloud_org by predicted engagement.
+
+## What high-engagement looks like for this account
+These are the best-performing posts by likes+retweets. Learn the patterns:
+
+{top_posts_text if top_posts_text else "  (no historical data yet)"}
+
+## Candidates to score
+
+{candidates_text}
+
+## Scoring task
+
+Score each candidate from 0 to 10:
+- 10 = will almost certainly spark real discussion, strong opinions, or go viral in the infra/cloud space
+- 7-9 = solid, likely to get genuine replies or retweets from practitioners
+- 4-6 = decent but forgettable, might get a few likes
+- 1-3 = generic, obvious, preaching to the choir, or no hook
+- 0 = actively bad (wrong tone, product shill, AI-sounding fluff)
+
+Judge on: specificity of the claim, strength of the tension or insight, how much it forces a reaction.
+Do NOT reward safe takes. Reward posts where a senior engineer has a genuine opinion either way.
+
+Output ONLY a JSON array — one object per candidate, in the same order:
+[{{"id": "C1", "score": 8, "reason": "one short sentence"}}, ...]"""
+
+    try:
+        raw = call_llm(prompt, timeout=60)
+        if not raw:
+            print("LLM ranking returned nothing, using original order", file=sys.stderr)
+            return candidates
+
+        json_str = extract_json(raw)
+        if not json_str:
+            # Try finding a JSON array directly
+            import re as _re
+            m = _re.search(r'\[.*\]', raw, _re.DOTALL)
+            json_str = m.group(0) if m else None
+        if not json_str:
+            print("Could not parse LLM ranking response, using original order", file=sys.stderr)
+            return candidates
+
+        scores = json.loads(json_str)
+        score_map = {s["id"]: s["score"] for s in scores if "id" in s and "score" in s}
+
+        for i, c in enumerate(candidates):
+            label = f"C{i+1}"
+            c["llm_score"] = score_map.get(label, 0)
+            if label in score_map:
+                reason = next((s.get("reason", "") for s in scores if s.get("id") == label), "")
+                if reason:
+                    print(f"  {label} (score={c['llm_score']}): {reason}", flush=True)
+
+        ranked = sorted(candidates, key=lambda c: c.get("llm_score", 0), reverse=True)
+        return ranked
+
+    except Exception as e:
+        print(f"LLM ranking failed: {e}, using original order", file=sys.stderr)
+        return candidates
 
 
 def load_morning_research() -> dict | None:
@@ -186,13 +244,30 @@ def draft_batch(conn) -> list[dict]:
     if not research_text and recent_commits:
         commits_text = "\n".join(f"- {c}" for c in recent_commits[:4])
 
-    prompt = f"""Generate 4 short original takes for a technical Twitter account.
+    prompt = f"""Generate 4 original posts for a technical Twitter account. Mix two formats.
 
 # Project & Strategy Context
 {project_context}
 
 # Your Task
-Draft 4 tweets. Each must be a DIFFERENT angle. Strictly follow the phase rules above.
+Draft 4 posts. Use a mix of Format A and Format B (at least 1 of each). Each must be a DIFFERENT topic and angle.
+
+## Format A — Observational take (short, 1–4 sentences)
+Describe something real that most people haven't noticed or named.
+Structure: setup (what people assume) → reality (what actually happens, with numbers) → implication (let it land).
+NOT imperative. Never "make sure you", "you should". Describe; don't instruct.
+Example: "Stripe can quietly hold back 10% of your revenue for up to 6 months if their system flags your account — rapid growth is often enough to trigger it."
+
+## Format B — Engineering dilemma (longer, structured, ends with a question)
+A realistic scenario with no obvious correct answer. Forces the reader to pick a side.
+Requirements:
+- Concrete system snapshot: team size, traffic/RPS, deploy time, incidents/month, DB shape
+- At least one time or org constraint (deadline, hiring freeze, audit requirement)
+- At least one contradictory signal ("it works fine, but…")
+- Both options clearly defensible — no cartoon villain choice
+- Ends with 1–2 direct decision questions
+The question must NOT have an obvious right answer. A senior engineer must be able to argue either side confidently.
+Bad: "Should you rewrite a clearly broken system?" Good: "300ms P99, 2 engineers, Series A in 3 months — do you start the migration or wait?"
 
 ## Recent posts — AVOID repeating these angles (last 12):
 {json.dumps(recent_posts, indent=2)}
@@ -201,23 +276,15 @@ Draft 4 tweets. Each must be a DIFFERENT angle. Strictly follow the phase rules 
 {json.dumps(engagement_themes, indent=2) if engagement_themes else "  (no data yet)"}
 Use as inspiration for fresh angles only — don't repeat same framing.
 
-{f"## Trending today (inspiration only — NO links in tweets):{chr(10)}{research_text}" if research_text else ""}
+{f"## Trending today (inspiration only — NO links in posts):{chr(10)}{research_text}" if research_text else ""}
 {f"## Recent dev activity (for inspiration):{chr(10)}{commits_text}" if commits_text else ""}
 
-## Voice & Style (see STRATEGY.md for full reference with examples)
-- Observational, not imperative — describe what happens, don't instruct the reader
-- Short sentences, each doing one job — but enough detail to be genuinely useful
-- Specific details over generic takes: numbers, timeframes, concrete mechanics
-- Peer voice — like explaining something to a knowledgeable friend, not a blog post
-- NOT: "Make sure you read Stripe's reserve policy" / "Switch to an authenticator app"
-- YES: "Stripe can hold 10% of your revenue for 6 months. Rapid growth often triggers it."
-
-## Constraints
-- Up to 280 characters per post
+## Rules for all posts
 - Standard sentence capitalization: capitalize the first word and proper nouns (AWS, GCP, Stripe, etc.)
-- Each tweet distinctly different in topic and angle
+- No hashtags, no links, no product mentions, no "Decent Cloud" references
+- No AI vocabulary: "Furthermore", "Additionally", "It's important to note that"
 
-Output as JSON array: ["tweet1", "tweet2", "tweet3", "tweet4"]
+Output as JSON array of 4 strings: ["post1", "post2", "post3", "post4"]
 Output ONLY the JSON array. No explanation, no markdown wrapping."""
 
     try:
@@ -299,8 +366,8 @@ Output ONLY the JSON array. No explanation, no markdown wrapping."""
             text = text.strip().strip('"').strip("'")
             # Strip LLM categorization prefixes like "(Observation/DR)", "(Technical insight)", etc.
             text = re.sub(r"^\([^)]{3,30}\)\s*", "", text).strip()
-            if not text or len(text) > 280 or len(text) < 20:
-                print(f"Batch draft rejected: length={len(text)}", file=sys.stderr)
+            if not text or len(text) < 20:
+                print(f"Batch draft rejected: too short ({len(text)} chars)", file=sys.stderr)
                 continue
             if has_product_mention(text):
                 print(
@@ -312,7 +379,7 @@ Output ONLY the JSON array. No explanation, no markdown wrapping."""
                 {
                     "text": text,
                     "draftedAt": now,
-                    "score": score_tweet(text),
+                    "llm_score": 0,  # set at selection time by llm_rank_candidates()
                     "posted": False,
                 }
             )
@@ -350,37 +417,39 @@ def draft_single(conn) -> dict | None:
         if parts:
             research_text = "\n".join(parts)
 
-    prompt = f"""You are drafting a short original take for a technical Twitter account.
+    prompt = f"""You are drafting one original post for a technical Twitter account.
 
 # Project & Strategy Context
 {project_context}
 
 # Your Task
-Draft ONE tweet. Strictly follow the phase rules above.
+Draft ONE post. Choose whichever format below produces the strongest result.
+
+## Format A — Observational take (short, 1–4 sentences)
+Describe something real that most people haven't noticed or named.
+Structure: setup (what people assume) → reality (with numbers/specifics) → implication (let it land, don't prescribe a fix).
+NOT imperative. Never "make sure you", "you should". Describe; don't instruct.
+
+## Format B — Engineering dilemma (longer, structured, ends with a question)
+A realistic scenario with no obvious correct answer. Forces the reader to pick a side.
+- Concrete system snapshot (team size, traffic, deploy time, incidents, DB shape)
+- At least one time or org constraint and one contradictory signal
+- Both options defensible — no cartoon villain choice
+- Ends with 1–2 direct decision questions with no obvious right answer
 
 ## Recent posts — avoid repeating these angles (last 12):
 {json.dumps(recent_posts, indent=2)}
 
-## Audience engagement signal — active topics recently:
+## Audience engagement signal:
 {json.dumps(engagement_themes, indent=2) if engagement_themes else "  (no data yet)"}
-Use as inspiration for fresh angles, but don't repeat the same framing.
 
-{f"## Trending today (inspiration only — NO links in tweets):{chr(10)}{research_text}" if research_text else ""}
+{f"## Trending today (inspiration only — NO links):{chr(10)}{research_text}" if research_text else ""}
 
-## Voice & Style (see STRATEGY.md for full reference with examples)
-- Observational, not imperative — describe what happens, don't instruct the reader
-- Short sentences, each doing one job — but enough detail to be genuinely useful
-- Specific details: numbers, timeframes, concrete mechanics over generic takes
-- Peer voice — like explaining something to a knowledgeable friend, not a blog post
+## Rules
+- Standard sentence capitalization: capitalize first word and proper nouns (AWS, GCP, Stripe, etc.)
+- No hashtags, no links, no product mentions, no "Decent Cloud" references
 
-## Constraints
-- 1-2 sentences max
-- Under 260 characters
-- Standard sentence capitalization: capitalize the first word and proper nouns (AWS, GCP, Stripe, etc.)
-
-Output ONLY the tweet text. No quotes, no JSON, no markdown.
-
-Tweet:"""
+Output ONLY the post text. No quotes, no JSON, no markdown."""
 
     try:
         text = call_llm(prompt, timeout=120)
@@ -402,7 +471,7 @@ Tweet:"""
             candidates = [
                 l
                 for l in lines
-                if 20 <= len(l) <= 280
+                if len(l) >= 20
                 and not l.startswith("*")
                 and not l.startswith("#")
             ]
@@ -411,7 +480,7 @@ Tweet:"""
             elif lines:
                 text = lines[-1]
 
-        if not text or len(text) > 280 or len(text) < 20:
+        if not text or len(text) < 20:
             return None
         if has_product_mention(text):
             return None
@@ -419,7 +488,7 @@ Tweet:"""
         return {
             "text": text,
             "draftedAt": datetime.now(timezone.utc).isoformat(),
-            "score": score_tweet(text),
+            "llm_score": 0,  # set at selection time by llm_rank_candidates()
             "posted": False,
         }
     except Exception as e:
@@ -481,11 +550,14 @@ def main() -> int:
                 print("No tweets available in queue")
                 return 1
 
-            # Pick the highest-scored unposted entry
-            best = max(unposted, key=lambda e: e.get("score", 0))
+            # Rank all unposted candidates with a single LLM call
+            top_posts = get_top_posts(conn, limit=20)
+            print(f"Ranking {len(unposted)} candidates against {len(top_posts)} top posts...", flush=True)
+            ranked = llm_rank_candidates(unposted, top_posts)
+            best = ranked[0]
             draft = best["text"]
             print(
-                f"Selected (score={best.get('score', 0):.2f}): {draft[:80]}...", flush=True
+                f"Selected (llm_score={best.get('llm_score', '?')}): {draft[:80]}...", flush=True
             )
 
             # Humanize (mandatory per strategy doc)

@@ -539,6 +539,22 @@ def insert_post(
         )
 
 
+def get_top_posts(conn, limit: int = 20) -> list[dict]:
+    """Fetch top-performing posts ordered by total engagement (likes + rts)."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT text, likes, rts, posted_at
+            FROM posts
+            WHERE text IS NOT NULL
+            ORDER BY (COALESCE(likes, 0) + COALESCE(rts, 0)) DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
 def get_recent_posts(conn, days: int = 7, limit: int = 50) -> list[dict]:
     """Fetch posts from the last N days."""
     since = datetime.now(timezone.utc) - timedelta(days=days)

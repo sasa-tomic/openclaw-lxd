@@ -31,21 +31,40 @@ sys.path.insert(0, "/projects/automations")
 _twitter_utils_stub = mock.MagicMock()
 _twitter_utils_stub.BLOCKED_AUTHORS = []
 _twitter_utils_stub.is_junk.return_value = False
-sys.modules.setdefault("twitter_utils", _twitter_utils_stub)
 
 _lib_llm_stub = mock.MagicMock()
-sys.modules.setdefault("lib", mock.MagicMock())
-sys.modules.setdefault("lib.llm_utils", _lib_llm_stub)
-sys.modules.setdefault("lib.config", mock.MagicMock())
 
 import importlib.util
 
 TARGET_MONITOR_PATH = Path("/projects/automations/twitter/target_monitor.py")
+
+# Temporarily inject stubs so target_monitor's module-level imports get the fakes.
+# We save and restore sys.modules to avoid polluting the process-wide module cache,
+# which would cause other test files (e.g. test_engagement_integration.py) to
+# receive MagicMock objects when they load twitter_utils fresh via importlib.
+_saved_modules = {}
+for _key, _stub in [
+    ("twitter_utils", _twitter_utils_stub),
+    ("lib", mock.MagicMock()),
+    ("lib.llm_utils", _lib_llm_stub),
+    ("lib.config", mock.MagicMock()),
+]:
+    _saved_modules[_key] = sys.modules.get(_key)
+    sys.modules[_key] = _stub
+
 spec = importlib.util.spec_from_file_location("target_monitor", TARGET_MONITOR_PATH)
 tm = importlib.util.module_from_spec(spec)
 tm.call_llm = _lib_llm_stub.call_llm_simple
 tm.extract_json = _lib_llm_stub.extract_json
 spec.loader.exec_module(tm)
+
+# Restore sys.modules to pre-stub state so later imports get the real modules.
+for _key, _orig in _saved_modules.items():
+    if _orig is None:
+        sys.modules.pop(_key, None)
+    else:
+        sys.modules[_key] = _orig
+del _saved_modules, _key, _stub, _orig
 
 # Patch module-level helpers that call external services
 tm.is_junk = mock.MagicMock(return_value=False)

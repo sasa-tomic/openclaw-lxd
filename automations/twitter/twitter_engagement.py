@@ -764,6 +764,9 @@ def main() -> int:
 
         return 0
 
+    except KeyboardInterrupt:
+        print("\nEngagement interrupted by signal — exiting cleanly.", file=sys.stderr)
+        return 1
     except Exception as e:
         send_error_alert(f"Autonomous engagement failed: {e}")
         print(f"ERROR: {e}", file=sys.stderr)
