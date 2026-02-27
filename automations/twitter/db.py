@@ -454,6 +454,27 @@ def get_recent_engagements(conn, hours: int = 24, limit: int = 100) -> list[dict
         return [dict(row) for row in cur.fetchall()]
 
 
+def get_engagements_with_user(conn, username: str, limit: int = 10) -> list[dict]:
+    """Fetch our most recent engagements with a specific user (DB only, no API calls).
+
+    Returns list of dicts with: tweet_id, target_tweet_text, our_reply_text,
+    replied_at, got_reply_back — newest first.
+    Uses the existing idx_eng_user index.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT tweet_id, target_tweet_text, our_reply_text, replied_at, got_reply_back
+            FROM engagements
+            WHERE LOWER(target_username) = LOWER(%s)
+            ORDER BY replied_at DESC
+            LIMIT %s
+            """,
+            (username, limit),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
 def get_engagements_for_perf_check(conn) -> list[dict]:
     """Fetch engagements that need a performance stats refresh.
 

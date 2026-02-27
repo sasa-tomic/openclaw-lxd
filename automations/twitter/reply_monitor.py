@@ -35,6 +35,7 @@ from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from db import (
     get_conn,
     get_engaged_tweet_ids,
+    get_engagements_with_user,
     get_our_thread_context,
     get_recent_engagements,
     get_recent_posts,
@@ -216,6 +217,7 @@ def draft_mention_reply(
     recent_engagements: list[dict],
     recent_posts: list[dict],
     is_direct_reply: bool,
+    prior_exchanges: list[dict] | None = None,
 ) -> dict | None:
     """Draft a reply to a mention/reply via LLM.
 
@@ -242,13 +244,14 @@ def draft_mention_reply(
         lines = [f'  - "{(p.get("text") or "")[:120]}"' for p in posts]
         recent_our_posts_text = "\n".join(lines)
 
-    # Conversation ancestry
+    # Conversation ancestry — read from oldest (root) to newest so the LLM sees the
+    # full arc in chronological order, not reversed.
     parent_chain_text = "None (original tweet, not a reply)"
     if tweet_context.get("parentChain"):
         parts = []
-        for p in tweet_context["parentChain"]:
-            parts.append(f'@{p.get("username", "?")} said: "{p.get("text", "")}"')
-        parent_chain_text = " -> ".join(parts)
+        for i, p in enumerate(tweet_context["parentChain"], 1):
+            parts.append(f'  [{i}] @{p.get("username", "?")} said: "{p.get("text", "")}"')
+        parent_chain_text = "\n".join(parts)
 
     # Other replies in the thread
     other_replies_text = "None visible yet"
@@ -269,29 +272,26 @@ def draft_mention_reply(
             all_visible_ids.append(t["id"])
     our_thread_note = get_our_thread_context(conn, [i for i in all_visible_ids if i])
 
+    # Prior exchanges with this specific person (from DB — no API calls)
+    prior_exchanges_text = "None on record."
+    if prior_exchanges:
+        lines = []
+        for ex in prior_exchanges:
+            their_tweet = (ex.get("target_tweet_text") or "")[:120]
+            our_reply = (ex.get("our_reply_text") or "")[:120]
+            got_reply = ex.get("got_reply_back", False)
+            lines.append(
+                f'  - They said: "{their_tweet}" | We replied: "{our_reply}"'
+                + (" | They replied back ✓" if got_reply else "")
+            )
+        prior_exchanges_text = "\n".join(lines)
+
     project_context = load_project_context()
 
     if is_direct_reply:
-        engagement_instruction = """This person DIRECTLY REPLIED to one of our tweets. Ignoring them is bad UX and kills conversation momentum. You MUST reply unless the content is pure spam.
-
-Your goal: **Continue the conversation naturally.** Acknowledge what they said and build on it. Be warm, direct, specific. No generic platitudes.
-
-Decision threshold: Reply unless it's spam/gibberish. Low bar to engage here."""
+        engagement_threshold = """This person DIRECTLY REPLIED to one of our tweets. High priority to continue the conversation — but only if the reply makes sense in context."""
     else:
-        engagement_instruction = """This is a cold mention of @DecentCloud_org. Apply normal quality filter.
-
-Engage if:
-- They're asking a genuine question relevant to our space (cloud, compute, marketplace, p2p)
-- They're expressing a real pain point we can speak to
-- There's an opportunity to add value and build reputation
-
-Skip if:
-- It's noise/spam/promo
-- Vague with nothing to add to
-- Engaging would feel forced or off-topic
-- Our only possible reply is pure validation ("so true!") with no new angle — they won't write back
-
-**Conversation likelihood check (cold mentions only):** Would the author actually reply to our specific response, or just like it and scroll on? If we can't say anything non-obvious or directly useful, skip it."""
+        engagement_threshold = """This is a cold mention of @DecentCloud_org. Apply normal quality filter: engage only if we can add something specific and genuinely useful to the discussion."""
 
     prompt = f"""You are the voice of @DecentCloud_org on Twitter. Someone mentioned or replied to us.
 
@@ -302,54 +302,71 @@ Skip if:
 **Author:** @{tweet_context["author"]} ({tweet_context.get("authorName", "")})
 **Their message:** {tweet_context["text"]}
 **Stats:** {tweet_context["stats"]["likes"]} likes, {tweet_context["stats"]["retweets"]} RTs, {tweet_context["stats"]["replies"]} replies
-
-# Context
 **Is this a direct reply to one of our tweets?** {"YES" if is_direct_reply else "NO (cold mention)"}
 
-**Conversation ancestry (what this tweet is replying to):**
+# Full Thread Context (read top-to-bottom — this is the conversation so far)
+
+**Conversation ancestry — oldest first, newest just before the message above:**
 {parent_chain_text}
 
-**Author's thread continuation (their follow-ups):**
-{json.dumps(tweet_context.get("threadContinuation"), indent=2) if tweet_context.get("threadContinuation") else "None"}
-
-**Other replies in this thread:**
+**Other replies visible in this thread:**
 {other_replies_text}
+
+**Author's own follow-up tweets (thread continuation):**
+{json.dumps(tweet_context.get("threadContinuation"), indent=2) if tweet_context.get("threadContinuation") else "None"}
 
 **Quoted tweet:**
 {json.dumps(tweet_context.get("quotedTweet"), indent=2) if tweet_context.get("quotedTweet") else "None"}
 
-**Cached conversation context (previous exchanges in this thread, if any):**
-{our_thread_note if our_thread_note else "No cached history — first time seeing this conversation."}
+**Our cached thread history (if we're part of this thread already):**
+{our_thread_note if our_thread_note else "Not part of one of our threads."}
 
-# Our Recent Activity (for voice consistency — DO NOT repeat these angles)
+**Our prior exchanges with @{tweet_context["author"]} (from DB — full history):**
+{prior_exchanges_text}
+
+# Our Recent Activity (voice consistency — DO NOT repeat these angles)
 **Our last 8 replies:**
 {recent_our_replies or "  (none yet)"}
 
 **Our recent original posts:**
 {recent_our_posts_text or "  (none yet)"}
 
-# Engagement Decision
-{engagement_instruction}
+# COHERENCE GATE — Apply this BEFORE deciding to engage
 
-# Reply Rules (always apply)
+Read everything above. Then answer internally:
+1. **What is this conversation actually about?** Reconstruct the topic from the full thread (ancestry + other replies + their message). If you cannot state a clear topic in one sentence, do not engage.
+2. **What is the register?** Is this a technical debate, a casual joke exchange, venting, sarcasm, banter? Your reply must match that register. A deadpan expert take into a joke thread is as bad as a joke into a serious debate.
+3. **What did WE say before, and how did it land?** Check "Prior exchanges with this person" above. If we've already had one or more exchanges in this thread and the tone suggests we were called out, corrected, or the person is frustrated with us, apply maximum scrutiny — it is usually better to stay silent than to double down.
+4. **What exactly are they saying to us?** Not the topic in general — specifically, what is their message in the context of the full thread? Reply to THAT, not to your own interpretation of the general topic.
+
+You MUST qualify for one of these two modes to engage:
+
+**Mode A — Sharp standalone take:** You have a specific fact, honest observation, or a genuinely funny/cynical line that works even for someone who hasn't read the whole thread. It earns likes from the audience on its own merits. It does NOT contradict or miss the point of what was actually said.
+
+**Mode B — Coherent continuation:** You understand exactly what was said and your reply clearly follows from and advances this specific conversation. Someone reading the thread would see your reply as a natural, on-point next step — not a tangent, not a repeat of something already said, not an expert monologue into casual banter.
+
+If you cannot confidently qualify for Mode A or Mode B, set shouldEngage: false.
+
+# Engagement Threshold
+{engagement_threshold}
+
+# Reply Rules (always apply when engaging)
 - 1-2 sentences max, under 280 chars
 - Observational voice, not imperative — describe what's happening, don't tell them what to do
-- Name the underlying mechanic with specifics — numbers, timeframes, concrete details
-- Peer voice — knowledgeable friend, not a brand account or security blog
-- NOT: "you should switch to an authenticator app" — YES: "SMS codes route through your carrier. a SIM swap reroutes them to someone else."
+- Peer voice — knowledgeable friend, not a brand account
 - NO product mentions ("DecentCloud", our product) in Phase 1
-- NO hashtags, NO links
-- NO "check us out", NO "follow for updates", NO generic questions
-- If they asked a question, answer it directly and with specific detail
-- If they made a point, engage with THAT point — add a non-obvious angle, name the mechanic, push back with facts
-- profileClickWorthy check: only reply if you're adding a specific fact, a non-obvious angle, or a well-supported pushback. Pure validation ("so true", "exactly", "been there", "this is real") fails this check regardless of conversation likelihood.
+- NO hashtags, NO links, NO "check us out", NO "follow for updates"
+- If they asked a question, answer it directly and specifically
+- profileClickWorthy: only true if you're adding a specific fact, a non-obvious angle, or a well-supported pushback. Pure validation fails this check regardless.
 
 # Output Format (JSON)
 {{
   "shouldEngage": true/false,
   "conversationLikelihood": 1-10,
   "profileClickWorthy": true/false,
-  "reasoning": "brief explanation",
+  "mode": "A" or "B" (which mode qualifies this reply, or null if not engaging),
+  "threadSummary": "one sentence: what is this conversation actually about",
+  "reasoning": "brief explanation of decision",
   "reply": "draft reply text here" (or null if shouldEngage is false)
 }}
 
@@ -525,11 +542,14 @@ def main() -> int:
                     flush=True,
                 )
 
+                # Fetch prior exchanges with this author from DB (no API calls)
+                prior_exchanges = get_engagements_with_user(conn, author)
+
                 # LLM drafts the reply
                 print("  Asking LLM to draft reply...", flush=True)
                 decision = draft_mention_reply(
                     mention, tweet_context, recent_engagements, recent_posts,
-                    is_direct_reply
+                    is_direct_reply, prior_exchanges
                 )
 
                 if not decision or not decision.get("shouldEngage"):

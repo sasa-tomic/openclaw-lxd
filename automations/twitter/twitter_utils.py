@@ -1160,7 +1160,7 @@ def fetch_tweet_context(tweet_id: str) -> dict | None:
 
   // Parent chain: articles BEFORE the main tweet (conversation ancestry)
   const parentChain = [];
-  for (let i = 0; i < mainIdx && parentChain.length < 3; i++) {{
+  for (let i = 0; i < mainIdx && parentChain.length < 10; i++) {{
     const pUser = getUsername(articles[i]);
     const pText = getText(articles[i]);
     if (pText && pUser) {{

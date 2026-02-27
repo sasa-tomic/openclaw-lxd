@@ -35,6 +35,7 @@ from db import (
     ensure_schema,
     get_conn,
     get_engaged_tweet_ids,
+    get_engagements_with_user,
     get_our_thread_context,
     get_queued_candidates,
     get_recent_engagements,
@@ -169,16 +170,16 @@ def draft_reply_with_full_context(
         recent_engagements, recent_posts
     )
 
-    # Build full conversation context sections
+    # Build full conversation context sections — oldest (root) first for clarity
     parent_chain_text = "None (original tweet, not a reply)"
     if tweet_context.get("parentChain"):
         parts = []
-        for p in tweet_context["parentChain"]:
-            parts.append(f'@{p.get("username", "?")} said: "{p.get("text", "")}"')
-        parent_chain_text = " -> ".join(parts)
+        for i, p in enumerate(tweet_context["parentChain"], 1):
+            parts.append(f'  [{i}] @{p.get("username", "?")} said: "{p.get("text", "")}"')
+        parent_chain_text = "\n".join(parts)
     elif tweet_context.get("replyTo"):
         rt = tweet_context["replyTo"]
-        parent_chain_text = f'@{rt.get("username", "?")} said: "{rt.get("text", "")}"'
+        parent_chain_text = f'  [1] @{rt.get("username", "?")} said: "{rt.get("text", "")}"'
 
     other_replies_text = "None visible yet"
     if tweet_context.get("otherReplies"):
@@ -190,6 +191,21 @@ def draft_reply_with_full_context(
 
     # Thread context pre-fetched in Phase A and stored on tweet_context
     our_thread_note = tweet_context.get("ourThreadContext")
+
+    # Prior exchanges with this author (fetched from DB in Phase A)
+    prior_exchanges_text = "None on record."
+    prior_exchanges = tweet_context.get("priorExchanges") or []
+    if prior_exchanges:
+        lines = []
+        for ex in prior_exchanges:
+            their_tweet = (ex.get("target_tweet_text") or "")[:120]
+            our_reply = (ex.get("our_reply_text") or "")[:120]
+            got_reply = ex.get("got_reply_back", False)
+            lines.append(
+                f'  - They said: "{their_tweet}" | We replied: "{our_reply}"'
+                + (" | They replied back ✓" if got_reply else "")
+            )
+        prior_exchanges_text = "\n".join(lines)
 
     project_context = load_project_context()
 
@@ -256,129 +272,103 @@ def draft_reply_with_full_context(
 # Author Profile (determine if they're target audience)
 {author_profile_text}
 
-# Full Conversation Context (READ THIS CAREFULLY)
+# Full Conversation Context (read top-to-bottom — this is the full thread so far)
 
-**Conversation ancestry (what this tweet is replying to):**
+**Conversation ancestry — oldest first, leading up to the tweet above:**
 {parent_chain_text}
-
-**Author's thread continuation (their own follow-up tweets):**
-{json.dumps(tweet_context.get("threadContinuation"), indent=2) if tweet_context.get("threadContinuation") else "None (single tweet or no continuation yet)"}
 
 **Other replies already in this thread (what others have said):**
 {other_replies_text}
 
+**Author's own follow-up tweets:**
+{json.dumps(tweet_context.get("threadContinuation"), indent=2) if tweet_context.get("threadContinuation") else "None (single tweet or no continuation yet)"}
+
 **Quoted tweet:**
 {json.dumps(tweet_context.get("quotedTweet"), indent=2) if tweet_context.get("quotedTweet") else "None"}
 
-**Our thread this tweet is part of (FULL NOTE — read every tweet before replying):**
+**Our thread this tweet is part of (our own cached context):**
 {our_thread_note if our_thread_note else "Not part of one of our threads."}
 
-# Our Recent Activity (for voice consistency — DO NOT repeat these angles)
+**Our prior exchanges with @{tweet_context["author"]} (full DB history — not just today):**
+{prior_exchanges_text}
 
+# Our Recent Activity (voice consistency — DO NOT repeat these angles)
 **Our last 8 replies:**
 {recent_our_replies or "  (none yet)"}
 
 **Our recent original posts:**
 {recent_our_posts or "  (none yet)"}{combos_section}
 
-# Your Task
-1. **Read the FULL conversation context above.** What is the author ACTUALLY saying?
-   - Use parent chain + thread continuation to understand the full picture
-   - Check other replies — don't duplicate what's already been said in the thread
-   - Check our recent replies — don't repeat the same angle we already used recently
-   - Check author profile — do they have followers? **Our own account has ~15 followers, so any account with more than 10 followers is a valid target.** Only skip accounts with ≤10 followers. Do NOT dismiss accounts for having "only" hundreds or even low thousands of followers — that's fine at our stage.
-   - If it's a spam/scam account with no real discussion happening, SKIP IT
+# COHERENCE GATE — Apply this FIRST, before everything else
 
-2. **PRIORITIZE engagement opportunities (score 8-10 = must engage):**
-   - Provider support horror stories ("cloud support terrible", "provider ghosted")
-   - Marketplace trust/accountability pain ("can't find a reliable provider", "no way to vet providers")
-   - The matching problem: hard to find the right provider (buy side) or hard to find users (sell side)
-   - Manual work that AI should be automating but isn't yet
-   - **Author likely to engage back** (active account, replies to others, not a content farm)
-   - **Tweet has zero replies** — being first means our reply is pinned at the top and gets maximum visibility
+Read the full thread above. Then answer internally:
 
-   **GOOD (score 6-7):**
-   - Cloud cost complaints, infrastructure philosophy debates, GPU availability/demand
-   - Low or zero engagement on the tweet is fine — **zero replies is actually ideal**, we get top position
-   - Any thread where we can drop a specific fact or honest take that earns likes from the audience
+1. **What is this conversation actually about?** Use the ancestry (oldest to newest) + other replies to reconstruct the full arc. State the topic in one sentence. If you cannot, do not engage.
+2. **What is the register?** Technical debate, casual banter, venting, sarcasm, humor, or something else? Your reply MUST match the register. A deadpan expert take dropped into banter is worse than silence.
+3. **What is the author SPECIFICALLY saying to us or to the thread?** Not the general topic — their exact point in context. Reply to that, not to your interpretation of the broader theme.
+4. **Have we talked to this person before?** See "Prior exchanges" above. If so, does the current message suggest the previous exchange went poorly (they pushed back, corrected us, or seem frustrated)? If yes, apply maximum scrutiny — silence is better than doubling down on a bad take.
+5. **Check other replies in the thread.** Don't repeat a point that's already been made by someone else.
 
-   **SKIP (score <3):**
-   - Author has ≤10 followers (we ourselves have only ~15, so anything above that is real reach)
-   - Already overcrowded threads (>50 replies) where our reply will be buried
-   - No hook at all: our only move would be pure validation with nothing specific to add
+You MUST qualify for one of these two modes to engage:
 
-3. **Rate AUDIENCE engagement potential (1-10) — this is NOT about whether the author will reply:**
-   Ask yourself: will this reply earn likes or follows from *anyone* reading the thread?
+**Mode A — Sharp standalone take:** A specific fact, honest observation, or genuinely funny/cynical line that works even for someone who hasn't read the whole thread. Earns likes from the audience on its own merits. Does NOT contradict or miss what was actually said.
 
-   **This score measures audience reach and visibility, not author-reply probability.**
-   A Bloomberg thread (9M followers) = score 8-9 even if Bloomberg never replies — thousands of people will see our reply.
-   A dead thread with 2 followers and no engagement = score 1-2.
+**Mode B — Coherent continuation:** You understand exactly what was said, and your reply clearly follows from and advances this specific conversation. Someone reading the thread would see your reply as a natural, on-point next step — not a tangent, not a repeat of what's already been said, not an expert lecture into casual banter.
 
-   **High (8-10):** High-follower account or high-engagement thread — our reply is seen by lots of people; OR author made a debatable claim we can push back on with something specific
-   **Medium (4-7):** Moderate-reach thread where a sharp fact or observation gets seen by real audience; might get likes from readers
-   **Low (1-3):** Thread is dead/low-traffic (≤100 followers, zero engagement); our only move is pure validation with nothing specific to add; nobody will see or care about the reply
+If you cannot confidently qualify for Mode A or Mode B, set shouldEngage: false. It is always better to skip than to post something that reads as off-topic, tone-deaf, or confused.
 
-   **The test:** "Would someone reading this thread see our reply and think 'who is this — I should follow'?" Likes from the audience count far more than a reply from the author. High-follower accounts almost never reply back — that's fine, their AUDIENCE is the prize.
+# Engagement Scoring
+**PRIORITIZE (score 8-10):**
+- Provider horror stories, marketplace trust pain, matching problem, manual work that should be automated
+- Author is active and likely to engage back
+- Tweet has zero replies — being first pins us at the top
 
-4. **If YES, draft a reply that gets engagement (likes, follows):**
+**GOOD (score 6-7):**
+- Cloud cost complaints, infra philosophy debates, GPU availability
+- Any thread where a sharp fact or honest take earns likes from readers
 
-   **Voice:**
-   - **Primary rule: write like a human expert tweets, not like an AI generating cynicism.** Study the high-engagement examples in the "Reply style" section above — match that register exactly.
-   - 1-2 sentences. Direct, specific, zero performance. Just what a senior engineer fires off in 5 seconds when they know the answer.
-   - No setup, no punchline structure — just the plain thing, stated plainly
-   - Standard sentence capitalization: capitalize the first word and proper nouns (AWS, GCP, Stripe, etc.). No trailing punctuation if it feels unnatural.
-   - The fact itself carries the weight — don't editorialize on top of it
-   - NEVER use template anchors: "wild that", "funny how", "almost like", "turns out", "weird that" — these read as AI tells
-   - Do NOT construct a clever observation. Just say the thing, plainly.
+**SKIP (score <3):**
+- Author has ≤10 followers (we have ~15; anything above is real reach)
+- Overcrowded threads (>50 replies) where we'll be buried
+- Our only move is pure validation with nothing specific to add
 
-   **What gets likes/follows:**
-   - Dropping a specific fact that makes their situation sound worse than they described
-   - Pointing out who actually holds the bag (hint: not the vendor)
-   - Saying the quiet part out loud — no softening, no "to be fair"
+**Audience reach test:** "Would someone reading this thread see our reply and think 'who is this — I should follow'?" Likes from readers matter far more than a reply from the author. High-follower accounts rarely reply back — their AUDIENCE is the prize.
 
-   **What kills engagement:**
-   - Generic validation ("so true", "yeah that's rough")
-   - Clever sentence construction that takes effort to parse
-   - Imperative framing ("make sure you...", "you should switch to...")
-   - Sales pitches or product mentions — zero in Phase 1
-   - Anchor phrases that signal AI: "wild that", "funny how", "almost like", "turns out"
+# Reply Rules (when engaging)
+- 1-2 sentences max, under 280 chars
+- Write like a human expert tweets — direct, specific, no performance
+- Standard sentence capitalization; no trailing punctuation if it feels unnatural
+- The fact carries the weight — don't editorialize on top of it
+- NEVER: "wild that", "funny how", "almost like", "turns out", "weird that" — AI tells
+- NO questions unless they asked one first
+- NO hashtags, NO links, NO product mentions, NO "check us out"
+- profileClickWorthy: only true if you're adding a specific fact or non-obvious angle. Pure validation ("so true", "exactly", "been there") fails this check.
 
-   **Hard rules:**
-   - 1-2 sentences max, under 280 chars
-   - NO questions unless they asked one first
-   - NO hashtags, NO links
-   - NO "check us out", NO "follow for updates"
-   - profileClickWorthy check: only reply if you're adding a specific fact or a cutting observation. Pure validation ("so true", "exactly", "been there", "this is real") fails this check regardless of conversation likelihood.
-
-5. **If NO (not worth engaging), explain why**
-
-# Example Replies (Study the Voice — Direct, Specific, Human)
-
+# Example Replies (voice reference — direct, specific, human)
 Tweet: "Tried Akash for GPU compute, provider just stopped responding mid-job"
--> "Anonymous providers have zero skin in the game, which is fine until your job disappears mid-run"
+→ "Anonymous providers have zero skin in the game, which is fine until your job disappears mid-run"
 
 Tweet: "Cloud support is terrible, been waiting 3 days for a response"
--> "Nobody at AWS is losing sleep over your ticket"
+→ "Nobody at AWS is losing sleep over your ticket"
 
 Tweet: "Egress fees are such a scam"
--> "$0 in. $90/TB out. Totally fine."
+→ "$0 in. $90/TB out. Totally fine."
 
 Tweet: "Accountability cannot be delegated. When a cloud provider manages your data, the liability stays with you."
--> "They take the contract, you take the fine"
-
-Tweet: "Cloud egress fees are notoriously confusing"
--> "In: $0. Out: $90/TB. Not that confusing actually"
+→ "They take the contract, you take the fine"
 
 # Output Format (JSON)
 {{
   "shouldEngage": true/false,
   "audienceEngagementPotential": 1-10,
   "profileClickWorthy": true/false,
+  "mode": "A" or "B" (which mode qualifies this reply, or null if not engaging),
+  "threadSummary": "one sentence: what is this conversation actually about",
   "reasoning": "brief explanation of decision",
   "reply": "draft reply text here" (or null if shouldEngage is false)
 }}
 
-IMPORTANT: "audienceEngagementPotential" measures how many people will see and like our reply, NOT whether the author will reply to us. Large media accounts (Bloomberg, TechCrunch, etc.) score 8-9 because of audience reach even though they never reply directly.
+IMPORTANT: "audienceEngagementPotential" measures how many people will see and like our reply, NOT whether the author will reply. Large accounts score 8-9 because of audience reach even if they never reply directly.
 
 Output ONLY valid JSON, nothing else.
 """
@@ -744,6 +734,9 @@ def main() -> int:
 
                 # Fetch author profile for context (bio, recent tweets, interests)
                 author_name = tweet_context.get("author", "")
+
+                # Prior exchanges with this author (DB only — no API calls)
+                tweet_context["priorExchanges"] = get_engagements_with_user(conn, author_name or author)
                 if author_name:
                     author_profile = get_user_profile(author_name)
                     if author_profile:
