@@ -88,7 +88,6 @@ CDP action and released immediately after.
 
 **Helper Functions:**
 - `humanize(text)` — Run through humanize.py for natural voice
-- `is_junk(text)` — Filter spam/crypto noise
 - `jitter_sleep()` — Random delay between actions
 - `load_state() / save_state()` — Twitter state management (with trimming: engagedPosts capped at 500, recentPosts at 300)
 - `load_project_context()` — Load strategy doc for LLM prompts
@@ -96,7 +95,6 @@ CDP action and released immediately after.
 - `get_engaged_ids(state)` — Fast set of already-engaged tweet IDs
 - `get_our_tweet_ids()` — Set of our own tweet IDs (for thread detection)
 - `log_recent(type, description, url, tweet_id)` — Log to Obsidian notes
-- `save_encountered_thread(context, decision, tweet_id, search_term)` — Save to Obsidian thread index
 - `lookup_our_thread(tweet_ids)` — Check if any IDs match our own thread posts
 - `utc_now()` — Return UTC ISO timestamp string
 
@@ -265,15 +263,14 @@ The @DecentCloud_org account is a **Twitter Premium+ subscriber**. This enables:
 Candidates go through multiple layers before LLM analysis:
 
 1. **Search**: CDP search across SEARCH_TERMS (dynamically generated from recent successful engagements + static fallback list)
-2. **Junk filter**: `is_junk()` removes spam, crypto noise, bots
-3. **Blocked authors**: Skip accounts in BLOCKED_AUTHORS list
-4. **Already-engaged**: Skip tweet IDs already in engagedPosts
-5. **LLM analysis**: Full context analysis with conversationLikelihood score
+2. **Blocked authors**: Skip accounts in BLOCKED_AUTHORS list
+3. **Already-engaged**: Skip tweet IDs already in engagedPosts
+4. **LLM analysis**: Full context analysis with conversationLikelihood score
    - Requires `shouldEngage: true` AND `conversationLikelihood >= 6`
    - LLM given author profile (bio, followers, recent tweets) for context
    - LLM given full parentChain + otherReplies for conversation awareness
    - LLM given our own recent 8 replies + 5 posts for voice consistency
-6. **Humanize**: Natural voice pass before posting
+5. **Humanize**: Natural voice pass before posting
 
 Note: Hard follower count cutoffs (`get_follower_count()`) are available but currently
 the LLM receives follower data as context and makes the call rather than hard-filtering.

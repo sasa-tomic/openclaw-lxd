@@ -50,7 +50,6 @@ TELEGRAM_CHAT_ID = TELEGRAM_TARGET
 
 SKIP_DIRS = {".obsidian", ".trash", ".stversions", ".sync", "Reference", "_reports"}
 SKIP_PATH_PREFIXES = {
-    "Pickle/Twitter/encountered",
     "Pickle/Twitter/threads",
     "Pickle/_reports",
 }

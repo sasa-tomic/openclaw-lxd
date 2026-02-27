@@ -50,14 +50,11 @@ from twitter_utils import (
     auto_follow_after_engagement,
     fetch_tweet_context,
     humanize,
-    is_junk,
     jitter_sleep,
     load_project_context,
     lookup_our_thread,
     post_reply,
-    save_encountered_thread,
     send_error_alert,
-    update_thread_index,
     utc_now,
 )
 
@@ -470,12 +467,6 @@ def main() -> int:
                     mark_mention_seen(conn, seen_mentions, tid)
                     seen_ids.add(tid)
                     continue
-                if is_junk(text):
-                    print(f"  Skipping junk tweet {tid}", flush=True)
-                    mark_mention_seen(conn, seen_mentions, tid)
-                    seen_ids.add(tid)
-                    continue
-
                 new_mentions.append(m)
 
             if not new_mentions:
@@ -570,21 +561,6 @@ def main() -> int:
                 print("  Replied", flush=True)
                 if our_reply_id:
                     print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
-
-                # Cache the conversation as a local .md note and update thread index
-                note_path = save_encountered_thread(
-                    tweet_context=tweet_context,
-                    decision=decision,
-                    tweet_id=tid,
-                )
-                if note_path:
-                    index_ids = [tid] + [
-                        p["tweetId"]
-                        for p in (tweet_context.get("parentChain") or [])
-                        if p.get("tweetId")
-                    ]
-                    update_thread_index(index_ids, str(note_path))
-                    print(f"  Cached conversation: {note_path.name}", flush=True)
 
                 # Auto-follow the author
                 auto_follow_after_engagement(conn, author, tid)

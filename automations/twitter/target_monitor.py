@@ -50,7 +50,6 @@ from twitter_utils import (
     fetch_tweet_context,
     get_user_profile,
     humanize,
-    is_junk,
     jitter_sleep,
     load_project_context,
     lookup_our_thread,
@@ -669,12 +668,6 @@ def process_account(
             f"  @{username}: cannot parse timestamp '{ts_str}' -- skipping (safety)",
             flush=True,
         )
-        return False
-
-    # Skip junk content early
-    text = latest.get("text", "")
-    if is_junk(text):
-        print(f"  @{username}: tweet is junk -- skipping", flush=True)
         return False
 
     # Fetch full tweet context via CDP

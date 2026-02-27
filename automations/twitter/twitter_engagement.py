@@ -61,7 +61,6 @@ from twitter_utils import (
     load_project_context,
     lookup_our_thread,
     post_reply,
-    save_encountered_thread,
     send_error_alert,
     unfollow_user,
     utc_now,
@@ -802,11 +801,6 @@ def main() -> int:
 
                 print(f"\nProcessing {tweet_id} (@{author})...")
 
-                # Save encountered thread regardless of decision
-                if decision:
-                    save_encountered_thread(
-                        tweet_context, decision, tweet_id, search_term
-                    )
 
                 if not decision or not decision.get("shouldEngage"):
                     if decision:

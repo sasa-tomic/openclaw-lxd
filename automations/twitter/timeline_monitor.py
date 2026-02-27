@@ -46,7 +46,6 @@ from twitter_utils import (
     auto_follow_after_engagement,
     fetch_tweet_context,
     humanize,
-    is_junk,
     jitter_sleep,
     load_project_context,
     lookup_our_thread,
@@ -71,15 +70,6 @@ JITTER_MAX_SEC = 30
 # Minimum conversation likelihood required (alongside profileClickWorthy)
 CONV_LIKELIHOOD_THRESHOLD = 6
 
-# Keywords that mark a tweet as infra/cloud relevant (pre-LLM filter)
-INFRA_KEYWORDS = [
-    "aws", "gcp", "azure", "cloud", "kubernetes", "k8s", "server", "deploy",
-    "infra", "gpu", "compute", "outage", "sla", "provider", "latency",
-    "database", "docker", "self-host", "serverless", "terraform", "devops",
-    "sre", "incident", "container", "hosting", "vps", "datacenter",
-]
-
-
 # ---------------------------------------------------------------------------
 # Age filter
 # ---------------------------------------------------------------------------
@@ -100,24 +90,6 @@ def is_recent(tweet: dict, max_age_min: int = MAX_TWEET_AGE_MIN) -> bool:
         return age_min <= max_age_min
     except Exception:
         return True  # parse failure, don't filter
-
-
-# ---------------------------------------------------------------------------
-# Keyword pre-filter
-# ---------------------------------------------------------------------------
-
-
-def passes_keyword_filter(text: str) -> bool:
-    """Return True if the tweet text contains at least one infra/cloud keyword.
-
-    Case-insensitive match against INFRA_KEYWORDS. Tweets that don't match
-    are silently skipped — not a rejection, just not relevant.
-    """
-    text_lower = text.lower()
-    for kw in INFRA_KEYWORDS:
-        if kw in text_lower:
-            return True
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -523,15 +495,6 @@ def main() -> int:
                 # Skip already-engaged tweets
                 if tid in engaged_ids:
                     print(f"  Already engaged with {tid} — skipping", flush=True)
-                    continue
-
-                # Skip junk content
-                if is_junk(text):
-                    print(f"  Junk tweet {tid} — skipping", flush=True)
-                    continue
-
-                # Keyword pre-filter (silent — not a rejection)
-                if not passes_keyword_filter(text):
                     continue
 
                 print(f"\nProcessing tweet {tid} (@{author})...", flush=True)

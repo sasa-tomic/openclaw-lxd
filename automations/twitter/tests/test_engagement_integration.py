@@ -216,7 +216,7 @@ def test_post_reply_failure_alerts_and_no_db_insert(engagement):
         patch.object(engagement, "send_error_alert", side_effect=lambda msg, **kw: alerts.append(msg)),
         patch.object(engagement, "jitter_sleep", lambda *a, **kw: None),
         patch.object(engagement, "auto_follow_after_engagement", lambda *a, **kw: None),
-        patch.object(engagement, "save_encountered_thread", lambda *a, **kw: None),
+
         patch.object(engagement, "mark_queue_processed", lambda *a, **kw: None),
     ):
         rc = engagement.main()
@@ -287,7 +287,7 @@ def test_successful_reply_inserted_into_db(engagement):
         patch.object(engagement, "send_error_alert", lambda *a, **kw: None),
         patch.object(engagement, "jitter_sleep", lambda *a, **kw: None),
         patch.object(engagement, "auto_follow_after_engagement", lambda *a, **kw: None),
-        patch.object(engagement, "save_encountered_thread", lambda *a, **kw: None),
+
         patch.object(engagement, "mark_queue_processed", lambda *a, **kw: None),
     ):
         rc = engagement.main()

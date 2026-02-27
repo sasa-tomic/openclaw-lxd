@@ -30,7 +30,6 @@ sys.path.insert(0, "/projects/automations")
 # Stub heavy twitter_utils / lib imports so tests run without a live browser
 _twitter_utils_stub = mock.MagicMock()
 _twitter_utils_stub.BLOCKED_AUTHORS = []
-_twitter_utils_stub.is_junk.return_value = False
 
 _lib_llm_stub = mock.MagicMock()
 
@@ -67,7 +66,6 @@ for _key, _orig in _saved_modules.items():
 del _saved_modules, _key, _stub, _orig
 
 # Patch module-level helpers that call external services
-tm.is_junk = mock.MagicMock(return_value=False)
 tm.lookup_our_thread = mock.MagicMock(return_value=None)
 tm.load_project_context = mock.MagicMock(return_value="DecentCloud is a p2p cloud marketplace.")
 tm.utc_now = mock.MagicMock(return_value="2026-02-22T15:00:00Z")
@@ -232,10 +230,6 @@ def _acct(last_tweet_id: str | None = None, last_checked: str | None = None) -> 
 
 
 class TestNewTweetDetection:
-    def setup_method(self):
-        """Reset is_junk mock to False before each test."""
-        tm.is_junk.return_value = False
-
     def test_skips_same_tweet_id(self):
         """process_account returns False when tweet ID hasn't changed."""
         mock_conn = mock.MagicMock()
@@ -314,21 +308,6 @@ class TestNewTweetDetection:
         assert result is False
         mock_cdp.assert_not_called()
 
-    def test_skips_junk_tweet(self):
-        """process_account skips tweets classified as junk."""
-        mock_conn = mock.MagicMock()
-        acct = _acct(last_tweet_id="old")
-        with (
-            mock.patch.object(tm, "get_account_kv", return_value=acct),
-            mock.patch.object(tm, "set_account_kv"),
-            mock.patch.object(tm, "is_engaged", return_value=False),
-            mock.patch.object(tm, "get_latest_profile_tweet",
-                               return_value=_fresh_tweet("junk123", age_min=2)),
-            mock.patch.object(tm, "is_junk", return_value=True),
-        ):
-            result = tm.process_account(mock_conn, "simonw", set(), [], [], _real_now())
-        assert result is False
-
     def test_no_reply_when_llm_rejects(self):
         """process_account returns False when LLM says shouldEngage=False."""
         mock_conn = mock.MagicMock()
@@ -346,7 +325,6 @@ class TestNewTweetDetection:
             mock.patch.object(tm, "fetch_tweet_context", return_value=_tweet_ctx("t456")),
             mock.patch.object(tm, "get_user_profile", return_value=None),
             mock.patch.object(tm, "draft_target_reply", return_value=rejected),
-            mock.patch.object(tm, "is_junk", return_value=False),
             mock.patch.object(tm, "post_reply") as mock_post,
         ):
             result = tm.process_account(mock_conn, "simonw", set(), [], [], _real_now())
@@ -377,7 +355,6 @@ class TestNewTweetDetection:
             mock.patch.object(tm, "get_user_profile",
                                return_value={"followersCount": 50000}),
             mock.patch.object(tm, "draft_target_reply", return_value=good_decision),
-            mock.patch.object(tm, "is_junk", return_value=False),
             mock.patch.object(tm, "humanize", side_effect=lambda x: x),
             mock.patch.object(tm, "post_reply", return_value=(True, "our_reply_id")),
             mock.patch.object(tm, "auto_follow_after_engagement"),
@@ -412,7 +389,6 @@ class TestNewTweetDetection:
                                return_value=_tweet_ctx("fail_tweet")),
             mock.patch.object(tm, "get_user_profile", return_value=None),
             mock.patch.object(tm, "draft_target_reply", return_value=good_decision),
-            mock.patch.object(tm, "is_junk", return_value=False),
             mock.patch.object(tm, "humanize", side_effect=lambda x: x),
             mock.patch.object(tm, "post_reply", return_value=(False, None)),
             mock.patch.object(tm, "send_error_alert"),
