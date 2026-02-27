@@ -87,8 +87,10 @@ def run_script(script_path: Path, timeout: int = 3600, logger=None) -> int:
         stderr_thread.join()
 
     rc = process.returncode
-    if rc != 0 and logger:
-        logger.error(f"{script_path.name} exited with code {rc}")
+    if rc != 0:
+        if logger:
+            logger.error(f"{script_path.name} exited with code {rc}")
+        raise RuntimeError(f"{script_path.name} exited with code {rc}")
     return rc
 
 

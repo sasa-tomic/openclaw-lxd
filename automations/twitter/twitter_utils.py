@@ -1736,14 +1736,14 @@ def get_tweet_stats(tweet_id: str) -> dict | None:
 
     with cdp_lock():
         print(f"  CDP: navigating to tweet {tweet_id} (stats)...", flush=True)
-        target_id = _get_target_id()
-        if not target_id:
+        try:
+            with CDPSession.connect() as cdp:
+                if not cdp.navigate(tweet_url, wait_sec=5):
+                    return None
+                raw = cdp.evaluate(js, timeout=15)
+        except Exception as e:
+            logger.warning(f"get_tweet_stats CDP failed: {e}")
             return None
-
-        if not _navigate_and_wait(tweet_url, target_id, wait_sec=5):
-            return None
-
-        raw = _evaluate(target_id, js, timeout=15)
 
         if not raw:
             return None

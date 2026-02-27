@@ -24,7 +24,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, "/projects/automations/twitter")
+sys.path.insert(0, str(Path(__file__).parent.parent))  # /projects/automations (for lib.*)
+sys.path.insert(0, str(Path(__file__).parent))          # /projects/automations/twitter (for db, twitter_utils)
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from twitter_utils import (
     humanize,

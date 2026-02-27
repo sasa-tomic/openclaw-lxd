@@ -281,19 +281,29 @@ class TestThreadLength:
 # ---------------------------------------------------------------------------
 
 class TestGetTweetStatsShape:
-    """Verify get_tweet_stats returns correct dict shape (via mocked CDP helpers)."""
+    """Verify get_tweet_stats returns correct dict shape (via mocked CDPSession)."""
+
+    def _make_mock_cdp(self, raw_json: str, navigate_ok: bool = True):
+        """Build a mock CDPSession context manager that returns raw_json from evaluate."""
+        import contextlib
+        mock_cdp = MagicMock()
+        mock_cdp.navigate.return_value = navigate_ok
+        mock_cdp.evaluate.return_value = raw_json
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__ = MagicMock(return_value=mock_cdp)
+        mock_ctx.__exit__ = MagicMock(return_value=False)
+        return mock_ctx
 
     def test_get_tweet_stats_returns_correct_keys(self):
         """get_tweet_stats must return dict with likes/retweets/replies."""
         from twitter import twitter_utils  # type: ignore
 
         mock_raw = json.dumps(json.dumps({"likes": 5, "retweets": 2, "replies": 1}))
+        mock_ctx = self._make_mock_cdp(mock_raw)
 
-        with patch.object(twitter_utils, "_get_target_id", return_value="mock-target"):
-            with patch.object(twitter_utils, "_navigate_and_wait", return_value=True):
-                with patch.object(twitter_utils, "_evaluate", return_value=mock_raw):
-                    with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
-                        result = twitter_utils.get_tweet_stats("123456789")
+        with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
+            with patch.object(twitter_utils.CDPSession, "connect", return_value=mock_ctx):
+                result = twitter_utils.get_tweet_stats("123456789")
 
         assert result is not None
         assert set(result.keys()) == {"likes", "retweets", "replies"}
@@ -305,19 +315,20 @@ class TestGetTweetStatsShape:
         """get_tweet_stats returns None when navigation fails."""
         from twitter import twitter_utils  # type: ignore
 
-        with patch.object(twitter_utils, "_get_target_id", return_value="mock-target"):
-            with patch.object(twitter_utils, "_navigate_and_wait", return_value=False):
-                with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
-                    result = twitter_utils.get_tweet_stats("000")
+        mock_ctx = self._make_mock_cdp("", navigate_ok=False)
+
+        with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
+            with patch.object(twitter_utils.CDPSession, "connect", return_value=mock_ctx):
+                result = twitter_utils.get_tweet_stats("000")
 
         assert result is None
 
-    def test_get_tweet_stats_returns_none_on_no_target(self):
-        """get_tweet_stats returns None when no browser target is available."""
+    def test_get_tweet_stats_returns_none_on_cdp_exception(self):
+        """get_tweet_stats returns None when CDPSession raises."""
         from twitter import twitter_utils  # type: ignore
 
-        with patch.object(twitter_utils, "_get_target_id", return_value=None):
-            with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
+        with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
+            with patch.object(twitter_utils.CDPSession, "connect", side_effect=OSError("no browser")):
                 result = twitter_utils.get_tweet_stats("000")
 
         assert result is None
@@ -327,12 +338,11 @@ class TestGetTweetStatsShape:
         from twitter import twitter_utils  # type: ignore
 
         mock_raw = json.dumps(json.dumps({"likes": 0, "retweets": 0, "replies": 0}))
+        mock_ctx = self._make_mock_cdp(mock_raw)
 
-        with patch.object(twitter_utils, "_get_target_id", return_value="mock-target"):
-            with patch.object(twitter_utils, "_navigate_and_wait", return_value=True):
-                with patch.object(twitter_utils, "_evaluate", return_value=mock_raw):
-                    with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
-                        result = twitter_utils.get_tweet_stats("111")
+        with patch.object(twitter_utils, "cdp_lock", MagicMock(return_value=__import__("contextlib").nullcontext())):
+            with patch.object(twitter_utils.CDPSession, "connect", return_value=mock_ctx):
+                result = twitter_utils.get_tweet_stats("111")
 
         assert result == {"likes": 0, "retweets": 0, "replies": 0}
 
