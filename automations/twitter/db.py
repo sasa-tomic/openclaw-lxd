@@ -647,6 +647,68 @@ def get_popular_candidate_tweets(conn, days: int = 30, limit: int = 25) -> list[
         return [dict(row) for row in cur.fetchall()]
 
 
+def upsert_tweet_replies(conn, parent_tweet_id: str, replies: list[dict]) -> int:
+    """Persist reply stats for a tweet we fetched context for.
+
+    Only inserts/updates replies that have a valid tweetId.
+    Uses ON CONFLICT to refresh stats if we re-scrape the same reply.
+    Returns count of rows upserted.
+    """
+    if not replies:
+        return 0
+    upserted = 0
+    for r in replies:
+        reply_id = r.get("tweetId")
+        if not reply_id:
+            continue
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO tweet_replies
+                    (reply_tweet_id, parent_tweet_id, author, text, likes, retweets, replies, scraped_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (reply_tweet_id) DO UPDATE SET
+                    likes      = EXCLUDED.likes,
+                    retweets   = EXCLUDED.retweets,
+                    replies    = EXCLUDED.replies,
+                    scraped_at = now()
+                """,
+                (
+                    reply_id,
+                    parent_tweet_id,
+                    r.get("username"),
+                    (r.get("text") or "")[:500],
+                    r.get("likes", 0),
+                    r.get("retweets", 0),
+                    r.get("replies", 0),
+                ),
+            )
+        upserted += 1
+    return upserted
+
+
+def get_top_tweet_replies(conn, days: int = 30, min_engagement: int = 1, limit: int = 50) -> list[dict]:
+    """Fetch top-engaged replies we've seen across all candidate tweets.
+
+    Useful for pattern mining: what reply styles/angles get traction in our target space.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT reply_tweet_id, parent_tweet_id, author, text,
+                   likes, retweets, replies, scraped_at
+            FROM tweet_replies
+            WHERE scraped_at >= %s
+              AND (likes + retweets) >= %s
+            ORDER BY (likes + retweets) DESC
+            LIMIT %s
+            """,
+            (cutoff, min_engagement, limit),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
 def get_posts_for_stats_update(conn, days: int = 30) -> list[dict]:
     """Return posts that need a stats refresh.
 
@@ -1004,6 +1066,20 @@ CREATE INDEX IF NOT EXISTS idx_edges_target    ON social_edges(target);
 CREATE INDEX IF NOT EXISTS idx_eng_user        ON engagements(target_username);
 CREATE INDEX IF NOT EXISTS idx_eng_time        ON engagements(replied_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_time      ON posts(posted_at DESC);
+
+CREATE TABLE IF NOT EXISTS tweet_replies (
+    reply_tweet_id  TEXT PRIMARY KEY,
+    parent_tweet_id TEXT NOT NULL,
+    author          TEXT,
+    text            TEXT,
+    likes           INTEGER DEFAULT 0,
+    retweets        INTEGER DEFAULT 0,
+    replies         INTEGER DEFAULT 0,
+    scraped_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tweet_replies_parent ON tweet_replies(parent_tweet_id);
+CREATE INDEX IF NOT EXISTS idx_tweet_replies_eng    ON tweet_replies((likes + retweets) DESC);
 """
 
 

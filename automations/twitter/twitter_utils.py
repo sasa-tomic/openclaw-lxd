@@ -1139,20 +1139,32 @@ def fetch_tweet_context(tweet_id: str) -> dict | None:
   // Articles after the main tweet: thread continuation (self-replies) + other replies.
   // Skip any article nested inside main (the quoted tweet) — document order places nested
   // articles after their parent in the NodeList, so they'd otherwise appear here.
+  // Collect up to 15 replies so we can re-sort by engagement and take the top ones.
   const threadContinuation = [];
-  const otherReplies = [];
-  for (let i = mainIdx + 1; i < articles.length && i <= mainIdx + 12; i++) {{
+  const otherRepliesRaw = [];
+  for (let i = mainIdx + 1; i < articles.length && i <= mainIdx + 20; i++) {{
     if (main.contains(articles[i])) continue;
     const aUser = getUsername(articles[i]);
     const aText = getText(articles[i]);
     if (!aUser || !aText) continue;
     if (aUser === username && threadContinuation.length < 5) {{
       threadContinuation.push({{ text: aText, id: getTweetId(articles[i]) }});
-    }} else if (aUser !== username && otherReplies.length < 5) {{
-      otherReplies.push({{ username: aUser, text: aText.slice(0, 300), tweetId: getTweetId(articles[i]) }});
+    }} else if (aUser !== username && otherRepliesRaw.length < 15) {{
+      const aStats = getStats(articles[i]);
+      otherRepliesRaw.push({{
+        username: aUser,
+        text: aText.slice(0, 300),
+        tweetId: getTweetId(articles[i]),
+        likes: aStats.likes,
+        retweets: aStats.retweets,
+        replies: aStats.replies,
+      }});
     }}
-    if (threadContinuation.length >= 5 && otherReplies.length >= 5) break;
+    if (threadContinuation.length >= 5 && otherRepliesRaw.length >= 15) break;
   }}
+  // Sort by total engagement descending so the highest-signal replies surface first
+  otherRepliesRaw.sort((a, b) => (b.likes + b.retweets) - (a.likes + a.retweets));
+  const otherReplies = otherRepliesRaw.slice(0, 8);
 
   return JSON.stringify({{
     username, displayName, text,

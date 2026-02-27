@@ -33,6 +33,7 @@ from pathlib import Path
 sys.path.insert(0, "/projects/automations")
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from db import (
+    ensure_schema,
     get_conn,
     get_engaged_tweet_ids,
     get_queued_candidates,
@@ -45,6 +46,7 @@ from db import (
     is_engaged,
     mark_queue_processed,
     upsert_search_term_stats,
+    upsert_tweet_replies,
 )
 from twitter_utils import (
     BLOCKED_AUTHORS,
@@ -519,6 +521,8 @@ def main() -> int:
 
     try:
         with get_conn() as conn:
+            ensure_schema(conn)
+
             # Load DB state
             engaged_ids = get_engaged_tweet_ids(conn)
             term_stats = get_search_term_stats(conn)
@@ -646,6 +650,13 @@ def main() -> int:
                         f"  Skipping {tweet_id} - failed to fetch context", flush=True
                     )
                     continue
+
+                # Persist high-engagement replies we observed while fetching context.
+                other_replies = tweet_context.get("otherReplies") or []
+                if other_replies:
+                    saved = upsert_tweet_replies(conn, str(tweet_id), other_replies)
+                    if saved:
+                        print(f"  Persisted {saved} replies for {tweet_id}", flush=True)
 
                 # Mark processed after successful context fetch so a browser failure
                 # doesn't permanently consume the candidate.
