@@ -17,9 +17,11 @@ Or run ad-hoc:
 from __future__ import annotations
 
 import json
+import random
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from prefect import flow, get_run_logger
@@ -147,8 +149,11 @@ def run_script(script_path: Path, timeout: int = 3600, logger=None) -> int:
 
 @flow(name="twitter-engagement", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def engagement_flow():
-    """Autonomous Twitter engagement - 5x daily."""
+    """Autonomous Twitter engagement - hourly."""
     logger = get_run_logger()
+    delay = random.randint(0, 3000)
+    logger.info(f"Jitter: sleeping {delay}s before engagement")
+    time.sleep(delay)
     logger.info("Starting engagement run")
     code = run_script(TWITTER_DIR / "twitter_engagement.py", logger=logger)
     logger.info(f"Engagement completed with code {code}")
