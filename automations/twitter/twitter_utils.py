@@ -625,6 +625,130 @@ def post_reply(
         return False, None
 
 
+def like_tweet(tweet_id: str) -> bool:
+    """Like a tweet via Chrome CDP. Returns True if successful."""
+    try:
+        with cdp_tab() as cdp:
+            tweet_url = f"{TWITTER_BASE_URL}/i/web/status/{tweet_id}"
+            if not cdp.navigate(tweet_url, wait_sec=2):
+                return False
+            LIKE_BTN = '[data-testid="like"]'
+            if not cdp.wait_for(LIKE_BTN, timeout=10):
+                print("  CDP: like button not found (already liked?)", flush=True)
+                return False
+            if not cdp.click(LIKE_BTN):
+                return False
+            time.sleep(1)
+            print(f"  CDP: liked tweet {tweet_id}", flush=True)
+            return True
+    except Exception as e:
+        logger.warning(f"like_tweet failed: {e}")
+        return False
+
+
+def post_quote_tweet(
+    tweet_id: str,
+    quote_text: str,
+    our_username: str = "DecentCloud_org",
+) -> tuple[bool, str | None]:
+    """Post a quote-tweet via Chrome CDP.
+
+    Flow: navigate to tweet → click retweet button → click Quote option in menu
+    → type text → click Post → poll for success → extract new tweet ID.
+
+    Returns (success, new_tweet_id). new_tweet_id may be None if posted but ID
+    could not be read from the page.
+
+    NOTE: The quote menu selector ([data-testid="quoteTweet"]) should be
+    verified live against X's current DOM before relying on this in production.
+    """
+    _extract_js = (
+        "(() => {"
+        f"  const pat = /\\/{our_username}\\/status\\/(\\d+)$/;"
+        "  let best = null;"
+        "  for (const a of document.querySelectorAll('a[href]')) {"
+        "    const m = a.href.match(pat);"
+        "    if (m && (!best || BigInt(m[1]) > BigInt(best))) best = m[1];"
+        "  }"
+        "  return best;"
+        "})()"
+    )
+
+    try:
+        with cdp_tab() as cdp:
+            tweet_url = f"{TWITTER_BASE_URL}/i/web/status/{tweet_id}"
+            print(f"  CDP: navigating to {tweet_url}", flush=True)
+            if not cdp.navigate(tweet_url, wait_sec=2):
+                return False, None
+            RETWEET_BTN = '[data-testid="retweet"]'
+            QUOTE_BTN = '[data-testid="quoteTweet"]'
+            TEXTAREA = '[data-testid="tweetTextarea_0"]'
+            POST_BTN = '[data-testid="tweetButton"]'
+            if not cdp.wait_for(RETWEET_BTN, timeout=10):
+                print("  CDP: retweet button not found", flush=True)
+                return False, None
+            if not cdp.click(RETWEET_BTN):
+                print("  CDP: could not click retweet button", flush=True)
+                return False, None
+            time.sleep(0.5)
+            # Quote menu option appears after clicking retweet
+            if not cdp.wait_for(QUOTE_BTN, timeout=5):
+                print("  CDP: quote option not found in retweet menu", flush=True)
+                return False, None
+            if not cdp.click(QUOTE_BTN):
+                print("  CDP: could not click Quote option", flush=True)
+                return False, None
+            time.sleep(0.5)
+            if not cdp.wait_for(TEXTAREA, timeout=10):
+                print("  CDP: quote compose textbox not found", flush=True)
+                return False, None
+            cdp.click(TEXTAREA)
+            time.sleep(0.3)
+            print(f"  CDP: typing quote...", flush=True)
+            if not cdp.type_text(TEXTAREA, quote_text):
+                print("  CDP: typing failed", flush=True)
+                return False, None
+            time.sleep(0.5)
+            print(f"  CDP: clicking Post...", flush=True)
+            if not cdp.click(POST_BTN):
+                print("  CDP: Post button not found", flush=True)
+                return False, None
+            # Poll up to 8s for textarea to clear
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                still_text = cdp.evaluate(
+                    f"document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()"
+                )
+                if not still_text:
+                    time.sleep(1.2)
+                    toast = cdp.evaluate(
+                        "document.querySelector('[data-testid=\"toast\"]')?.textContent?.trim()"
+                    )
+                    if toast and "your post was sent" not in toast.lower():
+                        print(f"  CDP: Twitter error toast: {toast[:120]}", flush=True)
+                        return False, None
+                    # Extract the new tweet ID
+                    new_id: str | None = None
+                    for _ in range(5):
+                        raw = cdp.evaluate(_extract_js)
+                        candidate = str(raw) if raw else None
+                        if candidate and int(candidate) > int(tweet_id):
+                            new_id = candidate
+                            break
+                        time.sleep(1)
+                    if new_id:
+                        print(f"  CDP: quote-tweet posted (id={new_id})", flush=True)
+                    else:
+                        print("  CDP: quote-tweet posted (could not read ID from page)", flush=True)
+                    return True, new_id
+                time.sleep(1)
+            print("  CDP: quote-tweet may have failed (textarea still has text)", flush=True)
+            return False, None
+    except Exception as e:
+        logger.warning(f"post_quote_tweet CDP failed: {e}")
+        return False, None
+
+
 def post_tweet(text: str) -> bool:
     """Post a new tweet via Chrome CDP (CDPSession direct WebSocket).
 
@@ -1319,7 +1443,7 @@ PROFILE_CACHE_PATH = Path("/home/openclaw/clawd/memory/twitter-profile-cache.jso
 PROFILE_CACHE_TTL_DAYS = 7
 
 SEARCH_CACHE_PATH = Path("/home/openclaw/clawd/memory/twitter-search-cache.json")
-SEARCH_CACHE_TTL_HOURS = 12
+SEARCH_CACHE_TTL_HOURS = 6
 
 
 def load_profile_cache() -> dict:

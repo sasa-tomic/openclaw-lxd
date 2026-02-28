@@ -60,7 +60,9 @@ from twitter_utils import (
     get_user_profile,
     humanize,
     jitter_sleep,
+    like_tweet,
     load_project_context,
+    post_quote_tweet,
     post_reply,
     send_error_alert,
     unfollow_user,
@@ -341,12 +343,18 @@ Read the full thread above. Then answer internally:
 
 **DEFAULT TO ENGAGING.** If you can land a witty, funny, cynical, or borderline-rude take — engage. The goal is views and follows, not politeness. Silence is only correct when the reply would be genuinely off-topic, tone-deaf, or incoherent. "I'm not sure it's perfect" is not a reason to skip — a sharp or entertaining reply that makes readers want to follow us is always worth posting.
 
+**Contrarian advantage:** Disagreeing with a popular opinion drives more engagement than agreeing.
+If the thread's consensus is wrong, incomplete, or vague — say so. Name the flaw specifically.
+"Actually X is wrong because Y" with a concrete reason outperforms validation every time.
+Readers follow accounts that hold a real position.
+
 # Engagement Scoring
 **PRIORITIZE (score 8-10):**
 - You can land a witty, funny, or cynical punchline that makes readers want to follow us — this is the highest priority signal
 - Provider horror stories, marketplace trust pain, matching problem, manual work that should be automated
 - Author is active and likely to engage back
 - Tweet has zero replies — being first pins us at the top
+- AWS egress gotchas, GCP Spanner pricing, Azure Reserved Instance complexity — name the platform specifically, not "cloud providers"
 
 **GOOD (score 6-7):**
 - Cloud cost complaints, infra philosophy debates, GPU availability
@@ -356,8 +364,24 @@ Read the full thread above. Then answer internally:
 - Author has ≤10 followers (we have ~15; anything above is real reach)
 - Overcrowded threads (>50 replies) where we'll be buried
 - Our only move is pure validation with nothing specific to add
+- Like-only (engagementType: "like") is available even for score <3 — no threshold applies.
 
 **Audience reach test:** "Would someone reading this thread see our reply and think 'who is this — I should follow'?" Likes from readers matter far more than a reply from the author. High-follower accounts rarely reply back — their AUDIENCE is the prize.
+
+**Mode L — Like only (lightweight signal):**
+Use when the tweet is relevant and interesting but you have no sharp reply angle.
+A like registers us with the author and their audience without requiring something worth saying.
+Set engagementType: "like" and reply: null. No audienceEngagementPotential requirement — likes are cheap.
+Use this when: tweet is on-topic, author is target audience, but you'd be forcing a reply.
+
+**Mode QT — Quote-tweet (high-reach only):**
+Quote instead of reply ONLY when:
+1. Thread already has 50+ replies — quote breaks out of the pile with its own reach
+2. Your take directly contradicts the original author and making the disagreement visible matters
+3. The original has 1K+ likes — their audience is bigger than the thread's
+
+A one-liner quote looks hollow. Minimum 2 sentences. Set engagementType: "quote".
+Default to reply unless one of the above conditions applies.
 
 # Reply Rules (when engaging)
 - 1-2 sentences max, under 280 chars
@@ -367,6 +391,7 @@ Read the full thread above. Then answer internally:
 - NEVER: "wild that", "funny how", "almost like", "turns out", "weird that" — AI tells
 - NO questions unless they asked one first
 - NO hashtags, NO links, NO product mentions, NO "check us out"
+- Name AWS, GCP, Azure, Stripe specifically when the point applies to them. "Cloud providers" is vague; "AWS" is interesting.
 - profileClickWorthy: true if the reply adds a specific fact, non-obvious angle, or is genuinely funny/cynical/sharp enough that a reader would want to see who said it. Pure validation ("so true", "exactly", "been there") fails this check. When in doubt, mark true — we want to engage.
 
 # Example Replies (voice reference — direct, specific, human)
@@ -382,15 +407,22 @@ Tweet: "Egress fees are such a scam"
 Tweet: "Accountability cannot be delegated. When a cloud provider manages your data, the liability stays with you."
 → "They take the contract, you take the fine"
 
+Tweet: "Everyone needs Kubernetes to scale"
+→ "Kubernetes trades operational simplicity for platform complexity. Most teams pay the tax and never need the scale."
+
+Tweet: "Cloud is always cheaper than on-prem"
+→ "Only if you don't count the engineering tax of cloud-native patterns. AWS margins are high for a reason."
+
 # Output Format (JSON)
 {{
   "shouldEngage": true/false,
+  "engagementType": "reply" or "like" or "quote" (default "reply" if omitted),
   "audienceEngagementPotential": 1-10,
   "profileClickWorthy": true/false,
   "mode": "A" or "B" (which mode qualifies this reply, or null if not engaging),
   "threadSummary": "one sentence: what is this conversation actually about",
   "reasoning": "brief explanation of decision",
-  "reply": "draft reply text here" (or null if shouldEngage is false)
+  "reply": "draft reply text here" (or null if engagementType is "like" or shouldEngage is false)
 }}
 
 IMPORTANT: "audienceEngagementPotential" measures how many people will see and like our reply, NOT whether the author will reply. Large accounts score 8-9 because of audience reach even if they never reply directly.
@@ -418,13 +450,14 @@ Output ONLY valid JSON, nothing else.
             decision["shouldEngage"] = False
             return decision
 
-        if not profile_click_worthy and audience_score < 5:
+        engagement_type = decision.get("engagementType", "reply")
+        if not profile_click_worthy and audience_score < 5 and engagement_type != "like":
             print(f"  Not profile-click-worthy + low audience score: {json.dumps(decision)}")
             decision["shouldEngage"] = False
             return decision
 
         reply = decision.get("reply")
-        if not reply or len(reply) > 280:
+        if engagement_type != "like" and (not reply or len(reply) > 280):
             print("  LLM reply invalid (empty or too long)")
             return None
 
@@ -515,8 +548,18 @@ def _reach_score(c: dict) -> int:
 
     Each like implies ~20 impressions; each RT ~50 (amplification to new feeds).
     We use a simplified ratio: likes × 1 + retweets × 3.
+    Freshness bonus: tweets <30min old get +500, <60min get +200.
     """
-    return (c.get("likes") or 0) + (c.get("retweets") or 0) * 3
+    base = (c.get("likes") or 0) + (c.get("retweets") or 0) * 3
+    tweet_id = int(c.get("tweetId") or c.get("tweet_id") or 0)
+    if tweet_id:
+        ms = (tweet_id >> 22) + 1288834974657
+        age_min = (_time.time() * 1000 - ms) / 60000
+        if age_min < 30:
+            base += 500
+        elif age_min < 60:
+            base += 200
+    return base
 
 
 def llm_triage_candidates(candidates: list[dict], top_n: int = 15) -> list[str]:
@@ -822,39 +865,72 @@ def main() -> int:
                         print(f"  LLM skipped: {json.dumps(decision)}")
                     continue
 
-                reply_text = decision["reply"]
-                print(f"  LLM approved: {reply_text[:80]}...")
+                engagement_type = decision.get("engagementType", "reply")
+                reply_text = decision.get("reply")
+                print(f"  LLM approved [{engagement_type}]: {(reply_text or '')[:80]}...")
                 print(f"  Reasoning: {decision.get('reasoning', 'N/A')}")
-
-                try:
-                    reply_text = humanize(reply_text)
-                except Exception as e:
-                    print(f"  Humanize failed: {e}")
-                    continue
 
                 jitter_sleep()
 
-                MAX_REPLY_ATTEMPTS = 3
                 posted = False
                 our_reply_id = None
-                for attempt in range(1, MAX_REPLY_ATTEMPTS + 1):
-                    posted, our_reply_id = post_reply(tweet_id, reply_text)
-                    if posted:
-                        break
-                    if attempt < MAX_REPLY_ATTEMPTS:
-                        print(f"  Reply attempt {attempt} failed, retrying in 5s...", flush=True)
-                        _time.sleep(5)
+                engagement_source = "search"
+
+                if engagement_type == "like":
+                    posted = like_tweet(tweet_id)
+                    engagement_source = "like"
+                elif engagement_type == "quote":
+                    if not reply_text:
+                        print("  Quote-tweet requires reply text — skipping")
+                        continue
+                    try:
+                        reply_text = humanize(reply_text)
+                    except Exception as e:
+                        print(f"  Humanize failed: {e}")
+                        continue
+                    MAX_REPLY_ATTEMPTS = 3
+                    for attempt in range(1, MAX_REPLY_ATTEMPTS + 1):
+                        posted, our_reply_id = post_quote_tweet(tweet_id, reply_text)
+                        if posted:
+                            break
+                        if attempt < MAX_REPLY_ATTEMPTS:
+                            print(f"  Quote attempt {attempt} failed, retrying in 5s...", flush=True)
+                            _time.sleep(5)
+                    if not posted:
+                        send_error_alert(f"Failed to quote-tweet {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
+                        continue
+                    engagement_source = "quote"
+                else:  # "reply"
+                    if not reply_text:
+                        print("  Reply requires reply text — skipping")
+                        continue
+                    try:
+                        reply_text = humanize(reply_text)
+                    except Exception as e:
+                        print(f"  Humanize failed: {e}")
+                        continue
+                    MAX_REPLY_ATTEMPTS = 3
+                    for attempt in range(1, MAX_REPLY_ATTEMPTS + 1):
+                        posted, our_reply_id = post_reply(tweet_id, reply_text)
+                        if posted:
+                            break
+                        if attempt < MAX_REPLY_ATTEMPTS:
+                            print(f"  Reply attempt {attempt} failed, retrying in 5s...", flush=True)
+                            _time.sleep(5)
+                    if not posted:
+                        send_error_alert(f"Failed to post reply to {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
+                        continue
 
                 if not posted:
-                    send_error_alert(f"Failed to post reply to {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
                     continue
 
-                print("  Replied", flush=True)
+                print(f"  {engagement_type.capitalize()}d", flush=True)
                 if our_reply_id:
                     print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
 
-                # Auto-follow the author after confirmed reply
-                auto_follow_after_engagement(conn, author, tweet_id)
+                # Auto-follow the author after confirmed engagement
+                if engagement_type != "like":
+                    auto_follow_after_engagement(conn, author, tweet_id)
 
                 # Insert engagement into DB
                 stats = tweet_context.get("stats", {})
@@ -864,7 +940,7 @@ def main() -> int:
                     target_username=author,
                     our_reply_text=reply_text,
                     our_reply_id=our_reply_id,
-                    source="search",
+                    source=engagement_source,
                     search_term=search_term,
                     conv_likelihood=decision.get("audienceEngagementPotential") or decision.get("conversationLikelihood"),
                     profile_click_worthy=decision.get("profileClickWorthy"),
@@ -880,18 +956,19 @@ def main() -> int:
                 engaged_count += 1
                 if search_term:
                     term_engaged_counts[search_term] += 1
-                results.append(f"{tweet_id} | @{author}")
+                results.append(f"{tweet_id} | @{author} [{engagement_type}]")
 
                 # Update voice context in-memory so subsequent runs in this session
                 # see our latest replies (posting is sequential so no race).
-                recent_engagements = [
-                    {
-                        "target_username": author,
-                        "our_reply_text": reply_text,
-                        "replied_at": utc_now(),
-                        "search_term": search_term,
-                    }
-                ] + recent_engagements[:7]
+                if reply_text:
+                    recent_engagements = [
+                        {
+                            "target_username": author,
+                            "our_reply_text": reply_text,
+                            "replied_at": utc_now(),
+                            "search_term": search_term,
+                        }
+                    ] + recent_engagements[:7]
 
             # Accumulate per-term hit-rate stats
             for term, count in term_candidate_counts.items():

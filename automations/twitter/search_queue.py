@@ -110,7 +110,7 @@ def cmd_fill(args: argparse.Namespace) -> int:
         print(f"  [{i}/{len(terms)}] '{term}'", flush=True)
 
         cdp_candidates = search_candidates(
-            terms=[term], term_stats=term_stats, bypass_cache=True, since_hours=2, limit=50
+            terms=[term], term_stats=term_stats, bypass_cache=True, since_hours=1, limit=50
         )
         new_candidates = _candidates_for_term(cdp_candidates, engaged_ids, already_queued_ids)
 

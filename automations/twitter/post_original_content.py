@@ -287,6 +287,9 @@ Describe something real that most people haven't noticed or named.
 Structure: setup (what people assume) → reality (what actually happens, with numbers) → implication (let it land).
 NOT imperative. Never "make sure you", "you should". Describe; don't instruct.
 Example: "Stripe can quietly hold back 10% of your revenue for up to 6 months if their system flags your account — rapid growth is often enough to trigger it."
+Go for the uncomfortable truth over the comfortable observation.
+"Everyone knows X" posts don't land — find the contradiction.
+Safe: "Cloud migrations are hard." Spicy: "Most cloud migrations cost 3x because enterprises are trading human problems for API problems."
 
 ## Format B — Engineering dilemma (longer, structured, ends with a question)
 A realistic scenario with no obvious correct answer. Forces the reader to pick a side.
@@ -314,6 +317,7 @@ Use as inspiration for fresh angles only — don't repeat same framing.
 - Standard sentence capitalization: capitalize the first word and proper nouns (AWS, GCP, Stripe, etc.)
 - No hashtags, no links, no product mentions, no "Decent Cloud" references
 - No AI vocabulary: "Furthermore", "Additionally", "It's important to note that"
+- Name specific platforms (AWS, GCP, Azure, Stripe) when discussing their gotchas. "The cloud" is vague; "AWS egress fees" is interesting.
 
 Output as JSON array of 4 strings: ["post1", "post2", "post3", "post4"]
 Output ONLY the JSON array. No explanation, no markdown wrapping."""
