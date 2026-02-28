@@ -218,6 +218,7 @@ def draft_mention_reply(
     recent_posts: list[dict],
     is_direct_reply: bool,
     prior_exchanges: list[dict] | None = None,
+    conn=None,
 ) -> dict | None:
     """Draft a reply to a mention/reply via LLM.
 
@@ -576,7 +577,7 @@ def main() -> int:
                 print("  Asking LLM to draft reply...", flush=True)
                 decision = draft_mention_reply(
                     mention, tweet_context, recent_engagements, recent_posts,
-                    is_direct_reply, prior_exchanges
+                    is_direct_reply, prior_exchanges, conn=conn
                 )
 
                 if not decision or not decision.get("shouldEngage"):

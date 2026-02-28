@@ -90,7 +90,11 @@ class CDPSession:
 
         Returns the new tab's info dict (including webSocketDebuggerUrl).
         """
-        resp = requests.post(f"http://{host}:{port}/json/new?about:blank", timeout=10)
+        resp = requests.post(
+            f"http://{host}:{port}/json/new?about:blank",
+            headers={"Host": host},
+            timeout=10,
+        )
         resp.raise_for_status()
         return resp.json()
 
