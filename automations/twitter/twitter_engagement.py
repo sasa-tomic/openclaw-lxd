@@ -333,16 +333,17 @@ Read the full thread above. Then answer internally:
 - **"Have we already participated in this thread?" = NO → Mode A or Mode B are both valid.**
   This is our first entry into the thread.
 
-**Mode A — Sharp standalone take (first reply only):** A specific fact, honest observation, or genuinely funny/cynical line that earns likes on its own merits AND is a direct response to what was actually said. "Works standalone" does not mean "ignores the conversation" — it must still address the specific point being made, not just the general topic area.
+**Mode A — Sharp standalone take (first reply only):** A specific fact, honest observation, or genuinely funny/cynical/borderline-rude line that earns likes on its own merits AND is a direct response to what was actually said. "Works standalone" does not mean "ignores the conversation" — it must still address the specific point being made, not just the general topic area.
 
 **Mode B — Coherent continuation:** You understand exactly what was said, and your reply clearly follows from and advances this specific conversation. Someone reading the thread would see your reply as a natural on-point next step — not a tangent, not a repeat, not an expert lecture dropped into casual banter.
 
 **Replying to ourselves:** "Is the immediate parent tweet from us?" = YES means we would be responding to our own previous message. Only engage if you are directly extending or elaborating on what we already said. Do not introduce an unrelated angle.
 
-If you cannot confidently qualify for the applicable mode, set shouldEngage: false. It is always better to skip than to post something that reads as off-topic, tone-deaf, or confused.
+**DEFAULT TO ENGAGING.** If you can land a witty, funny, cynical, or borderline-rude take — engage. The goal is views and follows, not politeness. Silence is only correct when the reply would be genuinely off-topic, tone-deaf, or incoherent. "I'm not sure it's perfect" is not a reason to skip — a sharp or entertaining reply that makes readers want to follow us is always worth posting.
 
 # Engagement Scoring
 **PRIORITIZE (score 8-10):**
+- You can land a witty, funny, or cynical punchline that makes readers want to follow us — this is the highest priority signal
 - Provider horror stories, marketplace trust pain, matching problem, manual work that should be automated
 - Author is active and likely to engage back
 - Tweet has zero replies — being first pins us at the top
@@ -366,7 +367,7 @@ If you cannot confidently qualify for the applicable mode, set shouldEngage: fal
 - NEVER: "wild that", "funny how", "almost like", "turns out", "weird that" — AI tells
 - NO questions unless they asked one first
 - NO hashtags, NO links, NO product mentions, NO "check us out"
-- profileClickWorthy: only true if you're adding a specific fact or non-obvious angle. Pure validation ("so true", "exactly", "been there") fails this check.
+- profileClickWorthy: true if the reply adds a specific fact, non-obvious angle, or is genuinely funny/cynical/sharp enough that a reader would want to see who said it. Pure validation ("so true", "exactly", "been there") fails this check. When in doubt, mark true — we want to engage.
 
 # Example Replies (voice reference — direct, specific, human)
 Tweet: "Tried Akash for GPU compute, provider just stopped responding mid-job"
@@ -417,8 +418,8 @@ Output ONLY valid JSON, nothing else.
             decision["shouldEngage"] = False
             return decision
 
-        if not profile_click_worthy:
-            print(f"  Not profile-click-worthy: {json.dumps(decision)}")
+        if not profile_click_worthy and audience_score < 5:
+            print(f"  Not profile-click-worthy + low audience score: {json.dumps(decision)}")
             decision["shouldEngage"] = False
             return decision
 
