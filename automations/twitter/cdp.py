@@ -35,6 +35,18 @@ import websocket
 logger = logging.getLogger(__name__)
 
 
+def _chrome_raise_for_status(resp: requests.Response) -> None:
+    """Like raise_for_status() but logs status code + body before raising."""
+    if resp.status_code >= 400:
+        logger.error(
+            "Chrome HTTP error %s %s — body: %s",
+            resp.status_code,
+            resp.reason,
+            resp.text[:500],
+        )
+        resp.raise_for_status()
+
+
 class CDPSession:
     """A thread-safe Chrome DevTools Protocol session over WebSocket."""
 
@@ -58,7 +70,7 @@ class CDPSession:
     def tabs(cls, host: str = "localhost", port: int = 9222) -> list[dict]:
         """Return tab list from the /json endpoint."""
         resp = requests.get(f"http://{host}:{port}/json", timeout=10)
-        resp.raise_for_status()
+        _chrome_raise_for_status(resp)
         return resp.json()
 
     @classmethod
@@ -95,7 +107,7 @@ class CDPSession:
             headers={"Host": host},
             timeout=10,
         )
-        resp.raise_for_status()
+        _chrome_raise_for_status(resp)
         return resp.json()
 
     # ------------------------------------------------------------------
