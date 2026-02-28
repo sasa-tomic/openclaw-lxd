@@ -18,9 +18,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-import subprocess as _subprocess
 import sys
-import sys as _sys
 import threading
 from pathlib import Path
 
@@ -58,20 +56,26 @@ def _get_prefect_logs(flow_run_id, limit=50) -> str:
 def _on_flow_failure(flow, flow_run, state):
     """Auto-repair hook: fires on flow failure or crash. Non-blocking."""
     log_snippet = _get_prefect_logs(flow_run.id)
-    Path("/home/openclaw/clawd/logs").mkdir(parents=True, exist_ok=True)
-    _subprocess.Popen(
-        [
-            _sys.executable, "-u",
-            str(_REPAIR_SCRIPT),
-            "--flow-name", flow.name,
-            "--flow-run-id", str(flow_run.id),
-            "--state-message", str(state.message or ""),
-            "--log-snippet", log_snippet,
-        ],
-        stdout=open("/home/openclaw/clawd/logs/twitter-repair.log", "a"),
-        stderr=_subprocess.STDOUT,
-        cwd=str(Path(__file__).parent),
-    )
+    log_path = Path("/home/openclaw/clawd/logs/twitter-repair.log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = log_path.open("a")
+    try:
+        subprocess.Popen(
+            [
+                sys.executable, "-u",
+                str(_REPAIR_SCRIPT),
+                "--flow-name", flow.name,
+                "--flow-run-id", str(flow_run.id),
+                "--state-message", str(state.message or ""),
+                "--log-snippet", log_snippet,
+            ],
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            cwd=str(Path(__file__).parent),
+            close_fds=True,
+        )
+    finally:
+        log_fh.close()
 
 
 def _stream_pipe(pipe, log_fn, print_fn):

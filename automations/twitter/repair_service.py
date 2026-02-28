@@ -145,7 +145,7 @@ Primary script: /projects/automations/twitter/{primary_script}
 
 ## Verify your fix
 Run this command and ensure all tests pass:
-  cd /projects/automations/twitter && uv run pytest tests/ -q -m "not integration"
+  cd {worktree_path}/twitter && uv run pytest tests/ -q -m "not integration"
 
 You MUST run the tests and fix any failures before finishing.
 

@@ -1127,6 +1127,12 @@ CREATE TABLE IF NOT EXISTS tweet_replies (
 
 CREATE INDEX IF NOT EXISTS idx_tweet_replies_parent ON tweet_replies(parent_tweet_id);
 CREATE INDEX IF NOT EXISTS idx_tweet_replies_eng    ON tweet_replies((likes + retweets) DESC);
+
+CREATE TABLE IF NOT EXISTS tweet_context_cache (
+    tweet_id  TEXT PRIMARY KEY,
+    context   TEXT NOT NULL,   -- JSON blob
+    cached_at TEXT NOT NULL    -- ISO-8601 UTC timestamp
+);
 """
 
 
@@ -1227,6 +1233,49 @@ def queue_size(conn) -> int:
         )
         row = cur.fetchone()
         return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Tweet context cache
+# ---------------------------------------------------------------------------
+
+
+def get_cached_tweet_context(conn, tweet_id: str, ttl_hours: int = 1) -> dict | None:
+    """Return cached tweet context if fresh, else None."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT context, cached_at FROM tweet_context_cache WHERE tweet_id = %s",
+            (tweet_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        cached_at = datetime.fromisoformat(row["cached_at"].replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) - cached_at > timedelta(hours=ttl_hours):
+            return None
+    except (KeyError, ValueError):
+        return None
+    try:
+        return json.loads(row["context"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def store_tweet_context(conn, tweet_id: str, context: dict) -> None:
+    """Upsert tweet context into cache."""
+    cached_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO tweet_context_cache (tweet_id, context, cached_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (tweet_id) DO UPDATE SET
+                context   = EXCLUDED.context,
+                cached_at = EXCLUDED.cached_at
+            """,
+            (tweet_id, json.dumps(context, ensure_ascii=False), cached_at),
+        )
 
 
 def ensure_schema(conn) -> None:

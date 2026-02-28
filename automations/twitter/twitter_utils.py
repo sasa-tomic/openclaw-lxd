@@ -1061,43 +1061,19 @@ def search_candidates(
     return candidates
 
 
-def _load_tweet_context_cache() -> dict:
-    if TWEET_CONTEXT_CACHE_PATH.exists():
-        try:
-            return json.loads(TWEET_CONTEXT_CACHE_PATH.read_text())
-        except Exception as e:
-            logger.debug(f"_load_tweet_context_cache failed: {e}")
-    return {}
-
-
-def _save_tweet_context_cache(cache: dict) -> None:
-    TWEET_CONTEXT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = TWEET_CONTEXT_CACHE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n")
-    tmp.replace(TWEET_CONTEXT_CACHE_PATH)
+TWEET_CONTEXT_CACHE_TTL_HOURS = 1
 
 
 def _get_cached_tweet_context(tweet_id: str) -> dict | None:
-    cache = _load_tweet_context_cache()
-    entry = cache.get(tweet_id)
-    if not entry:
-        return None
-    try:
-        cached_at = datetime.fromisoformat(entry["cachedAt"].replace("Z", "+00:00"))
-        if datetime.now(timezone.utc) - cached_at > timedelta(
-            hours=TWEET_CONTEXT_CACHE_TTL_HOURS
-        ):
-            return None
-    except (KeyError, ValueError) as e:
-        logger.debug(f"_get_cached_tweet_context date parse failed: {e}")
-        return None
-    return entry.get("context")
+    from db import get_conn, get_cached_tweet_context as _db_get
+    with get_conn() as conn:
+        return _db_get(conn, tweet_id, ttl_hours=TWEET_CONTEXT_CACHE_TTL_HOURS)
 
 
 def _cache_tweet_context(tweet_id: str, context: dict) -> None:
-    cache = _load_tweet_context_cache()
-    cache[tweet_id] = {"cachedAt": utc_now(), "context": context}
-    _save_tweet_context_cache(cache)
+    from db import get_conn, store_tweet_context as _db_store
+    with get_conn() as conn:
+        _db_store(conn, tweet_id, context)
 
 
 def fetch_tweet_context(tweet_id: str) -> dict | None:
@@ -1305,12 +1281,6 @@ PROFILE_CACHE_TTL_DAYS = 7
 
 SEARCH_CACHE_PATH = Path("/home/openclaw/clawd/memory/twitter-search-cache.json")
 SEARCH_CACHE_TTL_HOURS = 12
-
-TWEET_CONTEXT_CACHE_PATH = Path(
-    "/home/openclaw/clawd/memory/twitter-tweet-context-cache.json"
-)
-TWEET_CONTEXT_CACHE_TTL_HOURS = 1
-
 
 def load_profile_cache() -> dict:
     """Load the profile cache. Returns {} if not found."""
