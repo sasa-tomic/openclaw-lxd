@@ -40,6 +40,7 @@ STATE_FILE = Path("/home/openclaw/clawd/memory/twitter-repair-state.json")
 LOG_DIR = Path("/home/openclaw/clawd/logs")
 REPAIR_COOLDOWN_HOURS = 2
 MAX_HISTORY = 100
+MAX_REPAIR_ATTEMPTS = 3
 
 AUTOMATIONS_DIR = Path("/projects/automations")
 WORKTREES_DIR = AUTOMATIONS_DIR / ".claude" / "worktrees"
@@ -149,6 +150,35 @@ Run this command and ensure all tests pass:
   cd {worktree_path}/twitter && uv run pytest tests/ -q -m "not integration"
 
 You MUST run the tests and fix any failures before finishing.
+
+## Summary
+End with a one-paragraph summary: what was broken, exactly what you changed, which files.
+"""
+
+
+def _build_retry_prompt(
+    flow_name: str,
+    primary_script: str,
+    attempt: int,
+    test_output: str,
+    worktree_path: Path,
+) -> str:
+    # Trim test output to avoid huge prompts
+    trimmed = test_output[-3000:] if len(test_output) > 3000 else test_output
+    return f"""Previous repair attempt {attempt} for '{flow_name}' fixed the flow but the test suite still has failures.
+
+## Test output from attempt {attempt}
+{trimmed}
+
+## Your task
+1. Read the failing test(s) and the source files they test
+2. Fix only the root cause — do NOT rewrite tests to skip or hide failures
+3. Run the tests again and confirm they pass:
+   cd {worktree_path}/twitter && uv run pytest tests/ -q -m "not integration"
+
+Primary script: /projects/automations/twitter/{primary_script}
+
+Be minimal. Touch only what is needed to make the tests green.
 
 ## Summary
 End with a one-paragraph summary: what was broken, exactly what you changed, which files.
@@ -285,47 +315,68 @@ def _do_repair(
             print(f"[repair] Warning: could not symlink .venv: {e}", flush=True)
 
     # ------------------------------------------------------------------
-    # 6 & 7. Build prompt and run opencode
+    # 6–8. Run opencode → test suite, with retries on test failure
     # ------------------------------------------------------------------
-    prompt = _build_prompt(flow_name, primary_script, state_message, log_snippet, related, worktree_path)
-
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
     env["TERM"] = "dumb"
 
-    print(f"[repair] Running opencode (timeout 3600s) …", flush=True)
-    try:
-        oc_result = subprocess.run(
-            ["timeout", "3600", OPENCODE_BIN, "run", prompt, "--dir", str(worktree_path)],
-            env=env,
+    opencode_exit = 0
+    opencode_output = ""
+    tests_passed = False
+    test_output = ""
+    test_summary = "no tests run"
+
+    for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
+        if attempt == 1:
+            prompt = _build_prompt(
+                flow_name, primary_script, state_message, log_snippet, related, worktree_path
+            )
+        else:
+            print(
+                f"[repair] Tests failed on attempt {attempt - 1}; retrying opencode with test output …",
+                flush=True,
+            )
+            prompt = _build_retry_prompt(
+                flow_name, primary_script, attempt - 1, test_output, worktree_path
+            )
+
+        print(f"[repair] Running opencode attempt {attempt}/{MAX_REPAIR_ATTEMPTS} (timeout 3600s) …", flush=True)
+        try:
+            oc_result = subprocess.run(
+                ["timeout", "3600", OPENCODE_BIN, "run", prompt, "--dir", str(worktree_path)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=3660,
+                cwd=str(worktree_path),
+            )
+        except subprocess.TimeoutExpired:
+            oc_result = type("R", (), {"returncode": 124, "stdout": "", "stderr": "timeout"})()
+
+        opencode_exit = oc_result.returncode
+        opencode_output = (oc_result.stdout or "") + "\n" + (oc_result.stderr or "")
+        print(f"[repair] opencode exited with code {opencode_exit}", flush=True)
+
+        print(f"[repair] Running test suite (attempt {attempt}) …", flush=True)
+        test_result = subprocess.run(
+            ["uv", "run", "pytest", "tests/", "-q", "-m", "not integration"],
+            cwd=str(worktree_path / "twitter"),
             capture_output=True,
             text=True,
-            timeout=3660,
-            cwd=str(worktree_path),
+            timeout=180,
+            env=env,
         )
-    except subprocess.TimeoutExpired:
-        oc_result = type("R", (), {"returncode": 124, "stdout": "", "stderr": "timeout"})()
+        tests_passed = test_result.returncode == 0
+        test_output = (test_result.stdout or "") + (test_result.stderr or "")
+        test_summary = _summarize_test_output(test_output, tests_passed)
+        print(
+            f"[repair] Tests {'PASSED' if tests_passed else 'FAILED'} (attempt {attempt}): {test_summary}",
+            flush=True,
+        )
 
-    opencode_exit = oc_result.returncode
-    opencode_output = (oc_result.stdout or "") + "\n" + (oc_result.stderr or "")
-    print(f"[repair] opencode exited with code {opencode_exit}", flush=True)
-
-    # ------------------------------------------------------------------
-    # 8. Run test suite inside worktree
-    # ------------------------------------------------------------------
-    print("[repair] Running test suite …", flush=True)
-    test_result = subprocess.run(
-        ["uv", "run", "pytest", "tests/", "-q", "-m", "not integration"],
-        cwd=str(worktree_path / "twitter"),
-        capture_output=True,
-        text=True,
-        timeout=180,
-        env=env,
-    )
-    tests_passed = test_result.returncode == 0
-    test_output = (test_result.stdout or "") + (test_result.stderr or "")
-    test_summary = _summarize_test_output(test_output, tests_passed)
-    print(f"[repair] Tests {'PASSED' if tests_passed else 'FAILED'}: {test_summary}", flush=True)
+        if tests_passed:
+            break
 
     # ------------------------------------------------------------------
     # 9 & 10. Merge or leave worktree
