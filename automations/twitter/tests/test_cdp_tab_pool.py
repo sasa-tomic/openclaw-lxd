@@ -137,7 +137,7 @@ def test_blocks_until_slot_freed():
     Main process tries to acquire — must wait >= hold_sec.
     """
     _cleanup_slot_locks()
-    hold_sec = 2.0
+    hold_sec = 1.0
     ready0 = multiprocessing.Event()
     ready1 = multiprocessing.Event()
     p0 = multiprocessing.Process(
@@ -188,7 +188,7 @@ def test_timeout_raises_when_all_slots_held():
         assert ready0.wait(timeout=10), "P0 did not acquire slot 0"
         assert ready1.wait(timeout=10), "P1 did not acquire slot 1"
 
-        deadline = time.monotonic() + 2.0  # short deadline
+        deadline = time.monotonic() + 1.0  # short deadline
         with pytest.raises(TimeoutError):
             slot, lf = _acquire_tab_slot(deadline)
             # Should not reach here; release if it somehow does

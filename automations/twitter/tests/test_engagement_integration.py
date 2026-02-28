@@ -94,28 +94,16 @@ def test_engagement_pipeline_dry_run(engagement, captured_replies):
         print(f"\n[DRY-RUN] Would have posted to {tweet_id}: {reply_text[:120]}", flush=True)
         return False, None  # prevents insert_engagement from running
 
-    try:
-        from db import get_queued_candidates as _real_gqc
-        def _gqc_limited(conn, limit=100):
-            return _real_gqc(conn, limit=min(limit, 2))
-    except Exception:
-        _gqc_limited = None
-
-    patches = [
-        patch.object(engagement, "post_reply", _mock_post_reply),
-        patch.object(engagement, "send_error_alert", lambda *a, **kw: None),
-        patch.object(engagement, "jitter_sleep", lambda *a, **kw: None),
-        patch.object(engagement, "auto_follow_after_engagement", lambda *a, **kw: None),
-    ]
-    if _gqc_limited is not None:
-        patches.append(patch.object(engagement, "get_queued_candidates", _gqc_limited))
+    def _gqc_2(conn, limit=100):
+        from db import get_queued_candidates as _real
+        return _real(conn, limit=min(limit, 2))
 
     with (
+        patch.object(engagement, "get_queued_candidates", _gqc_2),
         patch.object(engagement, "post_reply", _mock_post_reply),
         patch.object(engagement, "send_error_alert", lambda *a, **kw: None),
         patch.object(engagement, "jitter_sleep", lambda *a, **kw: None),
         patch.object(engagement, "auto_follow_after_engagement", lambda *a, **kw: None),
-        *(patches[4:]),  # the optional get_queued_candidates limit patch
     ):
         rc = engagement.main()
 
@@ -167,8 +155,13 @@ def test_llm_rate_limit_skips_gracefully(engagement):
     if not candidates:
         pytest.skip("No candidates in queue to test with")
 
+    def _gqc_2(conn, limit=100):
+        from db import get_queued_candidates as _real
+        return _real(conn, limit=min(limit, 2))
+
     # Simulate LLM always returning None (as it does after 429 exhaustion)
     with (
+        patch.object(engagement, "get_queued_candidates", _gqc_2),
         patch.object(engagement, "draft_reply_with_full_context", return_value=None),
         patch.object(engagement, "post_reply", return_value=(False, None)),
         patch.object(engagement, "send_error_alert", lambda *a, **kw: None),
