@@ -741,28 +741,24 @@ def main() -> int:
             # ── Layer 1: reach-sort — highest-visibility tweets first ─────────
             eligible.sort(key=_reach_score, reverse=True)
 
-            # ── Layer 2: LLM batch triage — pick best FETCH_BATCH from top 30 ─
+            # ── Layer 2: LLM batch triage — rank top 30, fetch context for all 30 ─
             TRIAGE_POOL = min(len(eligible), 30)
-            FETCH_BATCH = 15
             triage_pool = eligible[:TRIAGE_POOL]
 
             print(
                 f"Triaging {TRIAGE_POOL} reach-sorted candidates (of {len(eligible)} total)...",
                 flush=True,
             )
-            ranked_ids = llm_triage_candidates(triage_pool, top_n=FETCH_BATCH)
+            ranked_ids = llm_triage_candidates(triage_pool, top_n=TRIAGE_POOL)
 
-            # Reconstruct ordered list from triage result
+            # Reconstruct in triage-ranked order; fallback preserves reach-sort order
             id_to_candidate = {str(c["tweetId"]): c for c in triage_pool}
             selected = [id_to_candidate[tid] for tid in ranked_ids if tid in id_to_candidate]
-            if len(selected) < FETCH_BATCH:
-                # Fallback: fill remaining slots from reach-sorted pool
-                seen = {str(c["tweetId"]) for c in selected}
-                for c in triage_pool:
-                    if str(c["tweetId"]) not in seen:
-                        selected.append(c)
-                    if len(selected) >= FETCH_BATCH:
-                        break
+            # Append any the LLM omitted (shouldn't happen with top_n=TRIAGE_POOL)
+            seen = {str(c["tweetId"]) for c in selected}
+            for c in triage_pool:
+                if str(c["tweetId"]) not in seen:
+                    selected.append(c)
 
             print(f"Selected {len(selected)} candidates for context fetch")
 
