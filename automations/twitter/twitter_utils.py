@@ -765,6 +765,7 @@ def _cdp_search(
     ] = {}  # requestId -> True for in-flight SearchTimeline reqs
     _lock = threading.Lock()
     _shutdown = threading.Event()
+    _body_received = threading.Event()  # set whenever a new body is appended
 
     def _fetch_body(cdp, req_id: str) -> None:
         """Called from a worker thread — safe to call cdp.send() here."""
@@ -776,6 +777,7 @@ def _cdp_search(
             if body:
                 with _lock:
                     bodies.append(body)
+                _body_received.set()
         except Exception as e:
             logger.debug(f"_cdp_search getResponseBody {req_id}: {e}")
 
@@ -813,10 +815,16 @@ def _cdp_search(
                 executor.shutdown(wait=False)
                 return []
 
-            # Each scroll fires a new paginated SearchTimeline request
+            # Each scroll fires a new paginated SearchTimeline request.
+            # Wait for the response event rather than sleeping a fixed amount;
+            # break early if no new response arrives (results exhausted).
             for _ in range(5):
+                bodies_before = len(bodies)
+                _body_received.clear()
                 cdp.scroll_to_bottom()
-                time.sleep(2)
+                _body_received.wait(timeout=3)
+                if len(bodies) == bodies_before:
+                    break
 
             # Signal handlers to stop submitting, then drain the executor
             _shutdown.set()
