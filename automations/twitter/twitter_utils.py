@@ -810,14 +810,20 @@ def _cdp_search(
         cdp.on("Network.loadingFinished", on_loading_finished)
 
         try:
-            if not cdp.navigate(url, wait_sec=5):
+            if not cdp.navigate(url, wait_sec=1):
                 _shutdown.set()
                 executor.shutdown(wait=False)
                 return []
 
+            # The first SearchTimeline response fires during page load.
+            # Wait reactively instead of burning a fixed 5s.
+            _body_received.wait(timeout=5)
+
             # Each scroll fires a new paginated SearchTimeline request.
-            # Wait for the response event rather than sleeping a fixed amount;
-            # break early if no new response arrives (results exhausted).
+            # Break early when no new response arrives (results exhausted)
+            # or when we already have enough unique tweets to satisfy limit.
+            last_parsed_idx = 0
+            seen_so_far: set[str] = set()
             for _ in range(5):
                 bodies_before = len(bodies)
                 _body_received.clear()
@@ -825,6 +831,15 @@ def _cdp_search(
                 _body_received.wait(timeout=3)
                 if len(bodies) == bodies_before:
                     break
+                if limit:
+                    with _lock:
+                        new_bodies = bodies[last_parsed_idx:]
+                    last_parsed_idx += len(new_bodies)
+                    for body in new_bodies:
+                        for t in _parse_graphql_search_body(body):
+                            seen_so_far.add(t["tweetId"])
+                    if len(seen_so_far) >= limit:
+                        break
 
             # Signal handlers to stop submitting, then drain the executor
             _shutdown.set()
