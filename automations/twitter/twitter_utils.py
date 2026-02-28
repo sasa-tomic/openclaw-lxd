@@ -590,8 +590,13 @@ def post_reply(
                         'document.querySelector(\'[data-testid="toast"]\')?.textContent?.trim()'
                     )
                     if toast:
-                        print(f"  CDP: Twitter error toast detected: {toast[:120]}", flush=True)
-                        return False, None
+                        if "your post was sent" in toast.lower():
+                            # Success toast — Twitter confirmed submission.
+                            # Fall through to reply-ID extraction below.
+                            print(f"  CDP: success toast: {toast[:80]}", flush=True)
+                        else:
+                            print(f"  CDP: Twitter error toast detected: {toast[:120]}", flush=True)
+                            return False, None
                     # Extract our reply ID from the thread DOM (already on this page).
                     # The new reply renders immediately; its ID must be > tweet_id.
                     reply_id: str | None = None
