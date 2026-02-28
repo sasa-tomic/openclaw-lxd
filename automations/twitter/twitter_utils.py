@@ -11,7 +11,6 @@ import contextlib
 import fcntl
 import json
 import logging
-import os
 import random
 import re
 import subprocess
@@ -23,13 +22,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from email.utils import parsedate_to_datetime as _parse_twitter_date
 from urllib.parse import quote
+from cdp import CDPSession
 
 logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from lib.config import OPENCLAW_BIN, TWITTER_BASE_URL
+from lib.config import TWITTER_BASE_URL  # noqa: E402
 
-from cdp import CDPSession
 
 THREAD_INDEX_PATH = Path("/home/openclaw/clawd/memory/twitter-thread-index.json")
 STRATEGY_PATH = Path("/projects/automations/twitter/STRATEGY.md")
@@ -224,12 +223,12 @@ SKIP_PATTERNS = [
 # ---------------------------------------------------------------------------
 
 _CLOUD = "(aws OR gcp OR azure OR k8s OR vultr OR linode OR digitalocean OR hetzner OR contabo OR cloud)"
-_SUPPORT = "(down OR broken OR unreliable OR 'no support' OR 'bad support' OR trust OR ghost OR ghosted)"
+_SUPPORT = "(down OR broken OR unreliable OR support OR trust OR ghost OR ghosted OR nightmare OR painful OR stuck)"
 _P2P = "(runpod OR akash OR 'vast.ai' OR 'lambda labs' OR decentralized)"
 _PAAS = "(fly.io OR heroku OR 'render.com' OR railway)"
 _GPU = "(h100 OR a100 OR gpu OR B100 OR B300)"
 _PAIN = "(terrible OR useless OR ghosted OR broken)"
-_COST = "(expensive OR insane OR overpriced OR scam OR overpaying)"
+_COST = "(expensive OR insane OR overpriced OR scam OR overpaying OR cheaper)"
 
 # Kept for backwards-compat with generate_dynamic_keywords()
 PROVIDERS = _CLOUD
@@ -251,8 +250,6 @@ SEARCH_TERMS = [
     f"{_CLOUD} AND (outage OR incident) AND (SLA OR useless OR compensation OR credit OR nightmare OR burnout OR frustrating)",
     # Cloud exit — exact phrases people actually tweet
     f'(leaving OR ditching OR "moving off") AND {_CLOUD}',
-    # Cloud migration regret
-    f"{_CLOUD} AND migration AND (nightmare OR regret OR painful OR stuck)",
     # Self-hosting vs cloud debate
     '(cheaper OR better OR worth it) AND ("self-hosting" OR "self-hosted")',
     # Provider accountability — direct positioning angle
@@ -581,13 +578,15 @@ def post_reply(
             # Poll up to 8s for textarea to clear (reply submitted → div resets)
             deadline = time.time() + 8
             while time.time() < deadline:
-                still_text = cdp.evaluate(f'document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()')
+                still_text = cdp.evaluate(
+                    f"document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()"
+                )
                 if not still_text:
                     # Give Twitter a moment to surface any error toast before
                     # declaring success (errors also clear the textarea).
                     time.sleep(1.2)
                     toast = cdp.evaluate(
-                        'document.querySelector(\'[data-testid="toast"]\')?.textContent?.trim()'
+                        "document.querySelector('[data-testid=\"toast\"]')?.textContent?.trim()"
                     )
                     if toast:
                         if "your post was sent" in toast.lower():
@@ -595,7 +594,10 @@ def post_reply(
                             # Fall through to reply-ID extraction below.
                             print(f"  CDP: success toast: {toast[:80]}", flush=True)
                         else:
-                            print(f"  CDP: Twitter error toast detected: {toast[:120]}", flush=True)
+                            print(
+                                f"  CDP: Twitter error toast detected: {toast[:120]}",
+                                flush=True,
+                            )
                             return False, None
                     # Extract our reply ID from the thread DOM (already on this page).
                     # The new reply renders immediately; its ID must be > tweet_id.
@@ -610,7 +612,10 @@ def post_reply(
                     if reply_id:
                         print(f"  CDP: reply posted (id={reply_id})", flush=True)
                     else:
-                        print("  CDP: reply posted (could not read ID from page)", flush=True)
+                        print(
+                            "  CDP: reply posted (could not read ID from page)",
+                            flush=True,
+                        )
                     return True, reply_id
                 time.sleep(1)
             print("  CDP: reply may have failed (textarea still has text)", flush=True)
@@ -648,7 +653,9 @@ def post_tweet(text: str) -> bool:
             # Poll up to 8s for compose to close (textarea gone or empty)
             deadline = time.time() + 8
             while time.time() < deadline:
-                still_text = cdp.evaluate(f'document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()')
+                still_text = cdp.evaluate(
+                    f"document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()"
+                )
                 if not still_text:
                     print("  CDP: tweet posted successfully", flush=True)
                     return True
@@ -680,11 +687,7 @@ def _extract_graphql_tweet_node(node: dict) -> dict | None:
         # screen_name is under result.core in newer API responses; fall back to legacy
         user_core = user_result.get("core", {})
         legacy_user = user_result.get("legacy", {})
-        username = (
-            user_core.get("screen_name")
-            or legacy_user.get("screen_name")
-            or ""
-        )
+        username = user_core.get("screen_name") or legacy_user.get("screen_name") or ""
         legacy = node.get("legacy", {})
         tweet_id = legacy.get("id_str") or node.get("rest_id", "")
         text = legacy.get("full_text", "")
@@ -757,14 +760,18 @@ def _cdp_search(
     url = f"{TWITTER_BASE_URL}/search?q={encoded}&f=live"
 
     bodies: list[str] = []
-    pending_ids: dict[str, bool] = {}   # requestId -> True for in-flight SearchTimeline reqs
+    pending_ids: dict[
+        str, bool
+    ] = {}  # requestId -> True for in-flight SearchTimeline reqs
     _lock = threading.Lock()
     _shutdown = threading.Event()
 
     def _fetch_body(cdp, req_id: str) -> None:
         """Called from a worker thread — safe to call cdp.send() here."""
         try:
-            resp = cdp.send("Network.getResponseBody", {"requestId": req_id}, timeout=15)
+            resp = cdp.send(
+                "Network.getResponseBody", {"requestId": req_id}, timeout=15
+            )
             body = resp.get("result", {}).get("body") or resp.get("body", "")
             if body:
                 with _lock:
@@ -1043,7 +1050,9 @@ def search_candidates(
 
                 hit_count = len(fresh_candidates)
                 stale_note = f", {stale} stale dropped" if stale else ""
-                since_note = f" since:{since_dt.strftime('%H:%M UTC')}" if since_dt else ""
+                since_note = (
+                    f" since:{since_dt.strftime('%H:%M UTC')}" if since_dt else ""
+                )
                 print(
                     f"  CDP: '{term}'{since_note} => {hit_count} hits{stale_note}",
                     flush=True,
@@ -1071,12 +1080,14 @@ TWEET_CONTEXT_CACHE_TTL_HOURS = 1
 
 def _get_cached_tweet_context(tweet_id: str) -> dict | None:
     from db import get_conn, get_cached_tweet_context as _db_get
+
     with get_conn() as conn:
         return _db_get(conn, tweet_id, ttl_hours=TWEET_CONTEXT_CACHE_TTL_HOURS)
 
 
 def _cache_tweet_context(tweet_id: str, context: dict) -> None:
     from db import get_conn, store_tweet_context as _db_store
+
     with get_conn() as conn:
         _db_store(conn, tweet_id, context)
 
@@ -1286,6 +1297,7 @@ PROFILE_CACHE_TTL_DAYS = 7
 
 SEARCH_CACHE_PATH = Path("/home/openclaw/clawd/memory/twitter-search-cache.json")
 SEARCH_CACHE_TTL_HOURS = 12
+
 
 def load_profile_cache() -> dict:
     """Load the profile cache. Returns {} if not found."""
@@ -1553,7 +1565,10 @@ def get_follower_count(username: str) -> int | None:
     count = None
     try:
         with cdp_tab() as cdp:
-            print(f"  CDP: navigating to profile @{username} (follower count)...", flush=True)
+            print(
+                f"  CDP: navigating to profile @{username} (follower count)...",
+                flush=True,
+            )
             if not cdp.navigate(profile_url, wait_sec=3):
                 return None
             raw = cdp.evaluate(js, timeout=10)
@@ -1601,11 +1616,16 @@ def follow_user(username: str) -> bool:
             FOLLOW_BTN = '[data-testid$="-follow"]'
             UNFOLLOW_BTN = '[data-testid$="-unfollow"]'
             # Wait for either button to appear (page loaded)
-            if not cdp.wait_for(f'{FOLLOW_BTN}, {UNFOLLOW_BTN}', timeout=10):
-                print(f"  CDP: follow/unfollow button not found for @{username}", flush=True)
+            if not cdp.wait_for(f"{FOLLOW_BTN}, {UNFOLLOW_BTN}", timeout=10):
+                print(
+                    f"  CDP: follow/unfollow button not found for @{username}",
+                    flush=True,
+                )
                 return False
             # Check if already following
-            already = cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null')
+            already = cdp.evaluate(
+                f"document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null"
+            )
             if already:
                 print(f"  CDP: already following @{username}", flush=True)
                 return True
@@ -1616,7 +1636,9 @@ def follow_user(username: str) -> bool:
             # Poll up to 5s for unfollow button to confirm follow took effect
             deadline = time.time() + 5
             while time.time() < deadline:
-                if cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
+                if cdp.evaluate(
+                    f"document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null"
+                ):
                     print(f"  CDP: followed @{username}", flush=True)
                     return True
                 time.sleep(1)
@@ -1642,12 +1664,19 @@ def unfollow_user(username: str) -> bool:
             UNFOLLOW_BTN = '[data-testid$="-unfollow"]'
             CONFIRM_BTN = '[data-testid="confirmationSheetConfirm"]'
             # Wait for either button to appear (page loaded)
-            if not cdp.wait_for(f'{FOLLOW_BTN}, {UNFOLLOW_BTN}', timeout=10):
-                print(f"  CDP: follow/unfollow button not found for @{username}", flush=True)
+            if not cdp.wait_for(f"{FOLLOW_BTN}, {UNFOLLOW_BTN}", timeout=10):
+                print(
+                    f"  CDP: follow/unfollow button not found for @{username}",
+                    flush=True,
+                )
                 return False
             # Check if actually following
-            if not cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
-                print(f"  CDP: not following @{username} (no unfollow button)", flush=True)
+            if not cdp.evaluate(
+                f"document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null"
+            ):
+                print(
+                    f"  CDP: not following @{username} (no unfollow button)", flush=True
+                )
                 return True  # Already not following
             print(f"  CDP: clicking Following to unfollow @{username}...", flush=True)
             if not cdp.click(UNFOLLOW_BTN):
@@ -1655,14 +1684,19 @@ def unfollow_user(username: str) -> bool:
                 return False
             # Wait for confirmation dialog
             if not cdp.wait_for(CONFIRM_BTN, timeout=5):
-                print(f"  CDP: Unfollow confirmation not found for @{username}", flush=True)
+                print(
+                    f"  CDP: Unfollow confirmation not found for @{username}",
+                    flush=True,
+                )
                 return False
             if not cdp.click(CONFIRM_BTN):
                 return False
             # Poll up to 5s for unfollow to confirm
             deadline = time.time() + 5
             while time.time() < deadline:
-                if not cdp.evaluate(f'document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null'):
+                if not cdp.evaluate(
+                    f"document.querySelector({json.dumps(UNFOLLOW_BTN)}) !== null"
+                ):
                     print(f"  CDP: unfollowed @{username}", flush=True)
                     return True
                 time.sleep(1)
@@ -1691,7 +1725,10 @@ def check_follows_back(username: str) -> bool | None:
 
     try:
         with cdp_tab() as cdp:
-            print(f"  CDP: navigating to profile @{username} (follows-back check)...", flush=True)
+            print(
+                f"  CDP: navigating to profile @{username} (follows-back check)...",
+                flush=True,
+            )
             if not cdp.navigate(profile_url, wait_sec=3):
                 return None
             result = cdp.evaluate(js, timeout=10)
