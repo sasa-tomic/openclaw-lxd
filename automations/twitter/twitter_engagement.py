@@ -446,7 +446,9 @@ Output ONLY valid JSON, nothing else.
         audience_score = decision.get("audienceEngagementPotential", 5)
         profile_click_worthy = decision.get("profileClickWorthy", False)
         if not decision.get("shouldEngage") or audience_score < 3:
-            print(f"  LLM skipped: {json.dumps(decision)}")
+            tweet_id = candidate.get("tweetId", "?")
+            tweet_text = (tweet_context.get("text") or "")[:120]
+            print(f"  LLM skipped [{tweet_id}]: {tweet_text!r}\n  Decision: {json.dumps(decision)}")
             decision["shouldEngage"] = False
             return decision
 
@@ -862,7 +864,8 @@ def main() -> int:
 
                 if not decision or not decision.get("shouldEngage"):
                     if decision:
-                        print(f"  LLM skipped: {json.dumps(decision)}")
+                        tweet_text = (tweet_context.get("text") or "")[:120]
+                        print(f"  LLM skipped [{tweet_id}]: {tweet_text!r}\n  Decision: {json.dumps(decision)}")
                     continue
 
                 engagement_type = decision.get("engagementType", "reply")
