@@ -102,9 +102,8 @@ class CDPSession:
 
         Returns the new tab's info dict (including webSocketDebuggerUrl).
         """
-        resp = requests.put(
+        resp = requests.get(
             f"http://{host}:{port}/json/new",
-            headers={"Host": host},
             timeout=10,
         )
         _chrome_raise_for_status(resp)

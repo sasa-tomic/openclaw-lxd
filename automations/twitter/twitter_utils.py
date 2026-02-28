@@ -765,6 +765,11 @@ def post_tweet(text: str) -> bool:
             if not cdp.wait_for(TEXTAREA, timeout=10):
                 print("  CDP: compose textbox not found", flush=True)
                 return False
+            # Verify the compose modal loaded (not the home-page sidebar widget,
+            # which also has tweetTextarea_0 but uses tweetButtonInline, not tweetButton).
+            if not cdp.wait_for(POST_BTN, timeout=8):
+                print("  CDP: compose Post button not found — modal may not have loaded", flush=True)
+                return False
             print(f"  CDP: typing tweet...", flush=True)
             if not cdp.type_text(TEXTAREA, text):
                 print("  CDP: typing failed", flush=True)
@@ -772,7 +777,7 @@ def post_tweet(text: str) -> bool:
             time.sleep(0.5)
             print(f"  CDP: clicking Post...", flush=True)
             if not cdp.click(POST_BTN):
-                print("  CDP: Post button not found", flush=True)
+                print("  CDP: Post button click failed", flush=True)
                 return False
             # Poll up to 8s for compose to close (textarea gone or empty)
             deadline = time.time() + 8

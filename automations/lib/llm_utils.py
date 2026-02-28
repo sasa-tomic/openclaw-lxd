@@ -176,6 +176,7 @@ def call_llm(
                 else:
                     last_error = (
                         f"{model_label} model '{model_name}' returned empty content"
+                        f" — body: {response.text[:500]}"
                     )
                     print(f"LLM: {last_error}", file=sys.stderr)
                     if attempt < max_retries - 1:
@@ -187,19 +188,22 @@ def call_llm(
                 if attempt < max_retries - 1 and attempt < len(_RETRY_DELAYS):
                     wait = _RETRY_DELAYS[attempt]
                     print(
-                        f"LLM: HTTP 429 rate limit on {model_label} model '{model_name}'. "
-                        f"Waiting {wait}s before retry...",
+                        f"LLM: HTTP 429 rate limit on {model_label} model '{model_name}' "
+                        f"— body: {response.text[:500]}. Waiting {wait}s before retry...",
                         flush=True,
                     )
                     time.sleep(wait)
                     continue
                 else:
-                    last_error = f"HTTP 429 rate limit on {model_label} model '{model_name}' - all attempts exhausted"
+                    last_error = (
+                        f"HTTP 429 rate limit on {model_label} model '{model_name}' - all attempts exhausted"
+                        f" — body: {response.text[:500]}"
+                    )
                     print(f"LLM: {last_error}", file=sys.stderr)
                     break
 
             else:
-                last_error = f"{model_label} model '{model_name}' returned HTTP {response.status_code}: {response.text[:300]}"
+                last_error = f"{model_label} model '{model_name}' returned HTTP {response.status_code} — body: {response.text[:500]}"
                 print(f"LLM: {last_error}", file=sys.stderr)
                 break
 
