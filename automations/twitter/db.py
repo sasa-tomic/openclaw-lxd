@@ -1220,14 +1220,14 @@ def mark_queue_processed(conn, tweet_ids: list[str]) -> None:
 
 
 def queue_size(conn) -> int:
-    """Count unprocessed candidates whose tweet is < 6 hours old."""
+    """Count unprocessed candidates whose tweet is < 24 hours old."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT COUNT(*) FROM candidate_queue
-            WHERE processed_at IS NULL
-              AND tweet_id NOT IN (SELECT tweet_id FROM engagements)
-              AND to_timestamp(((tweet_id::bigint >> 22) + 1288834974657) / 1000.0)
+            SELECT COUNT(*) FROM candidate_queue cq
+            WHERE cq.processed_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM engagements e WHERE e.tweet_id = cq.tweet_id)
+              AND to_timestamp(((cq.tweet_id::bigint >> 22) + 1288834974657) / 1000.0)
                     > now() - interval '24 hours'
             """
         )

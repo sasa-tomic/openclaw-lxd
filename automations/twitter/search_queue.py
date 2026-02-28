@@ -157,13 +157,13 @@ def cmd_show(args: argparse.Namespace) -> int:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT tweet_id, author, search_term, queued_at, text
-                FROM candidate_queue
-                WHERE processed_at IS NULL
-                  AND tweet_id NOT IN (SELECT tweet_id FROM engagements)
-                  AND to_timestamp(((tweet_id::bigint >> 22) + 1288834974657) / 1000.0)
+                SELECT cq.tweet_id, cq.author, cq.search_term, cq.queued_at, cq.text
+                FROM candidate_queue cq
+                WHERE cq.processed_at IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM engagements e WHERE e.tweet_id = cq.tweet_id)
+                  AND to_timestamp(((cq.tweet_id::bigint >> 22) + 1288834974657) / 1000.0)
                         > now() - interval '24 hours'
-                ORDER BY tweet_id DESC
+                ORDER BY cq.tweet_id DESC
                 LIMIT %s
                 """,
                 (args.limit,),
@@ -202,13 +202,13 @@ def cmd_stats(_args: argparse.Namespace) -> int:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT tweet_id, search_term
-                FROM candidate_queue
-                WHERE processed_at IS NULL
-                  AND tweet_id NOT IN (SELECT tweet_id FROM engagements)
-                  AND to_timestamp(((tweet_id::bigint >> 22) + 1288834974657) / 1000.0)
+                SELECT cq.tweet_id, cq.search_term
+                FROM candidate_queue cq
+                WHERE cq.processed_at IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM engagements e WHERE e.tweet_id = cq.tweet_id)
+                  AND to_timestamp(((cq.tweet_id::bigint >> 22) + 1288834974657) / 1000.0)
                         > now() - interval '24 hours'
-                ORDER BY tweet_id ASC
+                ORDER BY cq.tweet_id ASC
                 """
             )
             rows = cur.fetchall()
