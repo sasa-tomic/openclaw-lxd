@@ -83,6 +83,7 @@ def test_engagement_pipeline_dry_run(engagement, captured_replies):
 
     post_reply is intercepted so nothing reaches Twitter.
     Everything else — browser navigation, DOM extraction, LLM calls — is real.
+    Candidate limit is capped at 2 to keep the test fast.
     """
     def _mock_post_reply(tweet_id, reply_text):
         """Record what would have been posted, return failure so no DB insert."""
@@ -93,11 +94,28 @@ def test_engagement_pipeline_dry_run(engagement, captured_replies):
         print(f"\n[DRY-RUN] Would have posted to {tweet_id}: {reply_text[:120]}", flush=True)
         return False, None  # prevents insert_engagement from running
 
+    try:
+        from db import get_queued_candidates as _real_gqc
+        def _gqc_limited(conn, limit=100):
+            return _real_gqc(conn, limit=min(limit, 2))
+    except Exception:
+        _gqc_limited = None
+
+    patches = [
+        patch.object(engagement, "post_reply", _mock_post_reply),
+        patch.object(engagement, "send_error_alert", lambda *a, **kw: None),
+        patch.object(engagement, "jitter_sleep", lambda *a, **kw: None),
+        patch.object(engagement, "auto_follow_after_engagement", lambda *a, **kw: None),
+    ]
+    if _gqc_limited is not None:
+        patches.append(patch.object(engagement, "get_queued_candidates", _gqc_limited))
+
     with (
         patch.object(engagement, "post_reply", _mock_post_reply),
         patch.object(engagement, "send_error_alert", lambda *a, **kw: None),
         patch.object(engagement, "jitter_sleep", lambda *a, **kw: None),
         patch.object(engagement, "auto_follow_after_engagement", lambda *a, **kw: None),
+        *(patches[4:]),  # the optional get_queued_candidates limit patch
     ):
         rc = engagement.main()
 
