@@ -1061,6 +1061,45 @@ def search_candidates(
     return candidates
 
 
+def _load_tweet_context_cache() -> dict:
+    if TWEET_CONTEXT_CACHE_PATH.exists():
+        try:
+            return json.loads(TWEET_CONTEXT_CACHE_PATH.read_text())
+        except Exception as e:
+            logger.debug(f"_load_tweet_context_cache failed: {e}")
+    return {}
+
+
+def _save_tweet_context_cache(cache: dict) -> None:
+    TWEET_CONTEXT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TWEET_CONTEXT_CACHE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n")
+    tmp.replace(TWEET_CONTEXT_CACHE_PATH)
+
+
+def _get_cached_tweet_context(tweet_id: str) -> dict | None:
+    cache = _load_tweet_context_cache()
+    entry = cache.get(tweet_id)
+    if not entry:
+        return None
+    try:
+        cached_at = datetime.fromisoformat(entry["cachedAt"].replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) - cached_at > timedelta(
+            hours=TWEET_CONTEXT_CACHE_TTL_HOURS
+        ):
+            return None
+    except (KeyError, ValueError) as e:
+        logger.debug(f"_get_cached_tweet_context date parse failed: {e}")
+        return None
+    return entry.get("context")
+
+
+def _cache_tweet_context(tweet_id: str, context: dict) -> None:
+    cache = _load_tweet_context_cache()
+    cache[tweet_id] = {"cachedAt": utc_now(), "context": context}
+    _save_tweet_context_cache(cache)
+
+
 def fetch_tweet_context(tweet_id: str) -> dict | None:
     """Fetch tweet context (text, author, stats, full thread) via Chrome CDP.
 
@@ -1073,6 +1112,11 @@ def fetch_tweet_context(tweet_id: str) -> dict | None:
 
     Uses CDPSession (direct WebSocket).
     """
+    cached = _get_cached_tweet_context(tweet_id)
+    if cached:
+        print(f"  Using cached tweet context for {tweet_id}", flush=True)
+        return cached
+
     tweet_url = f"https://x.com/i/web/status/{tweet_id}"
 
     # Extract tweet data via JavaScript.
@@ -1233,7 +1277,7 @@ def fetch_tweet_context(tweet_id: str) -> dict | None:
         parent_chain = data.get("parentChain") or []
         reply_to = parent_chain[-1] if parent_chain else None
 
-        return {
+        result = {
             "tweetId": tweet_id,
             "author": data["username"],
             "authorName": data.get("displayName", ""),
@@ -1249,6 +1293,8 @@ def fetch_tweet_context(tweet_id: str) -> dict | None:
             "threadContinuation": data.get("threadContinuation"),
             "otherReplies": data.get("otherReplies"),
         }
+        _cache_tweet_context(tweet_id, result)
+        return result
     except (json.JSONDecodeError, TypeError) as e:
         print(f"  CDP fetch_tweet_context parse error: {e}", flush=True)
         return None
@@ -1258,7 +1304,12 @@ PROFILE_CACHE_PATH = Path("/home/openclaw/clawd/memory/twitter-profile-cache.jso
 PROFILE_CACHE_TTL_DAYS = 7
 
 SEARCH_CACHE_PATH = Path("/home/openclaw/clawd/memory/twitter-search-cache.json")
-SEARCH_CACHE_TTL_HOURS = 6
+SEARCH_CACHE_TTL_HOURS = 12
+
+TWEET_CONTEXT_CACHE_PATH = Path(
+    "/home/openclaw/clawd/memory/twitter-tweet-context-cache.json"
+)
+TWEET_CONTEXT_CACHE_TTL_HOURS = 1
 
 
 def load_profile_cache() -> dict:

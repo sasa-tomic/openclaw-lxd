@@ -63,7 +63,9 @@ def test_happy_path_articles_found_immediately():
     """Articles appear on the first wait_for — no warmup needed."""
     cdp = _make_cdp_mock(first_wait_for=True)
 
-    with patch("twitter_utils.cdp_tab") as mock_tab:
+    with patch("twitter_utils.cdp_tab") as mock_tab, \
+         patch("twitter_utils._get_cached_tweet_context", return_value=None), \
+         patch("twitter_utils._cache_tweet_context"):
         mock_tab.return_value = contextlib.contextmanager(lambda: (yield cdp))()
 
         from twitter_utils import fetch_tweet_context
@@ -84,7 +86,9 @@ def test_stuck_tab_triggers_home_warmup():
     """First wait_for times out (stuck tab) → warmup via home → retry succeeds."""
     cdp = _make_cdp_mock(first_wait_for=False, second_wait_for=True)
 
-    with patch("twitter_utils.cdp_tab") as mock_tab:
+    with patch("twitter_utils.cdp_tab") as mock_tab, \
+         patch("twitter_utils._get_cached_tweet_context", return_value=None), \
+         patch("twitter_utils._cache_tweet_context"):
         mock_tab.return_value = contextlib.contextmanager(lambda: (yield cdp))()
 
         from twitter_utils import fetch_tweet_context
@@ -104,7 +108,9 @@ def test_stuck_tab_warmup_also_fails_returns_none():
     """Both wait_for calls fail → returns None without crashing."""
     cdp = _make_cdp_mock(first_wait_for=False, second_wait_for=False)
 
-    with patch("twitter_utils.cdp_tab") as mock_tab:
+    with patch("twitter_utils.cdp_tab") as mock_tab, \
+         patch("twitter_utils._get_cached_tweet_context", return_value=None), \
+         patch("twitter_utils._cache_tweet_context"):
         mock_tab.return_value = contextlib.contextmanager(lambda: (yield cdp))()
 
         from twitter_utils import fetch_tweet_context
@@ -119,7 +125,8 @@ def test_navigate_failure_returns_none():
     cdp = MagicMock()
     cdp.navigate.return_value = False
 
-    with patch("twitter_utils.cdp_tab") as mock_tab:
+    with patch("twitter_utils.cdp_tab") as mock_tab, \
+         patch("twitter_utils._get_cached_tweet_context", return_value=None):
         mock_tab.return_value = contextlib.contextmanager(lambda: (yield cdp))()
 
         from twitter_utils import fetch_tweet_context
@@ -135,7 +142,9 @@ def test_malformed_js_response_returns_none():
     cdp = _make_cdp_mock(first_wait_for=True)
     cdp.evaluate.return_value = "not json at all {{"
 
-    with patch("twitter_utils.cdp_tab") as mock_tab:
+    with patch("twitter_utils.cdp_tab") as mock_tab, \
+         patch("twitter_utils._get_cached_tweet_context", return_value=None), \
+         patch("twitter_utils._cache_tweet_context"):
         mock_tab.return_value = contextlib.contextmanager(lambda: (yield cdp))()
 
         from twitter_utils import fetch_tweet_context

@@ -28,6 +28,7 @@ from twitter_utils import (
     TWITTER_BASE_URL,
     cdp_tab,
     fetch_user_profile,
+    get_user_profile,
     follow_user,
     jitter_sleep,
     send_error_alert,
@@ -192,7 +193,7 @@ def score_unscored_candidates(conn) -> int:
             continue
 
         try:
-            profile = fetch_user_profile(username)
+            profile = get_user_profile(username)
             if not profile:
                 print(f"  No profile for @{username} — skipping", flush=True)
                 continue
@@ -368,7 +369,7 @@ def fetch_and_score_new_candidates(conn, usernames: list[str]) -> int:
     profiles: list[dict] = []
     for username in usernames:
         try:
-            profile = fetch_user_profile(username)
+            profile = get_user_profile(username)
             if not profile:
                 continue
             fc = profile.get("followersCount") or 0

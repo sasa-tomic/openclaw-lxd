@@ -170,11 +170,25 @@ def draft_reply_with_full_context(
         recent_engagements, recent_posts
     )
 
+    # Detect whether we're already part of this thread (pre-compute for the LLM).
+    our_handle_lower = "decentcloud_org"
+    parent_chain = tweet_context.get("parentChain") or []
+    other_replies = tweet_context.get("otherReplies") or []
+    already_in_thread = (
+        any((p.get("username") or "").lower() == our_handle_lower for p in parent_chain)
+        or any((r.get("username") or "").lower() == our_handle_lower for r in other_replies)
+    )
+    immediate_parent = parent_chain[-1] if parent_chain else None
+    replying_to_self = (
+        immediate_parent is not None
+        and (immediate_parent.get("username") or "").lower() == our_handle_lower
+    )
+
     # Build full conversation context sections — oldest (root) first for clarity
     parent_chain_text = "None (original tweet, not a reply)"
-    if tweet_context.get("parentChain"):
+    if parent_chain:
         parts = []
-        for i, p in enumerate(tweet_context["parentChain"], 1):
+        for i, p in enumerate(parent_chain, 1):
             parts.append(f'  [{i}] @{p.get("username", "?")} said: "{p.get("text", "")}"')
         parent_chain_text = "\n".join(parts)
     elif tweet_context.get("replyTo"):
@@ -182,10 +196,10 @@ def draft_reply_with_full_context(
         parent_chain_text = f'  [1] @{rt.get("username", "?")} said: "{rt.get("text", "")}"'
 
     other_replies_text = "None visible yet"
-    if tweet_context.get("otherReplies"):
+    if other_replies:
         lines = [
             f'  - @{r.get("username", "?")}: "{r.get("text", "")}"'
-            for r in tweet_context["otherReplies"]
+            for r in other_replies
         ]
         other_replies_text = "\n".join(lines)
 
@@ -268,6 +282,8 @@ def draft_reply_with_full_context(
 **Found via:** "{candidate.get("searchTerm", "N/A")}"
 **Stats:** {tweet_context["stats"]["likes"]} likes, {tweet_context["stats"]["retweets"]} RTs, {tweet_context["stats"]["replies"]} replies
 **Estimated reply visibility:** ~{tweet_context["stats"]["likes"] * 20 + tweet_context["stats"]["retweets"] * 50:,} impressions (higher = our reply gets more eyeballs)
+**Have we already participated in this thread?** {"YES" if already_in_thread else "NO — this would be our first reply in this thread"}
+**Is the immediate parent tweet from us (replying to ourselves)?** {"YES" if replying_to_self else "NO"}
 
 # Author Profile (determine if they're target audience)
 {author_profile_text}
@@ -309,13 +325,21 @@ Read the full thread above. Then answer internally:
 4. **Have we talked to this person before?** See "Prior exchanges" above. If so, does the current message suggest the previous exchange went poorly (they pushed back, corrected us, or seem frustrated)? If yes, apply maximum scrutiny — silence is better than doubling down on a bad take.
 5. **Check other replies in the thread.** Don't repeat a point that's already been made by someone else.
 
-You MUST qualify for one of these two modes to engage:
+**Mode selection (hard rule — not a judgment call):**
 
-**Mode A — Sharp standalone take:** A specific fact, honest observation, or genuinely funny/cynical line that works even for someone who hasn't read the whole thread. Earns likes from the audience on its own merits. Does NOT contradict or miss what was actually said.
+- **"Have we already participated in this thread?" = YES → Mode B ONLY.**
+  We are mid-conversation. We must continue coherently. A tangential take — even a sharp one — is off-topic and makes us look like we're not following the thread. Mode A is not available.
 
-**Mode B — Coherent continuation:** You understand exactly what was said, and your reply clearly follows from and advances this specific conversation. Someone reading the thread would see your reply as a natural, on-point next step — not a tangent, not a repeat of what's already been said, not an expert lecture into casual banter.
+- **"Have we already participated in this thread?" = NO → Mode A or Mode B are both valid.**
+  This is our first entry into the thread.
 
-If you cannot confidently qualify for Mode A or Mode B, set shouldEngage: false. It is always better to skip than to post something that reads as off-topic, tone-deaf, or confused.
+**Mode A — Sharp standalone take (first reply only):** A specific fact, honest observation, or genuinely funny/cynical line that earns likes on its own merits AND is a direct response to what was actually said. "Works standalone" does not mean "ignores the conversation" — it must still address the specific point being made, not just the general topic area.
+
+**Mode B — Coherent continuation:** You understand exactly what was said, and your reply clearly follows from and advances this specific conversation. Someone reading the thread would see your reply as a natural on-point next step — not a tangent, not a repeat, not an expert lecture dropped into casual banter.
+
+**Replying to ourselves:** "Is the immediate parent tweet from us?" = YES means we would be responding to our own previous message. Only engage if you are directly extending or elaborating on what we already said. Do not introduce an unrelated angle.
+
+If you cannot confidently qualify for the applicable mode, set shouldEngage: false. It is always better to skip than to post something that reads as off-topic, tone-deaf, or confused.
 
 # Engagement Scoring
 **PRIORITIZE (score 8-10):**
