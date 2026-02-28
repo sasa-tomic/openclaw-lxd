@@ -14,3 +14,5 @@ uv run pytest tests/ -q
 ```
 
 All tests must pass. Fix any failures before finishing.
+
+**Use judgment about scope.** If the change is isolated (e.g. a standalone script not imported by anything else), skip the suite — don't test blindly just to follow the rule.
