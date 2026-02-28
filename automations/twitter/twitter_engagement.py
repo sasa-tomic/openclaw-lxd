@@ -476,10 +476,6 @@ Output ONLY valid JSON, nothing else.
             return decision
 
         engagement_type = decision.get("engagementType", "reply")
-        if not profile_click_worthy and audience_score < 5 and engagement_type != "like":
-            print(f"  Not profile-click-worthy + low audience score: {json.dumps(decision)}")
-            decision["shouldEngage"] = False
-            return decision
 
         reply = decision.get("reply")
         if engagement_type != "like" and (not reply or len(reply) > 280):
