@@ -199,6 +199,16 @@ class CDPSession:
         if self._dialog_handler_enabled:
             return
         self._dialog_handler_enabled = True
+
+        # Dismiss any dialog that might be blocking this tab before enabling Page
+        # events.  A previous session may have left a "Leave page?" beforeunload
+        # dialog open whose WebSocket closed before it could auto-dismiss it,
+        # causing Page.enable (and every other command) to timeout on this tab.
+        try:
+            self.send("Page.handleJavaScriptDialog", {"accept": True}, timeout=5)
+        except Exception:
+            pass  # No dialog open — expected in the normal case.
+
         self.send("Page.enable", {})
 
         def _handle_dialog(params: dict) -> None:
