@@ -16,8 +16,11 @@ Or run ad-hoc:
 
 from __future__ import annotations
 
+import json
 import subprocess
+import subprocess as _subprocess
 import sys
+import sys as _sys
 import threading
 from pathlib import Path
 
@@ -25,6 +28,50 @@ from prefect import flow, get_run_logger
 
 TWITTER_DIR = Path("/projects/automations/twitter")
 PYTHON = sys.executable
+
+_REPAIR_SCRIPT = Path(__file__).parent / "repair_service.py"
+
+
+def _get_prefect_logs(flow_run_id, limit=50) -> str:
+    """Fetch recent log lines from the local Prefect API."""
+    import urllib.request
+
+    url = "http://127.0.0.1:4200/api/logs/filter"
+    payload = json.dumps({
+        "logs": {"flow_run_id": {"any_": [str(flow_run_id)]}},
+        "limit": limit,
+    }).encode()
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logs = json.loads(resp.read())
+            return "\n".join(
+                f"[{'ERROR' if l.get('level', 0) >= 40 else 'INFO'}] {l.get('message', '')[:300]}"
+                for l in logs
+            )
+    except Exception:
+        return ""
+
+
+def _on_flow_failure(flow, flow_run, state):
+    """Auto-repair hook: fires on flow failure or crash. Non-blocking."""
+    log_snippet = _get_prefect_logs(flow_run.id)
+    Path("/home/openclaw/clawd/logs").mkdir(parents=True, exist_ok=True)
+    _subprocess.Popen(
+        [
+            _sys.executable, "-u",
+            str(_REPAIR_SCRIPT),
+            "--flow-name", flow.name,
+            "--flow-run-id", str(flow_run.id),
+            "--state-message", str(state.message or ""),
+            "--log-snippet", log_snippet,
+        ],
+        stdout=open("/home/openclaw/clawd/logs/twitter-repair.log", "a"),
+        stderr=_subprocess.STDOUT,
+        cwd=str(Path(__file__).parent),
+    )
 
 
 def _stream_pipe(pipe, log_fn, print_fn):
@@ -94,7 +141,7 @@ def run_script(script_path: Path, timeout: int = 3600, logger=None) -> int:
     return rc
 
 
-@flow(name="twitter-engagement", log_prints=True)
+@flow(name="twitter-engagement", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def engagement_flow():
     """Autonomous Twitter engagement - 5x daily."""
     logger = get_run_logger()
@@ -104,7 +151,7 @@ def engagement_flow():
     return code
 
 
-@flow(name="twitter-original-content", log_prints=True)
+@flow(name="twitter-original-content", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def original_content_flow():
     """Post original content - 2x daily."""
     logger = get_run_logger()
@@ -114,7 +161,7 @@ def original_content_flow():
     return code
 
 
-@flow(name="twitter-weekly-thread", log_prints=True)
+@flow(name="twitter-weekly-thread", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def weekly_thread_flow():
     """Post weekly thread - Wed 15:00 UTC."""
     logger = get_run_logger()
@@ -124,7 +171,7 @@ def weekly_thread_flow():
     return code
 
 
-@flow(name="twitter-daily-eval", log_prints=True)
+@flow(name="twitter-daily-eval", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def daily_eval_flow():
     """Daily strategy evaluation - 7:00 UTC."""
     logger = get_run_logger()
@@ -134,7 +181,7 @@ def daily_eval_flow():
     return code
 
 
-@flow(name="twitter-morning-research", log_prints=True)
+@flow(name="twitter-morning-research", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def morning_research_flow():
     """Morning research - 8:00 UTC."""
     logger = get_run_logger()
@@ -144,7 +191,7 @@ def morning_research_flow():
     return code
 
 
-@flow(name="twitter-cdp-health", log_prints=True)
+@flow(name="twitter-cdp-health", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def cdp_health_flow():
     """CDP health check - every 15 min."""
     logger = get_run_logger()
@@ -154,7 +201,7 @@ def cdp_health_flow():
     return code
 
 
-@flow(name="twitter-reply-monitor", log_prints=True)
+@flow(name="twitter-reply-monitor", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def reply_monitor_flow():
     """Monitor and respond to replies/mentions — every 5 min."""
     logger = get_run_logger()
@@ -165,7 +212,7 @@ def reply_monitor_flow():
 
 
 
-@flow(name="twitter-target-monitor", log_prints=True)
+@flow(name="twitter-target-monitor", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def target_monitor_flow():
     """Monitor target accounts for fast-reply opportunities -- every 30 min."""
     logger = get_run_logger()
@@ -175,7 +222,7 @@ def target_monitor_flow():
     return code
 
 
-@flow(name="twitter-timeline-monitor", log_prints=True)
+@flow(name="twitter-timeline-monitor", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def timeline_monitor_flow():
     """Monitor Following feed for near-realtime reply opportunities — every 5 min."""
     logger = get_run_logger()
@@ -185,7 +232,7 @@ def timeline_monitor_flow():
     return code
 
 
-@flow(name="twitter-search-queue", log_prints=True)
+@flow(name="twitter-search-queue", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def search_queue_flow():
     """Fill candidate queue via CDP search — every hour."""
     logger = get_run_logger()
@@ -195,7 +242,7 @@ def search_queue_flow():
     return code
 
 
-@flow(name="twitter-account-discovery", log_prints=True)
+@flow(name="twitter-account-discovery", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def account_discovery_flow():
     """Discover and score new candidate accounts — daily."""
     logger = get_run_logger()
