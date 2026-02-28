@@ -46,6 +46,7 @@ class CDPSession:
         # Maps CDP event method name -> list of callables
         self._event_handlers: dict[str, list] = {}
         self._lock = threading.Lock()
+        self._dialog_handler_enabled = False
         self._listener = threading.Thread(target=self._listen, daemon=True)
         self._listener.start()
 
@@ -173,12 +174,38 @@ class CDPSession:
     # High-level helpers
     # ------------------------------------------------------------------
 
+    def _setup_dialog_handler(self) -> None:
+        """Enable auto-dismissal of beforeunload/confirm dialogs.
+
+        Registers a one-time Page.javascriptDialogOpening handler that accepts
+        any dialog (beforeunload, alert, confirm, prompt) automatically.
+        Must be called after the WebSocket is open. Safe to call multiple times.
+        """
+        if self._dialog_handler_enabled:
+            return
+        self._dialog_handler_enabled = True
+        self.send("Page.enable", {})
+
+        def _handle_dialog(params: dict) -> None:
+            # Cannot call send() from the listener thread directly — use a thread.
+            def _accept() -> None:
+                try:
+                    self.send("Page.handleJavaScriptDialog", {"accept": True}, timeout=5)
+                except Exception as e:
+                    logger.debug(f"CDP auto-dismiss dialog failed: {e}")
+
+            t = threading.Thread(target=_accept, daemon=True)
+            t.start()
+
+        self.on("Page.javascriptDialogOpening", _handle_dialog)
+
     def navigate(self, url: str, wait_sec: float = 4.0) -> bool:
         """Navigate to url, wait wait_sec seconds for page load.
 
         Returns True on success, False on failure (TimeoutError is caught and logged).
         """
         try:
+            self._setup_dialog_handler()
             self.send("Page.navigate", {"url": url}, timeout=30)
             time.sleep(wait_sec)
             return True
