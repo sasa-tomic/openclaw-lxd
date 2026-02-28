@@ -110,6 +110,7 @@ def _build_prompt(
     state_message: str,
     log_snippet: str | None,
     related_scripts: list[str],
+    worktree_path: Path,
 ) -> str:
     related_lines = (
         "\n".join(f"- /projects/automations/twitter/{s}" for s in related_scripts)
@@ -286,7 +287,7 @@ def _do_repair(
     # ------------------------------------------------------------------
     # 6 & 7. Build prompt and run opencode
     # ------------------------------------------------------------------
-    prompt = _build_prompt(flow_name, primary_script, state_message, log_snippet, related)
+    prompt = _build_prompt(flow_name, primary_script, state_message, log_snippet, related, worktree_path)
 
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
