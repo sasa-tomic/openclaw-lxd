@@ -343,6 +343,7 @@ Pure validation ("so true", "exactly", "yeah exactly", "been there", "this is re
 - NO hashtags, NO links
 - NO questions unless they asked one first
 - NO imperative framing ("make sure you...", "you should...", "switch to...")
+- Standard sentence capitalization: capitalize the first word and proper nouns (AWS, GCP, Stripe, etc.)
 - profileClickWorthy check: only reply if you're adding a specific fact, a non-obvious angle, or a well-supported pushback. Pure validation ("so true", "exactly", "been there", "this is real") fails this check regardless of conversation likelihood.
 
 # Output Format (JSON)

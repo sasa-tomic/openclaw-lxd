@@ -216,6 +216,7 @@ def generate_thread(conn) -> dict | None:
 - 6-10 tweets total (Premium+ account — longer threads get more reach)
 - Thread should be CONTROVERSIAL enough to argue with but DEFENSIBLE
 - Include specific numbers, comparisons, or technical details where possible
+- Standard sentence capitalization: capitalize the first word and proper nouns (AWS, GCP, Stripe, etc.)
 
 ## Output Format (JSON only, no other text):
 {{"topic": "brief topic description", "tweets": ["1/ first tweet text", "2/ second tweet", ...]}}"""

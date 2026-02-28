@@ -314,7 +314,7 @@ Use as inspiration for fresh angles only — don't repeat same framing.
 {f"## Recent dev activity (for inspiration):{chr(10)}{commits_text}" if commits_text else ""}
 
 ## Rules for all posts
-- Standard sentence capitalization: capitalize the first word and proper nouns (AWS, GCP, Stripe, etc.)
+- ALWAYS capitalize the first word of every post. Standard sentence capitalization throughout: proper nouns (AWS, GCP, Stripe, etc.) capitalized, everything else normal case. BAD: "everyone claims..." GOOD: "Everyone claims..."
 - No hashtags, no links, no product mentions, no "Decent Cloud" references
 - No AI vocabulary: "Furthermore", "Additionally", "It's important to note that"
 - Name specific platforms (AWS, GCP, Azure, Stripe) when discussing their gotchas. "The cloud" is vague; "AWS egress fees" is interesting.
@@ -510,7 +510,7 @@ A realistic scenario with no obvious correct answer. Forces the reader to pick a
 {f"## Trending today (inspiration only — NO links):{chr(10)}{research_text}" if research_text else ""}
 
 ## Rules
-- Standard sentence capitalization: capitalize first word and proper nouns (AWS, GCP, Stripe, etc.)
+- ALWAYS capitalize the first word. Standard sentence capitalization: proper nouns (AWS, GCP, Stripe, etc.) capitalized, everything else normal case. BAD: "everyone claims..." GOOD: "Everyone claims..."
 - No hashtags, no links, no product mentions, no "Decent Cloud" references
 
 Output ONLY the post text. No quotes, no JSON, no markdown."""
