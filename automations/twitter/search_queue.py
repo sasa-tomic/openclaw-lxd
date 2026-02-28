@@ -55,21 +55,12 @@ DEFAULT_SAMPLE_SIZE = len(SEARCH_TERMS)  # search all terms by default
 # ---------------------------------------------------------------------------
 
 
-def fill_queue(
-    terms: list[str],
-    term_stats: dict,
+def _candidates_for_term(
+    cdp_candidates: list[dict],
     engaged_ids: set[str],
     already_queued_ids: set[str],
 ) -> list[dict]:
-    """Search via CDP and return new candidates ready to insert into the queue.
-
-    Does not hold a DB connection — callers should close their connection before
-    calling this so the long CDP search doesn't block other DB readers.
-    """
-    cdp_candidates = search_candidates(
-        terms=terms, term_stats=term_stats, bypass_cache=True, since_hours=2, limit=50
-    )
-
+    """Filter CDP results down to new candidates not already seen or engaged."""
     result = []
     for c in cdp_candidates:
         tid = str(c.get("tweetId", ""))
@@ -95,8 +86,7 @@ def cmd_fill(args: argparse.Namespace) -> int:
     print("=== SEARCH QUEUE FILL ===", flush=True)
     print(f"Time: {utc_now()}", flush=True)
 
-    # Phase 1: short read — fetch everything needed before the long CDP search.
-    # Connection is released before search so DDL locks don't block other readers.
+    # Phase 1: short read — fetch everything needed before the CDP searches.
     with get_conn() as conn:
         ensure_schema(conn)
         engaged_ids = get_engaged_tweet_ids(conn)
@@ -113,16 +103,30 @@ def cmd_fill(args: argparse.Namespace) -> int:
         )
         print(f"Searching {len(terms)} weighted terms...", flush=True)
 
-    # Phase 2: long CDP search — no DB connection held.
-    candidates = fill_queue(terms, term_stats, engaged_ids, already_queued_ids)
+    # Phase 2+3 interleaved: search one term at a time and insert immediately.
+    # This way a timeout only loses the terms not yet searched, not everything.
+    total_inserted = 0
+    for i, term in enumerate(terms, 1):
+        print(f"  [{i}/{len(terms)}] '{term}'", flush=True)
 
-    # Phase 3: short write — insert results and report queue size.
-    print(f"\nFound {len(candidates)} fresh candidates", flush=True)
+        cdp_candidates = search_candidates(
+            terms=[term], term_stats=term_stats, bypass_cache=True, since_hours=2, limit=50
+        )
+        new_candidates = _candidates_for_term(cdp_candidates, engaged_ids, already_queued_ids)
+
+        if new_candidates:
+            with get_conn() as conn:
+                inserted = insert_candidate_queue(conn, new_candidates)
+            total_inserted += inserted
+            # Track newly queued IDs so later terms don't re-insert them
+            for c in new_candidates:
+                already_queued_ids.add(c["tweet_id"])
+            print(f"    => {inserted} inserted", flush=True)
+
+    # Final report
+    print(f"\n  CDP: {total_inserted} fresh candidates across all terms", flush=True)
+    print(f"Found {total_inserted} fresh candidates", flush=True)
     with get_conn() as conn:
-        if candidates:
-            inserted = insert_candidate_queue(conn, candidates)
-            print(f"Inserted {inserted} new candidates into queue", flush=True)
-
         size = queue_size(conn)
         print(f"Queue: {size} unprocessed candidates ready for engagement", flush=True)
 
