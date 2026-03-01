@@ -48,18 +48,7 @@ WATCH_PATH = NOTES_DIR_STR
 DEBOUNCE_SECONDS = 3.0
 TELEGRAM_CHAT_ID = TELEGRAM_TARGET
 
-SKIP_DIRS = {".obsidian", ".trash", ".stversions", ".sync", "Reference", "_reports"}
-SKIP_PATH_PREFIXES = {
-    "Pickle/Twitter/threads",
-    "Pickle/_reports",
-}
 SKIP_PATTERNS = {"sync-conflict", ".tmp", ".swp", ".swo", "~", ".DS_Store"}
-SKIP_FILES = {"MEMORY.md", "HEARTBEAT.md", "changelog.md", "Clawd.md"}
-
-IGNORE_GROUPS = {
-    "F-Droid Translators",
-    "Weblate translators",
-}
 
 CHAT_DIRS = {"Signal", "WhatsApp", "Telegram"}
 
@@ -169,29 +158,9 @@ def should_skip_path(filepath: str) -> bool:
     if path.suffix.lower() != ".md":
         return True
 
-    for part in path.parts:
-        if part in SKIP_DIRS:
-            return True
-
-    try:
-        relative = str(path.relative_to(WATCH_PATH))
-    except ValueError:
-        relative = filepath
-    for prefix in SKIP_PATH_PREFIXES:
-        if relative.startswith(prefix):
-            return True
-
     filename = path.name.lower()
     for pattern in SKIP_PATTERNS:
         if pattern in filename:
-            return True
-
-    for skip_file in SKIP_FILES:
-        if skip_file.lower() in filename:
-            return True
-
-    for ignored in IGNORE_GROUPS:
-        if ignored in filepath:
             return True
 
     # Skip if any ancestor directory (up to WATCH_PATH) contains a .notodos file
