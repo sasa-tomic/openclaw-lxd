@@ -1,13 +1,17 @@
 # Prefect deployment configuration for Twitter automation
 # Run: uv run prefect deploy --all
 
+pull:
+  - prefect.deployments.steps.set_working_directory:
+      directory: /projects/automations/twitter
+
 deployments:
   - name: engagement
     description: "Autonomous Twitter engagement"
     version: "1.0"
     tags: ["twitter", "engagement"]
     schedule:
-      cron: "55 * * * *"  # Every hour at :55 — ~10 min after search-queue fills at :43
+      cron: "25,55 * * * *"
       timezone: "UTC"
     entrypoint: twitter_scheduler.py:engagement_flow
     work_pool:

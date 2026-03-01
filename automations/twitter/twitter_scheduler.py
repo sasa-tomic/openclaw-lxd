@@ -151,7 +151,7 @@ def run_script(script_path: Path, timeout: int = 3600, logger=None) -> int:
 def engagement_flow():
     """Autonomous Twitter engagement - hourly."""
     logger = get_run_logger()
-    delay = random.randint(0, 3000)
+    delay = random.randint(0, 1500)
     logger.info(f"Jitter: sleeping {delay}s before engagement")
     time.sleep(delay)
     logger.info("Starting engagement run")
