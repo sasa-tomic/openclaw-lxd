@@ -10,9 +10,11 @@ deployments:
     description: "Autonomous Twitter engagement"
     version: "1.0"
     tags: ["twitter", "engagement"]
-    schedule:
-      cron: "25,55 * * * *"
-      timezone: "UTC"
+    schedules:
+      - cron: "7 * * * *"   # :07 each hour
+        timezone: "UTC"
+      - cron: "38 * * * *"  # :38 each hour — 31-min gap, non-obvious minutes
+        timezone: "UTC"
     entrypoint: twitter_scheduler.py:engagement_flow
     work_pool:
       name: twitter-automation
