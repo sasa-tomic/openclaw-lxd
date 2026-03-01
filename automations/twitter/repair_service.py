@@ -114,7 +114,7 @@ def _build_prompt(
     worktree_path: Path,
 ) -> str:
     related_lines = (
-        "\n".join(f"- /projects/automations/twitter/{s}" for s in related_scripts)
+        "\n".join(f"- {worktree_path}/twitter/{s}" for s in related_scripts)
         if related_scripts
         else "None identified"
     )
@@ -122,7 +122,7 @@ def _build_prompt(
 
 ## Failed service
 Prefect flow: {flow_name}
-Primary script: /projects/automations/twitter/{primary_script}
+Primary script: {worktree_path}/twitter/{primary_script}
 
 ## Error / state message
 {state_message}
@@ -134,22 +134,26 @@ Primary script: /projects/automations/twitter/{primary_script}
 {related_lines}
 
 ## Repository layout
-- Main scripts: /projects/automations/twitter/*.py
-- Shared lib: /projects/automations/lib/
-- Tests: /projects/automations/twitter/tests/
+- Main scripts: {worktree_path}/twitter/*.py
+- Shared lib: {worktree_path}/lib/
+- Tests: {worktree_path}/twitter/tests/
 
 ## Your task
-1. Read {primary_script} and any shared modules it imports from lib/
-2. Identify the root cause from the error and log above
-3. Make the minimal fix — change only what is necessary to fix the specific error
-4. Check the related scripts listed above for the same bug pattern; fix them too if found
-5. Do NOT refactor, do NOT add features, do NOT change unrelated code
+1. Run the test suite first to establish a baseline:
+     cd {worktree_path}/twitter && uv run pytest tests/ -q -m "not integration"
+2. Read {worktree_path}/twitter/{primary_script} and any shared modules it imports from {worktree_path}/lib/
+3. Identify the root cause from the error and log above
+4. Make the minimal fix — change only what is necessary to fix the specific error
+5. Check the related scripts listed above for the same bug pattern; fix them too if found
+6. Fix ALL test failures shown in step 1, even ones unrelated to the original error — this
+   worktree is based on a git HEAD that may have pre-existing failures that need resolving
+7. Do NOT refactor, do NOT add features, do NOT change unrelated code
 
 ## Verify your fix
-Run this command and ensure all tests pass:
+Run this command and ensure ALL tests pass (zero failures):
   cd {worktree_path}/twitter && uv run pytest tests/ -q -m "not integration"
 
-You MUST run the tests and fix any failures before finishing.
+You MUST run the tests and fix every failure before finishing.
 
 ## Summary
 End with a one-paragraph summary: what was broken, exactly what you changed, which files.
@@ -176,7 +180,7 @@ def _build_retry_prompt(
 3. Run the tests again and confirm they pass:
    cd {worktree_path}/twitter && uv run pytest tests/ -q -m "not integration"
 
-Primary script: /projects/automations/twitter/{primary_script}
+Primary script: {worktree_path}/twitter/{primary_script}
 
 Be minimal. Touch only what is needed to make the tests green.
 
@@ -320,6 +324,8 @@ def _do_repair(
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
     env["TERM"] = "dumb"
+    # Allow opencode to access the .venv symlink (which points outside the worktree)
+    env["OPENCODE_PERMISSIONS"] = '{"*": {"*": "allow"}}'
 
     opencode_exit = 0
     opencode_output = ""
@@ -344,7 +350,7 @@ def _do_repair(
         print(f"[repair] Running opencode attempt {attempt}/{MAX_REPAIR_ATTEMPTS} (timeout 3600s) …", flush=True)
         try:
             oc_result = subprocess.run(
-                ["timeout", "3600", OPENCODE_BIN, "run", prompt, "--dir", str(worktree_path)],
+                ["timeout", "3600", OPENCODE_BIN, "run", "--thinking", prompt, "--dir", str(worktree_path)],
                 env=env,
                 capture_output=True,
                 text=True,
