@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))  # /projects/automations (
 sys.path.insert(0, str(Path(__file__).parent))          # /projects/automations/twitter (for db, twitter_utils)
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from twitter_utils import (
+    ensure_browser_ready,
     humanize,
     load_project_context,
     post_tweet,
@@ -563,6 +564,14 @@ Output ONLY the post text. No quotes, no JSON, no markdown."""
 def main() -> int:
     print("=== TWITTER ORIGINAL CONTENT POSTER ===", flush=True)
     print(f"Time: {utc_now()}", flush=True)
+
+    # Pre-flight: ensure Chrome CDP is reachable and clear any blocking dialogs.
+    try:
+        ensure_browser_ready()
+    except RuntimeError as e:
+        send_error_alert(f"Browser not ready: {e}")
+        print(f"Browser not ready: {e}", file=sys.stderr)
+        return 1
 
     try:
         with get_conn() as conn:
