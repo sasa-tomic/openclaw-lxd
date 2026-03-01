@@ -100,6 +100,60 @@ def _ensure_tab_pool(n: int) -> None:
         logger.warning(f"CDP pool: failed to ensure {n} tabs: {e}")
 
 
+def ensure_browser_ready() -> None:
+    """Pre-flight check: verify Chrome CDP is reachable and dismiss any blocking dialogs.
+
+    Call this at the start of any browser-dependent job.  Raises RuntimeError if
+    Chrome is unreachable.  For each pool tab, connects briefly and calls
+    _setup_dialog_handler() so that any "Leave site?" beforeunload dialog left
+    by a previous run is dismissed before the job begins.
+
+    Tab warm-up runs in parallel so total overhead is bounded by the slowest tab
+    (≤ ~8 s even with a blocking dialog).
+    """
+    import urllib.request
+
+    # 1. Fast HTTP check — fail early if Chrome is down entirely.
+    try:
+        with urllib.request.urlopen(
+            "http://localhost:9222/json/version", timeout=8
+        ):
+            pass
+    except Exception as e:
+        raise RuntimeError(f"Chrome CDP unreachable at localhost:9222: {e}")
+
+    # 2. Ensure the pool tabs exist.
+    _ensure_tab_pool(CDP_POOL_SIZE)
+
+    # 3. Connect to each pool tab and dismiss any blocking dialog.
+    tabs = _get_sorted_page_tabs()
+    errors: list[str] = []
+
+    def _warm_tab(tab: dict) -> None:
+        try:
+            cdp = CDPSession.connect_to_tab(tab["webSocketDebuggerUrl"])
+            try:
+                cdp._setup_dialog_handler()
+            finally:
+                cdp.close()
+        except Exception as e:
+            errors.append(f"tab {tab.get('id', '?')}: {e}")
+
+    threads = [
+        threading.Thread(target=_warm_tab, args=(tab,), daemon=True)
+        for tab in tabs[:CDP_POOL_SIZE]
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=40)
+
+    if errors:
+        logger.warning(f"Browser warm-up issues: {'; '.join(errors)}")
+    else:
+        logger.info(f"Browser ready: {len(tabs[:CDP_POOL_SIZE])} tab(s) warm")
+
+
 def _acquire_tab_slot(deadline: float) -> tuple[int, object]:
     """Block until one of CDP_POOL_SIZE slot lock files is free.
 
