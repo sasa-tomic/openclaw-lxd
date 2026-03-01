@@ -64,6 +64,7 @@ IGNORE_GROUPS = {
 CHAT_DIRS = {"Signal", "WhatsApp", "Telegram"}
 
 STATE_FILE = "/home/openclaw/clawd/memory/obsidian-watcher-state.json"
+LASTRUN_FILE = "/home/openclaw/clawd/memory/obsidian-watcher-lastrun"
 COOLDOWN_SECONDS = 120.0
 
 PROJECT_MAPPING = {
@@ -193,6 +194,14 @@ def should_skip_path(filepath: str) -> bool:
         if ignored in filepath:
             return True
 
+    # Skip if any ancestor directory (up to WATCH_PATH) contains a .notodos file
+    watch_root = Path(WATCH_PATH)
+    for parent in path.parents:
+        if (parent / ".notodos").exists():
+            return True
+        if parent == watch_root:
+            break
+
     return False
 
 
@@ -223,6 +232,38 @@ def mark_as_processed(filepath: str):
     state = load_state()
     state[filepath] = time.time()
     save_state(state)
+
+
+def find_files_since_lastrun() -> list[str]:
+    """Find .md files modified since the last run using the lastrun timestamp file.
+
+    Returns an empty list on first run (no lastrun file exists yet).
+    """
+    if not os.path.exists(LASTRUN_FILE):
+        logger.info("No lastrun file — skipping startup backfill (first run)")
+        return []
+    try:
+        result = subprocess.run(
+            ["find", WATCH_PATH, "-newer", LASTRUN_FILE, "-name", "*.md", "-type", "f"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        files = [f.strip() for f in result.stdout.strip().split("\n") if f.strip()]
+        files = [f for f in files if not should_skip_path(f)]
+        return files
+    except Exception as e:
+        logger.error(f"Failed to find files since last run: {e}")
+        return []
+
+
+def touch_lastrun_file():
+    """Update the lastrun file mtime to now."""
+    try:
+        os.makedirs(os.path.dirname(LASTRUN_FILE), exist_ok=True)
+        Path(LASTRUN_FILE).touch()
+    except Exception as e:
+        logger.error(f"Failed to touch lastrun file: {e}")
 
 
 def add_todoist_task(
@@ -659,9 +700,20 @@ def main():
         logger.error(f"Watch path does not exist: {WATCH_PATH}")
         return 1
 
+    # Collect backlog BEFORE touching, so we capture everything since last run.
+    # Touch immediately after so the next run's window starts from now.
+    backlog = find_files_since_lastrun()
+    touch_lastrun_file()
+
     event_handler = DebouncedHandler()
     observer = Observer()
     observer.schedule(event_handler, WATCH_PATH, recursive=True)
+
+    if backlog:
+        logger.info(f"Backfilling {len(backlog)} files modified since last run...")
+        for filepath in backlog:
+            process_note_change(filepath)
+        logger.info("Startup backfill complete")
 
     logger.info("Starting file system observer...")
     observer.start()
