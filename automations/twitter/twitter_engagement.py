@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, "/projects/automations")
+from prefect.concurrency.sync import concurrency
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from db import (
     ensure_schema,
@@ -679,7 +680,8 @@ def main() -> int:
                 print("Queue empty — falling back to CDP search...", flush=True)
                 from twitter_utils import search_candidates
 
-                candidates = search_candidates(term_stats=term_stats)
+                with concurrency("twitter-browser", occupy=1):
+                    candidates = search_candidates(term_stats=term_stats)
                 print(f"Found {len(candidates)} raw candidates from search", flush=True)
 
                 if not candidates:
@@ -689,6 +691,7 @@ def main() -> int:
                         flush=True,
                     )
 
+                    # LLM call — browser lock intentionally released here
                     new_keywords = generate_dynamic_keywords(
                         recent_engagements, max_terms=15
                     )
@@ -698,7 +701,8 @@ def main() -> int:
                     SEARCH_TERMS[:] = new_keywords
 
                     print("  Retrying search with fresh keywords...", flush=True)
-                    candidates = search_candidates(terms=new_keywords)
+                    with concurrency("twitter-browser", occupy=1):
+                        candidates = search_candidates(terms=new_keywords)
                     print(
                         f"  Found {len(candidates)} candidates with new keywords",
                         flush=True,
@@ -775,60 +779,62 @@ def main() -> int:
             to_analyze: list[tuple[dict, dict]] = []
             print(f"Fetching tweet context for {len(selected)} candidates...", flush=True)
 
-            for candidate in selected:
-                tweet_id = candidate["tweetId"]
-                author = candidate.get("author") or "unknown"
+            with concurrency("twitter-browser", occupy=1):
+                for candidate in selected:
+                    tweet_id = candidate["tweetId"]
+                    author = candidate.get("author") or "unknown"
 
-                # Skip if already engaged
-                if is_engaged(conn, str(tweet_id)):
-                    print(f"  Already engaged {tweet_id} in DB — skipping", flush=True)
+                    # Skip if already engaged
+                    if is_engaged(conn, str(tweet_id)):
+                        print(f"  Already engaged {tweet_id} in DB — skipping", flush=True)
+                        if using_queue:
+                            mark_queue_processed(conn, [str(tweet_id)])
+                        continue
+
+                    print(f"\nFetching context for {tweet_id} (@{author})...")
+                    tweet_context = fetch_tweet_context(tweet_id)
+                    if not tweet_context:
+                        print(
+                            f"  Skipping {tweet_id} - failed to fetch context", flush=True
+                        )
+                        continue
+
+                    # Check if this tweet is part of one of our own threads (DB lookup).
+                    # Done here (conn in scope) so draft_reply_with_full_context can run
+                    # safely in the thread pool without needing a DB connection.
+                    visible_ids = [str(tweet_id)]
+                    for p in tweet_context.get("parentChain") or []:
+                        if p.get("tweetId"):
+                            visible_ids.append(str(p["tweetId"]))
+                    for t in tweet_context.get("threadContinuation") or []:
+                        if t.get("id"):
+                            visible_ids.append(str(t["id"]))
+                    tweet_context["ourThreadContext"] = get_our_thread_context(conn, visible_ids)
+
+                    # Persist high-engagement replies we observed while fetching context.
+                    other_replies = tweet_context.get("otherReplies") or []
+                    if other_replies:
+                        saved = upsert_tweet_replies(conn, str(tweet_id), other_replies)
+                        if saved:
+                            print(f"  Persisted {saved} replies for {tweet_id}", flush=True)
+
+                    # Mark processed after successful context fetch so a browser failure
+                    # doesn't permanently consume the candidate.
                     if using_queue:
                         mark_queue_processed(conn, [str(tweet_id)])
-                    continue
 
-                print(f"\nFetching context for {tweet_id} (@{author})...")
-                tweet_context = fetch_tweet_context(tweet_id)
-                if not tweet_context:
-                    print(
-                        f"  Skipping {tweet_id} - failed to fetch context", flush=True
-                    )
-                    continue
+                    # Fetch author profile for context (bio, recent tweets, interests)
+                    author_name = tweet_context.get("author", "")
 
-                # Check if this tweet is part of one of our own threads (DB lookup).
-                # Done here (conn in scope) so draft_reply_with_full_context can run
-                # safely in the thread pool without needing a DB connection.
-                visible_ids = [str(tweet_id)]
-                for p in tweet_context.get("parentChain") or []:
-                    if p.get("tweetId"):
-                        visible_ids.append(str(p["tweetId"]))
-                for t in tweet_context.get("threadContinuation") or []:
-                    if t.get("id"):
-                        visible_ids.append(str(t["id"]))
-                tweet_context["ourThreadContext"] = get_our_thread_context(conn, visible_ids)
+                    # Prior exchanges with this author (DB only — no API calls)
+                    tweet_context["priorExchanges"] = get_engagements_with_user(conn, author_name or author)
+                    if author_name:
+                        author_profile = get_user_profile(author_name)
+                        if author_profile:
+                            tweet_context["authorProfile"] = author_profile
 
-                # Persist high-engagement replies we observed while fetching context.
-                other_replies = tweet_context.get("otherReplies") or []
-                if other_replies:
-                    saved = upsert_tweet_replies(conn, str(tweet_id), other_replies)
-                    if saved:
-                        print(f"  Persisted {saved} replies for {tweet_id}", flush=True)
-
-                # Mark processed after successful context fetch so a browser failure
-                # doesn't permanently consume the candidate.
-                if using_queue:
-                    mark_queue_processed(conn, [str(tweet_id)])
-
-                # Fetch author profile for context (bio, recent tweets, interests)
-                author_name = tweet_context.get("author", "")
-
-                # Prior exchanges with this author (DB only — no API calls)
-                tweet_context["priorExchanges"] = get_engagements_with_user(conn, author_name or author)
-                if author_name:
-                    author_profile = get_user_profile(author_name)
-                    if author_profile:
-                        tweet_context["authorProfile"] = author_profile
-
-                to_analyze.append((candidate, tweet_context))
+                    to_analyze.append((candidate, tweet_context))
+            # ── Phase B runs with browser lock released (LLM-only, no CDP) ──────
 
             # ── Phase B: parallel LLM analysis ───────────────────────────────
             print(
@@ -865,129 +871,129 @@ def main() -> int:
                         results_by_idx[futures[future]] = future.result()
                     analyzed = [results_by_idx[i] for i in range(len(to_analyze))]
 
-            # ── Phase C: sequential posting ───────────────────────────────────
-            for candidate, tweet_context, decision in analyzed:
-                if engaged_count >= 8:
-                    break
+            # ── Phase C: sequential posting (browser lock re-acquired) ───────────
+            with concurrency("twitter-browser", occupy=1):
+                for candidate, tweet_context, decision in analyzed:
+                    if engaged_count >= 8:
+                        break
 
-                tweet_id = candidate["tweetId"]
-                url = candidate["url"]
-                author = candidate.get("author") or "unknown"
-                search_term = candidate.get("searchTerm", "")
+                    tweet_id = candidate["tweetId"]
+                    url = candidate["url"]
+                    author = candidate.get("author") or "unknown"
+                    search_term = candidate.get("searchTerm", "")
 
-                print(f"\nProcessing {tweet_id} (@{author})...")
+                    print(f"\nProcessing {tweet_id} (@{author})...")
 
-
-                if not decision or not decision.get("shouldEngage"):
-                    if decision:
-                        tweet_text = (tweet_context.get("text") or "")[:120]
-                        print(f"  LLM skipped [{tweet_id}]: {tweet_text!r}\n  Decision: {json.dumps(decision)}")
-                    continue
-
-                engagement_type = decision.get("engagementType", "reply")
-                reply_text = decision.get("reply")
-                print(f"  LLM approved [{engagement_type}]: {(reply_text or '')[:80]}...")
-                print(f"  Reasoning: {decision.get('reasoning', 'N/A')}")
-
-                jitter_sleep()
-
-                posted = False
-                our_reply_id = None
-                engagement_source = "search"
-
-                if engagement_type == "like":
-                    posted = like_tweet(tweet_id)
-                    engagement_source = "like"
-                elif engagement_type == "quote":
-                    if not reply_text:
-                        print("  Quote-tweet requires reply text — skipping")
+                    if not decision or not decision.get("shouldEngage"):
+                        if decision:
+                            tweet_text = (tweet_context.get("text") or "")[:120]
+                            print(f"  LLM skipped [{tweet_id}]: {tweet_text!r}\n  Decision: {json.dumps(decision)}")
                         continue
-                    try:
-                        reply_text = humanize(reply_text)
-                    except Exception as e:
-                        print(f"  Humanize failed: {e}")
-                        continue
-                    MAX_REPLY_ATTEMPTS = 3
-                    for attempt in range(1, MAX_REPLY_ATTEMPTS + 1):
-                        posted, our_reply_id = post_quote_tweet(tweet_id, reply_text)
-                        if posted:
-                            break
-                        if attempt < MAX_REPLY_ATTEMPTS:
-                            print(f"  Quote attempt {attempt} failed, retrying in 5s...", flush=True)
-                            _time.sleep(5)
+
+                    engagement_type = decision.get("engagementType", "reply")
+                    reply_text = decision.get("reply")
+                    print(f"  LLM approved [{engagement_type}]: {(reply_text or '')[:80]}...")
+                    print(f"  Reasoning: {decision.get('reasoning', 'N/A')}")
+
+                    jitter_sleep()
+
+                    posted = False
+                    our_reply_id = None
+                    engagement_source = "search"
+
+                    if engagement_type == "like":
+                        posted = like_tweet(tweet_id)
+                        engagement_source = "like"
+                    elif engagement_type == "quote":
+                        if not reply_text:
+                            print("  Quote-tweet requires reply text — skipping")
+                            continue
+                        try:
+                            reply_text = humanize(reply_text)
+                        except Exception as e:
+                            print(f"  Humanize failed: {e}")
+                            continue
+                        MAX_REPLY_ATTEMPTS = 3
+                        for attempt in range(1, MAX_REPLY_ATTEMPTS + 1):
+                            posted, our_reply_id = post_quote_tweet(tweet_id, reply_text)
+                            if posted:
+                                break
+                            if attempt < MAX_REPLY_ATTEMPTS:
+                                print(f"  Quote attempt {attempt} failed, retrying in 5s...", flush=True)
+                                _time.sleep(5)
+                        if not posted:
+                            send_error_alert(f"Failed to quote-tweet {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
+                            continue
+                        engagement_source = "quote"
+                    else:  # "reply"
+                        if not reply_text:
+                            print("  Reply requires reply text — skipping")
+                            continue
+                        try:
+                            reply_text = humanize(reply_text)
+                        except Exception as e:
+                            print(f"  Humanize failed: {e}")
+                            continue
+                        MAX_REPLY_ATTEMPTS = 3
+                        for attempt in range(1, MAX_REPLY_ATTEMPTS + 1):
+                            posted, our_reply_id = post_reply(tweet_id, reply_text)
+                            if posted:
+                                break
+                            if attempt < MAX_REPLY_ATTEMPTS:
+                                print(f"  Reply attempt {attempt} failed, retrying in 5s...", flush=True)
+                                _time.sleep(5)
+                        if not posted:
+                            send_error_alert(f"Failed to post reply to {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
+                            continue
+
                     if not posted:
-                        send_error_alert(f"Failed to quote-tweet {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
-                        continue
-                    engagement_source = "quote"
-                else:  # "reply"
-                    if not reply_text:
-                        print("  Reply requires reply text — skipping")
-                        continue
-                    try:
-                        reply_text = humanize(reply_text)
-                    except Exception as e:
-                        print(f"  Humanize failed: {e}")
-                        continue
-                    MAX_REPLY_ATTEMPTS = 3
-                    for attempt in range(1, MAX_REPLY_ATTEMPTS + 1):
-                        posted, our_reply_id = post_reply(tweet_id, reply_text)
-                        if posted:
-                            break
-                        if attempt < MAX_REPLY_ATTEMPTS:
-                            print(f"  Reply attempt {attempt} failed, retrying in 5s...", flush=True)
-                            _time.sleep(5)
-                    if not posted:
-                        send_error_alert(f"Failed to post reply to {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
                         continue
 
-                if not posted:
-                    continue
+                    print(f"  {engagement_type.capitalize()}d", flush=True)
+                    if our_reply_id:
+                        print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
 
-                print(f"  {engagement_type.capitalize()}d", flush=True)
-                if our_reply_id:
-                    print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
+                    # Auto-follow the author after confirmed engagement
+                    if engagement_type != "like":
+                        auto_follow_after_engagement(conn, author, tweet_id)
 
-                # Auto-follow the author after confirmed engagement
-                if engagement_type != "like":
-                    auto_follow_after_engagement(conn, author, tweet_id)
+                    # Insert engagement into DB
+                    stats = tweet_context.get("stats", {})
+                    insert_engagement(
+                        conn,
+                        tweet_id=str(tweet_id),
+                        target_username=author,
+                        our_reply_text=reply_text,
+                        our_reply_id=our_reply_id,
+                        source=engagement_source,
+                        search_term=search_term,
+                        conv_likelihood=decision.get("audienceEngagementPotential") or decision.get("conversationLikelihood"),
+                        profile_click_worthy=decision.get("profileClickWorthy"),
+                        llm_reasoning=decision.get("reasoning"),
+                        target_tweet_text=tweet_context.get("text"),
+                        tweet_url=url,
+                        tweet_likes=stats.get("likes"),
+                        tweet_rts=stats.get("retweets"),
+                        tweet_replies=stats.get("replies"),
+                    )
 
-                # Insert engagement into DB
-                stats = tweet_context.get("stats", {})
-                insert_engagement(
-                    conn,
-                    tweet_id=str(tweet_id),
-                    target_username=author,
-                    our_reply_text=reply_text,
-                    our_reply_id=our_reply_id,
-                    source=engagement_source,
-                    search_term=search_term,
-                    conv_likelihood=decision.get("audienceEngagementPotential") or decision.get("conversationLikelihood"),
-                    profile_click_worthy=decision.get("profileClickWorthy"),
-                    llm_reasoning=decision.get("reasoning"),
-                    target_tweet_text=tweet_context.get("text"),
-                    tweet_url=url,
-                    tweet_likes=stats.get("likes"),
-                    tweet_rts=stats.get("retweets"),
-                    tweet_replies=stats.get("replies"),
-                )
+                    engaged_ids.add(str(tweet_id))
+                    engaged_count += 1
+                    if search_term:
+                        term_engaged_counts[search_term] += 1
+                    results.append(f"{tweet_id} | @{author} [{engagement_type}]")
 
-                engaged_ids.add(str(tweet_id))
-                engaged_count += 1
-                if search_term:
-                    term_engaged_counts[search_term] += 1
-                results.append(f"{tweet_id} | @{author} [{engagement_type}]")
-
-                # Update voice context in-memory so subsequent runs in this session
-                # see our latest replies (posting is sequential so no race).
-                if reply_text:
-                    recent_engagements = [
-                        {
-                            "target_username": author,
-                            "our_reply_text": reply_text,
-                            "replied_at": utc_now(),
-                            "search_term": search_term,
-                        }
-                    ] + recent_engagements[:7]
+                    # Update voice context in-memory so subsequent runs in this session
+                    # see our latest replies (posting is sequential so no race).
+                    if reply_text:
+                        recent_engagements = [
+                            {
+                                "target_username": author,
+                                "our_reply_text": reply_text,
+                                "replied_at": utc_now(),
+                                "search_term": search_term,
+                            }
+                        ] + recent_engagements[:7]
 
             # Accumulate per-term hit-rate stats
             for term, count in term_candidate_counts.items():
