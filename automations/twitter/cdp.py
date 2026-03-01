@@ -200,16 +200,43 @@ class CDPSession:
             return
         self._dialog_handler_enabled = True
 
-        # Dismiss any dialog that might be blocking this tab before enabling Page
-        # events.  A previous session may have left a "Leave page?" beforeunload
-        # dialog open whose WebSocket closed before it could auto-dismiss it,
-        # causing Page.enable (and every other command) to timeout on this tab.
-        try:
-            self.send("Page.handleJavaScriptDialog", {"accept": True}, timeout=5)
-        except Exception:
-            pass  # No dialog open — expected in the normal case.
+        # Enable the Page domain so we receive dialog events.
+        #
+        # Problem: if a blocking beforeunload dialog is open (e.g. "Leave site?
+        # Changes you made may not be saved"), the renderer is paused and
+        # Page.enable hangs indefinitely.  Page.handleJavaScriptDialog bypasses
+        # the renderer and dismisses the dialog, but Chrome only accepts it once
+        # Page.enable is in flight (it needs a pending Page listener).
+        #
+        # Fix: start Page.enable in a background thread, then periodically send
+        # Page.handleJavaScriptDialog from the main thread.  Chrome processes the
+        # dismiss, unpauses the renderer, and responds to the pending Page.enable.
+        enable_exc: list[Exception] = []
+        enable_done = threading.Event()
 
-        self.send("Page.enable", {})
+        def _do_enable() -> None:
+            try:
+                self.send("Page.enable", {}, timeout=35)
+            except Exception as e:
+                enable_exc.append(e)
+            finally:
+                enable_done.set()
+
+        threading.Thread(target=_do_enable, daemon=True).start()
+
+        # Check every 5 s; attempt dialog dismissal if Page.enable is still pending.
+        for _ in range(4):
+            if enable_done.wait(timeout=5):
+                break  # Page.enable completed — no blocking dialog (or already gone)
+            logger.debug("CDP: Page.enable waiting; trying Page.handleJavaScriptDialog")
+            try:
+                self.send("Page.handleJavaScriptDialog", {"accept": True}, timeout=3)
+            except Exception:
+                pass
+
+        enable_done.wait(timeout=5)  # safety drain
+        if enable_exc:
+            raise enable_exc[0]
 
         def _handle_dialog(params: dict) -> None:
             # Cannot call send() from the listener thread directly — use a thread.
