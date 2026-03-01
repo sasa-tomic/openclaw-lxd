@@ -51,6 +51,7 @@ from twitter_utils import (
     fetch_tweet_context,
     humanize,
     jitter_sleep,
+    like_tweet,
     load_project_context,
     post_reply,
     send_error_alert,
@@ -392,15 +393,19 @@ If you cannot confidently qualify for the applicable mode, set shouldEngage: fal
 - If they asked a question, answer it directly and specifically
 - profileClickWorthy: only true if you're adding a specific fact, a non-obvious angle, or a well-supported pushback. Pure validation fails this check regardless.
 
+# Mode L — Like only (use when reply feels forced but tweet is worth acknowledging)
+Before setting shouldEngage: false, ask: "Is this mention from someone worth registering with, even if we have nothing sharp to add?" If yes, set engagementType: "like" and reply: null — a like costs nothing and signals presence.
+
 # Output Format (JSON)
 {{
   "shouldEngage": true/false,
-  "conversationLikelihood": 1-10,
+  "engagementType": "reply" or "like" (default "reply"; use "like" when engaging but not replying),
+  "audienceEngagementPotential": 1-10,
   "profileClickWorthy": true/false,
-  "mode": "A" or "B" (which mode qualifies this reply, or null if not engaging),
+  "mode": "A" or "B" or null (null if engagementType is "like" or shouldEngage is false),
   "threadSummary": "one sentence: what is this conversation actually about",
   "reasoning": "brief explanation of decision",
-  "reply": "draft reply text here" (or null if shouldEngage is false)
+  "reply": "draft reply text here" (or null if engagementType is "like" or shouldEngage is false)
 }}
 
 Output ONLY valid JSON, nothing else."""
@@ -422,28 +427,15 @@ Output ONLY valid JSON, nothing else."""
 
         decision = json.loads(json_str)
 
-        conv_score = decision.get("conversationLikelihood", 5)
-        profile_click_worthy = decision.get("profileClickWorthy", False)
-        # Direct replies always get a response; cold mentions need a score >= 5
-        if not decision.get("shouldEngage") or (not is_direct_reply and conv_score < 5):
+        score = decision.get("audienceEngagementPotential", 5)
+        if not decision.get("shouldEngage") or score < 3:
             reason = decision.get("reasoning", "no reason")
-            if decision.get("shouldEngage") and conv_score < 5:
-                print(
-                    f"  Low conversation likelihood ({conv_score}/10): {reason}",
-                    flush=True,
-                )
-            else:
-                print(f"  LLM decided NOT to engage: {reason}", flush=True)
+            print(f"  LLM decided NOT to engage (score={score}/10): {reason}", flush=True)
             decision["shouldEngage"] = False
             return decision
 
-        # For cold mentions: also require profileClickWorthy (direct replies bypass this)
-        if not is_direct_reply and not profile_click_worthy:
-            print(
-                f"  Not profile-click-worthy (pure validation), skipping",
-                flush=True,
-            )
-            decision["shouldEngage"] = False
+        engagement_type = decision.get("engagementType", "reply")
+        if engagement_type == "like":
             return decision
 
         reply = decision.get("reply")
@@ -588,57 +580,75 @@ def main() -> int:
                 if not decision or not decision.get("shouldEngage"):
                     continue
 
-                reply_text = decision["reply"]
-                print(f"  LLM approved: {reply_text[:80]}...", flush=True)
+                engagement_type = decision.get("engagementType", "reply")
+                reply_text = decision.get("reply")
+                print(
+                    f"  LLM approved [{engagement_type}]: {(reply_text or '')[:80]}...",
+                    flush=True,
+                )
                 print(f"  Reasoning: {decision.get('reasoning', 'N/A')}", flush=True)
-
-                try:
-                    reply_text = humanize(reply_text)
-                except Exception as e:
-                    print(f"  Humanize failed: {e}", flush=True)
-                    continue
 
                 jitter_sleep(min_sec=5, max_sec=30)
 
-                url = mention.get("url") or f"{TWITTER_BASE_URL}/i/web/status/{tid}"
+                posted = False
+                our_reply_id = None
 
-                posted, our_reply_id = post_reply(tid, reply_text)
-                if not posted:
-                    send_error_alert(
-                        f"Reply monitor: failed to post reply to {tid} (@{author})"
-                    )
-                    continue
+                if engagement_type == "like":
+                    posted = like_tweet(tid)
+                    if not posted:
+                        print(f"  Like failed for {tid}", flush=True)
+                        continue
+                    print("  Liked", flush=True)
+                else:
+                    if not reply_text:
+                        print("  Reply requires text — skipping", flush=True)
+                        continue
+                    try:
+                        reply_text = humanize(reply_text)
+                    except Exception as e:
+                        print(f"  Humanize failed: {e}", flush=True)
+                        continue
 
-                print("  Replied", flush=True)
-                if our_reply_id:
-                    print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
+                    posted, our_reply_id = post_reply(tid, reply_text)
+                    if not posted:
+                        send_error_alert(
+                            f"Reply monitor: failed to post reply to {tid} (@{author})"
+                        )
+                        continue
 
-                # Auto-follow the author
-                auto_follow_after_engagement(conn, author, tid)
+                    print("  Replied", flush=True)
+                    if our_reply_id:
+                        print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
+
+                # Auto-follow the author (skip for likes — save that for replies)
+                if engagement_type != "like":
+                    auto_follow_after_engagement(conn, author, tid)
 
                 # Insert engagement record
+                source = "mention" if not is_direct_reply else "direct_reply"
                 insert_engagement(
                     conn,
                     tweet_id=tid,
                     target_username=author,
                     our_reply_text=reply_text,
                     our_reply_id=our_reply_id,
-                    source="mention" if not is_direct_reply else "direct_reply",
-                    conv_likelihood=decision.get("conversationLikelihood"),
+                    source=source if engagement_type != "like" else "like",
+                    conv_likelihood=decision.get("audienceEngagementPotential"),
                     profile_click_worthy=decision.get("profileClickWorthy"),
                     llm_reasoning=decision.get("reasoning"),
                 )
 
                 engaged_ids.add(tid)
 
-                # Update voice context in-memory
-                recent_engagements = [
-                    {
-                        "target_username": author,
-                        "our_reply_text": reply_text,
-                        "replied_at": utc_now(),
-                    }
-                ] + recent_engagements[:7]
+                # Update voice context in-memory (only meaningful for replies)
+                if reply_text:
+                    recent_engagements = [
+                        {
+                            "target_username": author,
+                            "our_reply_text": reply_text,
+                            "replied_at": utc_now(),
+                        }
+                    ] + recent_engagements[:7]
 
                 processed += 1
 
