@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import psycopg2
@@ -972,6 +972,10 @@ def get_recent_evals(conn, limit: int = 7) -> list[dict]:
                 d["raw_metrics"] = json.loads(d["raw_metrics"])
             except Exception:
                 pass
+        # Serialize date/datetime fields so callers can json.dumps the result
+        for k, v in d.items():
+            if isinstance(v, (datetime, date)):
+                d[k] = v.isoformat()
         result.append(d)
     return result
 
