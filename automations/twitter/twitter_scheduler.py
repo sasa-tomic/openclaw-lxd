@@ -21,9 +21,11 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from prefect import flow, get_run_logger
+from prefect.context import get_run_context
 
 TWITTER_DIR = Path("/projects/automations/twitter")
 PYTHON = sys.executable
@@ -146,6 +148,27 @@ def run_script(script_path: Path, timeout: int = 3600, logger=None) -> int:
     return rc
 
 
+def _is_stale_run(max_late_seconds: int, logger) -> bool:
+    """Return True when this run started too late to provide useful value."""
+    try:
+        flow_run = get_run_context().flow_run
+        expected = getattr(flow_run, "expected_start_time", None)
+        if expected is None:
+            return False
+        now = datetime.now(timezone.utc)
+        late_by = (now - expected).total_seconds()
+        if late_by > max_late_seconds:
+            logger.warning(
+                f"Skipping stale run: late by {int(late_by)}s "
+                f"(max {max_late_seconds}s)"
+            )
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"Stale-run check unavailable ({e}); continuing")
+        return False
+
+
 @flow(name="twitter-engagement", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
 def engagement_flow():
     """Autonomous Twitter engagement - 2x hourly at :07 and :38."""
@@ -153,6 +176,36 @@ def engagement_flow():
     logger.info("Starting engagement run")
     code = run_script(TWITTER_DIR / "twitter_engagement.py", logger=logger)
     logger.info(f"Engagement completed with code {code}")
+    return code
+
+
+@flow(name="twitter-engagement-prepare", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+def engagement_prepare_flow():
+    """Prepare candidates + full context for LLM analysis (CDP/browser phase)."""
+    logger = get_run_logger()
+    logger.info("Starting engagement prepare phase")
+    code = run_script(TWITTER_DIR / "twitter_engagement_prepare.py", timeout=900, logger=logger)
+    logger.info(f"Engagement prepare completed with code {code}")
+    return code
+
+
+@flow(name="twitter-engagement-analyze", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+def engagement_analyze_flow():
+    """LLM-only engagement analysis phase (no browser lock)."""
+    logger = get_run_logger()
+    logger.info("Starting engagement analyze phase")
+    code = run_script(TWITTER_DIR / "twitter_engagement_analyze.py", timeout=900, logger=logger)
+    logger.info(f"Engagement analyze completed with code {code}")
+    return code
+
+
+@flow(name="twitter-engagement-post", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+def engagement_post_flow():
+    """Post analyzed replies (CDP/browser phase)."""
+    logger = get_run_logger()
+    logger.info("Starting engagement post phase")
+    code = run_script(TWITTER_DIR / "twitter_engagement_post.py", timeout=900, logger=logger)
+    logger.info(f"Engagement post completed with code {code}")
     return code
 
 
@@ -200,6 +253,8 @@ def morning_research_flow():
 def cdp_health_flow():
     """CDP health check - every 15 min."""
     logger = get_run_logger()
+    if _is_stale_run(8 * 60, logger):
+        return 0
     logger.info("Starting CDP health check")
     code = run_script(TWITTER_DIR / "cdp_health_check.py", timeout=60, logger=logger)
     logger.info(f"CDP health check completed with code {code}")
@@ -210,6 +265,8 @@ def cdp_health_flow():
 def reply_monitor_flow():
     """Monitor and respond to replies/mentions — every 5 min."""
     logger = get_run_logger()
+    if _is_stale_run(12 * 60, logger):
+        return 0
     logger.info("Starting reply monitor")
     code = run_script(TWITTER_DIR / "reply_monitor.py", timeout=300, logger=logger)
     logger.info(f"Reply monitor completed with code {code}")
@@ -221,6 +278,8 @@ def reply_monitor_flow():
 def target_monitor_flow():
     """Monitor target accounts for fast-reply opportunities -- every 30 min."""
     logger = get_run_logger()
+    if _is_stale_run(45 * 60, logger):
+        return 0
     logger.info("Starting target account monitor")
     code = run_script(TWITTER_DIR / "target_monitor.py", timeout=600, logger=logger)
     logger.info(f"Target monitor completed with code {code}")
@@ -231,6 +290,8 @@ def target_monitor_flow():
 def timeline_monitor_flow():
     """Monitor Following feed for near-realtime reply opportunities — every 5 min."""
     logger = get_run_logger()
+    if _is_stale_run(12 * 60, logger):
+        return 0
     logger.info("Starting timeline monitor")
     code = run_script(TWITTER_DIR / "timeline_monitor.py", timeout=300, logger=logger)
     logger.info(f"Timeline monitor completed with code {code}")
@@ -241,6 +302,8 @@ def timeline_monitor_flow():
 def search_queue_flow():
     """Fill candidate queue via CDP search — every hour."""
     logger = get_run_logger()
+    if _is_stale_run(90 * 60, logger):
+        return 0
     logger.info("Starting search queue fill")
     code = run_script(TWITTER_DIR / "search_queue.py", timeout=300, logger=logger)
     logger.info(f"Search queue completed with code {code}")
@@ -259,6 +322,9 @@ def account_discovery_flow():
 
 FLOWS = {
     "engagement": engagement_flow,
+    "engagement-prepare": engagement_prepare_flow,
+    "engagement-analyze": engagement_analyze_flow,
+    "engagement-post": engagement_post_flow,
     "content": original_content_flow,
     "thread": weekly_thread_flow,
     "eval": daily_eval_flow,
