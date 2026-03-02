@@ -2080,28 +2080,31 @@ def get_tweet_stats(tweet_id: str) -> dict | None:
 def auto_follow_after_engagement(conn, username: str, tweet_id: str) -> bool:
     """Follow a user after engaging with their tweet. Returns True if followed.
 
-    conn: a psycopg2 connection (from get_conn() context manager)
+    The function intentionally uses short-lived DB connections so callers do not
+    hold transactions open during slow browser follow actions.
     """
-    from db import is_followed, set_followed, upsert_account
+    from db import get_conn, is_followed, set_followed, upsert_account
 
     # Skip our own account
     if username.lower() == "decentcloud_org":
         return False
 
     # Check DB: already followed?
-    if is_followed(conn, username):
-        print(f"  Already following @{username} in DB", flush=True)
-        return False
+    with get_conn() as db_conn:
+        if is_followed(db_conn, username):
+            print(f"  Already following @{username} in DB", flush=True)
+            return False
 
     print(f"  Auto-following @{username}...", flush=True)
     if follow_user(username):
-        # Ensure account row exists first, then mark followed
-        upsert_account(
-            conn,
-            username,
-            stage="followed",
-            discovery_source="engagement",
-        )
-        set_followed(conn, username)
+        with get_conn() as db_conn:
+            # Ensure account row exists first, then mark followed.
+            upsert_account(
+                db_conn,
+                username,
+                stage="followed",
+                discovery_source="engagement",
+            )
+            set_followed(db_conn, username)
         return True
     return False

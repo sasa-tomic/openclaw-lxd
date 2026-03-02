@@ -25,7 +25,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from prefect import flow, get_run_logger
-from prefect.context import get_run_context
+
+try:
+    # Prefect 3+ location.
+    from prefect.context import get_run_context as _get_run_context
+except Exception:
+    try:
+        # Backward/test fallback.
+        from prefect import get_run_context as _get_run_context
+    except Exception:
+        _get_run_context = None
 
 TWITTER_DIR = Path("/projects/automations/twitter")
 PYTHON = sys.executable
@@ -151,7 +160,9 @@ def run_script(script_path: Path, timeout: int = 3600, logger=None) -> int:
 def _is_stale_run(max_late_seconds: int, logger) -> bool:
     """Return True when this run started too late to provide useful value."""
     try:
-        flow_run = get_run_context().flow_run
+        if _get_run_context is None:
+            return False
+        flow_run = _get_run_context().flow_run
         expected = getattr(flow_run, "expected_start_time", None)
         if expected is None:
             return False
