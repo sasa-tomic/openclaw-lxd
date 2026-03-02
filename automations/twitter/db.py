@@ -1793,3 +1793,7 @@ def ensure_schema(conn) -> None:
                 relevance_notes=acct["relevance_notes"],
                 stage="candidate",
             )
+
+    # Release DDL locks immediately. Without this explicit commit, long-running
+    # flows can hold relation locks for minutes and block read-only CLI tools.
+    conn.commit()
