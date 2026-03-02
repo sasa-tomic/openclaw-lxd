@@ -1418,6 +1418,26 @@ CREATE TABLE IF NOT EXISTS candidate_queue (
     processed_at    TIMESTAMPTZ
 );
 
+CREATE TABLE IF NOT EXISTS engagement_pipeline_queue (
+    tweet_id        TEXT PRIMARY KEY,
+    author          TEXT,
+    text            TEXT,
+    search_term     TEXT,
+    url             TEXT,
+    likes           INTEGER DEFAULT 0,
+    retweets        INTEGER DEFAULT 0,
+    replies         INTEGER DEFAULT 0,
+    candidate_json  TEXT,
+    context_json    TEXT,
+    decision_json   TEXT,
+    status          TEXT        NOT NULL DEFAULT 'prepared',
+    prepared_at     TIMESTAMPTZ,
+    analyzed_at     TIMESTAMPTZ,
+    posted_at       TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ DEFAULT now(),
+    error           TEXT
+);
+
 CREATE TABLE IF NOT EXISTS kv_state (
     key        TEXT PRIMARY KEY,
     value      TEXT,
@@ -1425,6 +1445,7 @@ CREATE TABLE IF NOT EXISTS kv_state (
 );
 
 CREATE INDEX IF NOT EXISTS idx_queue_unprocessed ON candidate_queue(queued_at) WHERE processed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_eng_pipe_status ON engagement_pipeline_queue(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_accounts_stage  ON accounts(stage);
 CREATE INDEX IF NOT EXISTS idx_accounts_score  ON accounts(relevance_score DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_accounts_source ON accounts(discovery_source);
@@ -1553,6 +1574,154 @@ def queue_size(conn) -> int:
         )
         row = cur.fetchone()
         return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Engagement pipeline queue (prepare -> analyze -> post)
+# ---------------------------------------------------------------------------
+
+
+def upsert_prepared_candidate(conn, candidate: dict, tweet_context: dict) -> None:
+    """Insert or update a prepared candidate ready for LLM analysis."""
+    tweet_id = str(candidate.get("tweetId") or "")
+    if not tweet_id:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO engagement_pipeline_queue (
+                tweet_id, author, text, search_term, url, likes, retweets, replies,
+                candidate_json, context_json, status, prepared_at, updated_at, error
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'prepared', now(), now(), NULL)
+            ON CONFLICT (tweet_id) DO UPDATE SET
+                author = EXCLUDED.author,
+                text = EXCLUDED.text,
+                search_term = EXCLUDED.search_term,
+                url = EXCLUDED.url,
+                likes = EXCLUDED.likes,
+                retweets = EXCLUDED.retweets,
+                replies = EXCLUDED.replies,
+                candidate_json = EXCLUDED.candidate_json,
+                context_json = EXCLUDED.context_json,
+                status = 'prepared',
+                prepared_at = now(),
+                analyzed_at = NULL,
+                decision_json = NULL,
+                posted_at = NULL,
+                updated_at = now(),
+                error = NULL
+            """,
+            (
+                tweet_id,
+                candidate.get("author") or "unknown",
+                (candidate.get("text") or "")[:500],
+                candidate.get("searchTerm") or "",
+                candidate.get("url") or f"https://x.com/i/web/status/{tweet_id}",
+                candidate.get("likes", 0),
+                candidate.get("retweets", 0),
+                candidate.get("replies", 0),
+                json.dumps(candidate, ensure_ascii=False, default=str),
+                json.dumps(tweet_context, ensure_ascii=False, default=str),
+            ),
+        )
+
+
+def get_pipeline_items_by_status(conn, status: str, limit: int = 50) -> list[dict]:
+    """Fetch pipeline records for a given status."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT tweet_id, author, text, search_term, url, likes, retweets, replies,
+                   candidate_json, context_json, decision_json, status,
+                   prepared_at, analyzed_at, posted_at, updated_at, error
+            FROM engagement_pipeline_queue
+            WHERE status = %s
+              AND to_timestamp(((tweet_id::bigint >> 22) + 1288834974657) / 1000.0)
+                    > now() - interval '24 hours'
+            ORDER BY updated_at ASC
+            LIMIT %s
+            """,
+            (status, limit),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def update_pipeline_analysis(
+    conn,
+    tweet_id: str,
+    decision: dict | None,
+    *,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Persist analysis result for a prepared candidate."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE engagement_pipeline_queue
+            SET decision_json = %s,
+                status = %s,
+                analyzed_at = now(),
+                updated_at = now(),
+                error = %s
+            WHERE tweet_id = %s
+            """,
+            (
+                json.dumps(decision, ensure_ascii=False, default=str)
+                if decision is not None
+                else None,
+                status,
+                error,
+                tweet_id,
+            ),
+        )
+
+
+def mark_pipeline_posted(conn, tweet_id: str) -> None:
+    """Mark pipeline item as posted."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE engagement_pipeline_queue
+            SET status = 'posted',
+                posted_at = now(),
+                updated_at = now(),
+                error = NULL
+            WHERE tweet_id = %s
+            """,
+            (tweet_id,),
+        )
+
+
+def mark_pipeline_post_failed(conn, tweet_id: str, error: str) -> None:
+    """Mark pipeline item as post_failed with a reason."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE engagement_pipeline_queue
+            SET status = 'post_failed',
+                updated_at = now(),
+                error = %s
+            WHERE tweet_id = %s
+            """,
+            (error[:500], tweet_id),
+        )
+
+
+def mark_pipeline_skipped(conn, tweet_id: str, reason: str) -> None:
+    """Mark pipeline item as skipped with reason."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE engagement_pipeline_queue
+            SET status = 'skipped',
+                updated_at = now(),
+                error = %s
+            WHERE tweet_id = %s
+            """,
+            (reason[:500], tweet_id),
+        )
 
 
 # ---------------------------------------------------------------------------

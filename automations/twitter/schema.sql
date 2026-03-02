@@ -118,6 +118,27 @@ CREATE TABLE IF NOT EXISTS candidate_queue (
     processed_at    TIMESTAMPTZ   -- NULL = not yet processed by engagement flow
 );
 
+-- Prepared engagement pipeline handoff (prepare -> analyze -> post)
+CREATE TABLE IF NOT EXISTS engagement_pipeline_queue (
+    tweet_id        TEXT PRIMARY KEY,
+    author          TEXT,
+    text            TEXT,
+    search_term     TEXT,
+    url             TEXT,
+    likes           INTEGER DEFAULT 0,
+    retweets        INTEGER DEFAULT 0,
+    replies         INTEGER DEFAULT 0,
+    candidate_json  TEXT,
+    context_json    TEXT,
+    decision_json   TEXT,
+    status          TEXT        NOT NULL DEFAULT 'prepared',
+    prepared_at     TIMESTAMPTZ,
+    analyzed_at     TIMESTAMPTZ,
+    posted_at       TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ DEFAULT now(),
+    error           TEXT
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_accounts_stage  ON accounts(stage);
 CREATE INDEX IF NOT EXISTS idx_accounts_score  ON accounts(relevance_score DESC NULLS LAST);
@@ -127,3 +148,4 @@ CREATE INDEX IF NOT EXISTS idx_edges_target    ON social_edges(target);
 CREATE INDEX IF NOT EXISTS idx_eng_user        ON engagements(target_username);
 CREATE INDEX IF NOT EXISTS idx_eng_time        ON engagements(replied_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_time      ON posts(posted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_eng_pipe_status ON engagement_pipeline_queue(status, updated_at DESC);

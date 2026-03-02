@@ -6,16 +6,42 @@ pull:
       directory: /projects/automations/twitter
 
 deployments:
-  - name: engagement
-    description: "Autonomous Twitter engagement"
+  - name: engagement-prepare
+    description: "Engagement phase 1: search/context preparation (CDP)"
     version: "1.0"
-    tags: ["twitter", "engagement"]
+    tags: ["twitter", "engagement", "prepare"]
     schedules:
       - cron: "7 * * * *"   # :07 each hour
         timezone: "UTC"
-      - cron: "38 * * * *"  # :38 each hour — 31-min gap, non-obvious minutes
+      - cron: "38 * * * *"  # :38 each hour
         timezone: "UTC"
-    entrypoint: twitter_scheduler.py:engagement_flow
+    entrypoint: twitter_scheduler.py:engagement_prepare_flow
+    work_pool:
+      name: twitter-automation
+
+  - name: engagement-analyze
+    description: "Engagement phase 2: LLM-only analysis (no browser lock)"
+    version: "1.0"
+    tags: ["twitter", "engagement", "analyze", "llm"]
+    schedules:
+      - cron: "11 * * * *"   # ~4 min after prepare
+        timezone: "UTC"
+      - cron: "42 * * * *"   # ~4 min after prepare
+        timezone: "UTC"
+    entrypoint: twitter_scheduler.py:engagement_analyze_flow
+    work_pool:
+      name: twitter-automation
+
+  - name: engagement-post
+    description: "Engagement phase 3: post approved replies (CDP)"
+    version: "1.0"
+    tags: ["twitter", "engagement", "post"]
+    schedules:
+      - cron: "15 * * * *"   # ~4 min after analyze
+        timezone: "UTC"
+      - cron: "46 * * * *"   # ~4 min after analyze
+        timezone: "UTC"
+    entrypoint: twitter_scheduler.py:engagement_post_flow
     work_pool:
       name: twitter-automation
 

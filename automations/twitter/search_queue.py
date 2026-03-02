@@ -22,6 +22,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 from collections import Counter
 from datetime import datetime, timezone
@@ -129,6 +130,14 @@ def cmd_fill(args: argparse.Namespace) -> int:
     with get_conn() as conn:
         size = queue_size(conn)
         print(f"Queue: {size} unprocessed candidates ready for engagement", flush=True)
+
+    if getattr(args, "prepare", False):
+        print("\nRunning engagement prepare phase...", flush=True)
+        script_path = "/projects/automations/twitter/twitter_engagement_prepare.py"
+        res = subprocess.run([sys.executable, "-u", script_path], check=False)
+        if res.returncode != 0:
+            print(f"Prepare phase failed with code {res.returncode}", flush=True)
+            return res.returncode
 
     return 0
 
@@ -325,6 +334,11 @@ def main() -> int:
         type=int,
         metavar="N",
         help=f"Terms to sample (default: {DEFAULT_SAMPLE_SIZE})",
+    )
+    p_fill.add_argument(
+        "--prepare",
+        action="store_true",
+        help="Run engagement prepare phase after queue fill",
     )
 
     # show
