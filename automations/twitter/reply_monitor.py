@@ -69,6 +69,11 @@ SEEN_TTL_DAYS = 2
 
 # KV state key for seen mention IDs (stored as JSON string)
 KV_SEEN_MENTIONS = "reply_monitor:seen_mentions"
+KV_POST_FAILURE_STREAK = "reply_monitor:post_failure_streak"
+
+# Escalate repeated post failures into a flow failure so Prefect on_failure can
+# trigger repair_service.py. Single failures stay non-fatal.
+MAX_POST_FAILURE_STREAK_BEFORE_FAIL = 3
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +121,22 @@ def prune_seen_mentions(conn, seen: dict[str, str]) -> int:
     if expired:
         save_seen_mentions(conn, seen)
     return len(expired)
+
+
+def load_post_failure_streak(conn) -> int:
+    """Load consecutive reply-post failure streak from kv_state."""
+    raw = kv_get(conn, KV_POST_FAILURE_STREAK)
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def save_post_failure_streak(conn, streak: int) -> None:
+    """Persist consecutive reply-post failure streak to kv_state."""
+    kv_set(conn, KV_POST_FAILURE_STREAK, str(max(0, int(streak))))
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +484,12 @@ def main() -> int:
         with get_conn() as conn:
             # Load state from DB
             seen_mentions = load_seen_mentions(conn)
+            post_failure_streak = load_post_failure_streak(conn)
+            if post_failure_streak:
+                print(
+                    f"Loaded reply post failure streak={post_failure_streak}",
+                    flush=True,
+                )
 
             # Prune stale seen IDs
             pruned = prune_seen_mentions(conn, seen_mentions)
@@ -611,14 +638,28 @@ def main() -> int:
 
                     posted, our_reply_id = post_reply(tid, reply_text)
                     if not posted:
+                        post_failure_streak += 1
+                        save_post_failure_streak(conn, post_failure_streak)
                         send_error_alert(
-                            f"Reply monitor: failed to post reply to {tid} (@{author})"
+                            "Reply monitor: failed to post reply to "
+                            f"{tid} (@{author}) "
+                            f"[streak {post_failure_streak}/"
+                            f"{MAX_POST_FAILURE_STREAK_BEFORE_FAIL}]"
                         )
+                        if post_failure_streak >= MAX_POST_FAILURE_STREAK_BEFORE_FAIL:
+                            raise RuntimeError(
+                                "Reply posting failed repeatedly "
+                                f"({post_failure_streak} consecutive failures)"
+                            )
                         continue
 
                     print("  Replied", flush=True)
                     if our_reply_id:
                         print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
+                    if post_failure_streak:
+                        post_failure_streak = 0
+                        save_post_failure_streak(conn, post_failure_streak)
+                        print("  Reset reply post failure streak to 0", flush=True)
 
                 # Auto-follow the author (skip for likes — save that for replies)
                 if engagement_type != "like":
