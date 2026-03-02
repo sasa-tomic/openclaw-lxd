@@ -91,7 +91,7 @@ class TestGatherMetricsReplyPerformances:
     """Verify that gather_metrics() collects reply performance data."""
 
     def test_reply_performances_in_metrics(self):
-        """gather_metrics returns replyPerformances from _gather_reply_performances."""
+        """gather_metrics returns replyPerformances24h snapshot rows."""
         from twitter import daily_strategy_eval  # type: ignore
 
         expected_perf = [{
@@ -106,24 +106,40 @@ class TestGatherMetricsReplyPerformances:
 
         mock_conn = MagicMock()
         with (
-            patch.object(daily_strategy_eval, "_gather_reply_performances", return_value=expected_perf),
-            patch.object(daily_strategy_eval, "count_engagements", return_value=0),
-            patch.object(daily_strategy_eval, "_count_posts_since", return_value=0),
+            patch.object(daily_strategy_eval, "_refresh_reply_performances", return_value={"checked": 0}),
+            patch.object(daily_strategy_eval, "get_reply_performance_snapshot", return_value=expected_perf),
+            patch.object(
+                daily_strategy_eval,
+                "get_engagement_counts_breakdown",
+                side_effect=[
+                    {"total": 0, "non_like": 0, "like_only": 0},
+                    {"total": 0, "non_like": 0, "like_only": 0},
+                ],
+            ),
+            patch.object(
+                daily_strategy_eval,
+                "get_post_counts_breakdown",
+                side_effect=[
+                    {"total": 0, "original_posts": 0, "thread_roots": 0, "thread_replies": 0},
+                    {"total": 0, "original_posts": 0, "thread_roots": 0, "thread_replies": 0},
+                ],
+            ),
+            patch.object(daily_strategy_eval, "_refresh_post_stats", return_value=0),
             patch.object(daily_strategy_eval, "get_follower_count", return_value=250),
             patch.object(daily_strategy_eval, "get_last_eval", return_value=None),
         ):
             metrics = daily_strategy_eval.gather_metrics(mock_conn)
 
-        assert "replyPerformances" in metrics
-        assert len(metrics["replyPerformances"]) == 1
-        perf = metrics["replyPerformances"][0]
+        assert "replyPerformances24h" in metrics
+        assert len(metrics["replyPerformances24h"]) == 1
+        perf = metrics["replyPerformances24h"][0]
         assert perf["replyId"] == "222"
         assert perf["author"] == "alice"
         assert perf["likes"] == 7
         assert perf["retweets"] == 2
 
     def test_replies_outside_window_excluded(self):
-        """_gather_reply_performances skips entries without our_reply_id."""
+        """_refresh_reply_performances skips entries without our_reply_id."""
         from twitter import daily_strategy_eval  # type: ignore
 
         # Entries without our_reply_id should be skipped
@@ -134,14 +150,15 @@ class TestGatherMetricsReplyPerformances:
 
         mock_conn = MagicMock()
         with (
-            patch.object(daily_strategy_eval, "get_engagements_for_perf_check", return_value=mock_engagements),
+            patch.object(daily_strategy_eval, "get_engagements_for_perf_refresh", return_value=mock_engagements),
         ):
-            result = daily_strategy_eval._gather_reply_performances(mock_conn)
+            result = daily_strategy_eval._refresh_reply_performances(mock_conn)
 
-        assert result == []
+        assert result["checked"] == 0
+        assert result["firstChecks"] == 0
 
     def test_no_our_reply_id_skipped(self):
-        """_gather_reply_performances skips entries where get_tweet_stats returns None."""
+        """_refresh_reply_performances skips entries where get_tweet_stats returns None."""
         from twitter import daily_strategy_eval  # type: ignore
 
         mock_engagements = [
@@ -156,12 +173,65 @@ class TestGatherMetricsReplyPerformances:
 
         mock_conn = MagicMock()
         with (
-            patch.object(daily_strategy_eval, "get_engagements_for_perf_check", return_value=mock_engagements),
+            patch.object(daily_strategy_eval, "get_engagements_for_perf_refresh", return_value=mock_engagements),
             patch.object(daily_strategy_eval, "get_tweet_stats", return_value=None),
         ):
-            result = daily_strategy_eval._gather_reply_performances(mock_conn)
+            result = daily_strategy_eval._refresh_reply_performances(mock_conn)
 
-        assert result == []
+        assert result["candidates"] == 1
+        assert result["checked"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 2b: eval_history raw_metrics normalization
+# ---------------------------------------------------------------------------
+
+class TestEvalMetricNormalization:
+    """Verify legacy and current eval metric schemas normalize consistently."""
+
+    def test_normalize_legacy_raw_metrics(self):
+        from twitter import db  # type: ignore
+
+        legacy = {
+            "date": "2026-03-01",
+            "followerCount": 123,
+            "followerGrowth": 5,
+            "engagements24h": 40,
+            "engagements7d": 210,
+            "posts24h": 2,
+            "posts7d": 12,
+            "replyPerformances": [{"replyId": "1"}],
+        }
+        normalized = db.normalize_eval_metrics(legacy, fallback_row={})
+
+        assert normalized["engagements24hTotal"] == 40
+        assert normalized["replies24h"] == 40
+        assert normalized["likes24h"] == 0
+        assert normalized["posts24hTotal"] == 2
+        assert normalized["originalPosts24h"] == 2
+        assert len(normalized["replyPerformances24h"]) == 1
+
+    def test_normalize_current_raw_metrics(self):
+        from twitter import db  # type: ignore
+
+        current = {
+            "engagements24hTotal": 75,
+            "replies24h": 60,
+            "likes24h": 15,
+            "posts24hTotal": 7,
+            "originalPosts24h": 5,
+            "threadRoots24h": 1,
+            "threadReplies24h": 1,
+            "replyPerformances24h": [{"replyId": "x"}, {"replyId": "y"}],
+        }
+        normalized = db.normalize_eval_metrics(current, fallback_row={})
+
+        assert normalized["engagements24hTotal"] == 75
+        assert normalized["replies24h"] == 60
+        assert normalized["likes24h"] == 15
+        assert normalized["posts24hTotal"] == 7
+        assert normalized["originalPosts24h"] == 5
+        assert len(normalized["replyPerformances24h"]) == 2
 
 
 # ---------------------------------------------------------------------------

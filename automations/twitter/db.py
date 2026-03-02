@@ -475,7 +475,7 @@ def get_engagements_with_user(conn, username: str, limit: int = 10) -> list[dict
         return [dict(row) for row in cur.fetchall()]
 
 
-def get_engagements_for_perf_check(conn) -> list[dict]:
+def get_engagements_for_perf_refresh(conn) -> list[dict]:
     """Fetch engagements that need a performance stats refresh.
 
     Covers:
@@ -533,15 +533,85 @@ def get_engaged_tweet_ids(conn) -> set[str]:
         return {row[0] for row in cur.fetchall()}
 
 
-def count_engagements(conn, since: datetime) -> int:
-    """Count engagements since a given datetime."""
-    with conn.cursor() as cur:
+def get_engagement_counts_breakdown(conn, since: datetime) -> dict[str, int]:
+    """Return engagement counts since `since`, split by non-like vs like actions."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT COUNT(*) FROM engagements WHERE replied_at >= %s",
+            """
+            SELECT
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE COALESCE(source, '') <> 'like')::int AS non_like,
+                COUNT(*) FILTER (WHERE source = 'like')::int AS like_only
+            FROM engagements
+            WHERE replied_at >= %s
+            """,
             (since,),
         )
-        row = cur.fetchone()
-        return row[0] if row else 0
+        row = cur.fetchone() or {}
+        return {
+            "total": int(row.get("total", 0) or 0),
+            "non_like": int(row.get("non_like", 0) or 0),
+            "like_only": int(row.get("like_only", 0) or 0),
+        }
+
+
+def get_reply_performance_snapshot(conn, since: datetime, limit: int = 500) -> list[dict]:
+    """Return reply performance rows for a true time window snapshot.
+
+    Includes only actual replies/quotes (excludes source='like') with captured
+    our_reply_id. Uses persisted engagement stats fields already kept up to date
+    by daily_strategy_eval refresh.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                our_reply_id,
+                target_username,
+                our_reply_text,
+                reply_likes,
+                reply_rts,
+                reply_replies,
+                search_term,
+                perf_checked_at,
+                replied_at
+            FROM engagements
+            WHERE replied_at >= %s
+              AND our_reply_id IS NOT NULL
+              AND COALESCE(source, '') <> 'like'
+            ORDER BY replied_at DESC
+            LIMIT %s
+            """,
+            (since, limit),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "replyId": row["our_reply_id"],
+            "author": row["target_username"],
+            "replyText": (row.get("our_reply_text") or "")[:100],
+            "likes": int(row.get("reply_likes") or 0),
+            "retweets": int(row.get("reply_rts") or 0),
+            "replies": int(row.get("reply_replies") or 0),
+            "searchTerm": row.get("search_term"),
+            "repliedAt": (
+                row["replied_at"].isoformat()
+                if isinstance(row.get("replied_at"), datetime)
+                else str(row.get("replied_at") or "")
+            ),
+            "perfCheckedAt": (
+                row["perf_checked_at"].isoformat()
+                if isinstance(row.get("perf_checked_at"), datetime)
+                else (
+                    str(row.get("perf_checked_at"))
+                    if row.get("perf_checked_at") is not None
+                    else None
+                )
+            ),
+        }
+        for row in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -828,6 +898,30 @@ def count_posts_today(conn) -> int:
         return row[0] if row else 0
 
 
+def get_post_counts_breakdown(conn, since: datetime) -> dict[str, int]:
+    """Return post counts since `since`, split by original post vs thread items."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE type = 'post')::int AS original_posts,
+                COUNT(*) FILTER (WHERE type = 'thread')::int AS thread_roots,
+                COUNT(*) FILTER (WHERE type = 'thread_reply')::int AS thread_replies
+            FROM posts
+            WHERE posted_at >= %s
+            """,
+            (since,),
+        )
+        row = cur.fetchone() or {}
+        return {
+            "total": int(row.get("total", 0) or 0),
+            "original_posts": int(row.get("original_posts", 0) or 0),
+            "thread_roots": int(row.get("thread_roots", 0) or 0),
+            "thread_replies": int(row.get("thread_replies", 0) or 0),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Search term stats
 # ---------------------------------------------------------------------------
@@ -904,6 +998,57 @@ def update_search_term_perf(
 # ---------------------------------------------------------------------------
 
 
+def normalize_eval_metrics(raw_metrics: dict | None, fallback_row: dict | None = None) -> dict:
+    """Return a canonical eval metrics payload across legacy and current schemas.
+
+    Legacy rows used keys like engagements24h/posts24h/replyPerformances.
+    Current rows use explicit split metrics (engagements24hTotal, replies24h, ...).
+    This function normalizes both into one stable shape for downstream consumers.
+    """
+    src = raw_metrics if isinstance(raw_metrics, dict) else {}
+    row = fallback_row or {}
+
+    def _pick(*keys, default=None):
+        for k in keys:
+            if k in src and src[k] is not None:
+                return src[k]
+        return default
+
+    engagements_24h_total = _pick("engagements24hTotal", "engagements24h", default=row.get("engagements_24h"))
+    engagements_7d_total = _pick("engagements7dTotal", "engagements7d", default=row.get("engagements_7d"))
+    posts_24h_total = _pick("posts24hTotal", "posts24h", default=row.get("posts_24h"))
+    posts_7d_total = _pick("posts7dTotal", "posts7d", default=row.get("posts_7d"))
+    reply_perf = _pick("replyPerformances24h", "replyPerformances", default=[])
+
+    normalized = {
+        "schemaVersion": 2,
+        "date": _pick("date", default=row.get("eval_date").isoformat() if isinstance(row.get("eval_date"), date) else row.get("eval_date")),
+        "timestamp": _pick("timestamp"),
+        "operationalTargets": _pick("operationalTargets", default={}),
+        "followerCount": _pick("followerCount", default=row.get("follower_count")),
+        "followerGrowth": _pick("followerGrowth", default=row.get("follower_growth")),
+        "prevEvalDate": _pick("prevEvalDate"),
+        "engagements24hTotal": int(engagements_24h_total or 0),
+        "replies24h": int(_pick("replies24h", default=engagements_24h_total) or 0),
+        "likes24h": int(_pick("likes24h", default=0) or 0),
+        "engagements7dTotal": int(engagements_7d_total or 0),
+        "replies7d": int(_pick("replies7d", default=engagements_7d_total) or 0),
+        "likes7d": int(_pick("likes7d", default=0) or 0),
+        "posts24hTotal": int(posts_24h_total or 0),
+        "originalPosts24h": int(_pick("originalPosts24h", default=posts_24h_total) or 0),
+        "threadRoots24h": int(_pick("threadRoots24h", default=0) or 0),
+        "threadReplies24h": int(_pick("threadReplies24h", default=0) or 0),
+        "posts7dTotal": int(posts_7d_total or 0),
+        "originalPosts7d": int(_pick("originalPosts7d", default=posts_7d_total) or 0),
+        "threadRoots7d": int(_pick("threadRoots7d", default=0) or 0),
+        "threadReplies7d": int(_pick("threadReplies7d", default=0) or 0),
+        "postStatsRefreshed": int(_pick("postStatsRefreshed", default=0) or 0),
+        "replyPerfRefresh": _pick("replyPerfRefresh", default={}),
+        "replyPerformances24h": reply_perf if isinstance(reply_perf, list) else [],
+    }
+    return normalized
+
+
 def insert_eval(
     conn,
     eval_date,
@@ -972,6 +1117,10 @@ def get_recent_evals(conn, limit: int = 7) -> list[dict]:
                 d["raw_metrics"] = json.loads(d["raw_metrics"])
             except Exception:
                 pass
+        d["raw_metrics_normalized"] = normalize_eval_metrics(
+            d.get("raw_metrics"),
+            fallback_row=d,
+        )
         # Serialize date/datetime fields so callers can json.dumps the result
         for k, v in d.items():
             if isinstance(v, (datetime, date)):
@@ -984,6 +1133,173 @@ def get_last_eval(conn) -> dict | None:
     """Fetch the most recent evaluation record."""
     evals = get_recent_evals(conn, limit=1)
     return evals[0] if evals else None
+
+
+def backfill_eval_metrics(conn, *, dry_run: bool = True, limit: int | None = None) -> dict[str, int]:
+    """Rewrite eval_history.raw_metrics into canonical schema via normalize_eval_metrics().
+
+    Returns counters:
+      - scanned: rows examined
+      - updated: rows changed (or that would change in dry-run)
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        sql = """
+            SELECT id, eval_date, follower_count, follower_growth,
+                   engagements_24h, engagements_7d, posts_24h, posts_7d, raw_metrics
+            FROM eval_history
+            ORDER BY eval_date DESC
+        """
+        params: tuple[Any, ...] = ()
+        if limit is not None and limit > 0:
+            sql += " LIMIT %s"
+            params = (limit,)
+        cur.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    scanned = 0
+    updated = 0
+    for row in rows:
+        scanned += 1
+        raw = row.get("raw_metrics")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        normalized = normalize_eval_metrics(raw, fallback_row=row)
+        if raw == normalized:
+            continue
+        updated += 1
+        if dry_run:
+            continue
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE eval_history SET raw_metrics = %s WHERE id = %s",
+                (json.dumps(normalized), row["id"]),
+            )
+
+    return {"scanned": scanned, "updated": updated}
+
+
+def get_daily_analytics_series(conn, days: int = 30) -> list[dict]:
+    """Return per-day follower/reply/post analytics merged into one series.
+
+    Output rows:
+      {date, followers, follower_growth, engagements_total, replies, likes_only,
+       posts_total, original_posts, thread_roots, thread_replies}
+    """
+    now = datetime.now(timezone.utc)
+    since = (now - timedelta(days=max(1, days))).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Followers from eval_history (one row/day by schema).
+    follower_map: dict[str, dict[str, int | None]] = {}
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT eval_date, follower_count, follower_growth, raw_metrics
+            FROM eval_history
+            WHERE eval_date >= %s
+            ORDER BY eval_date ASC
+            """,
+            (since.date(),),
+        )
+        for row in cur.fetchall():
+            d = dict(row)
+            raw = d.get("raw_metrics")
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except Exception:
+                    raw = {}
+            normalized = normalize_eval_metrics(raw if isinstance(raw, dict) else {}, fallback_row=d)
+            day = (
+                d["eval_date"].isoformat()
+                if isinstance(d.get("eval_date"), date)
+                else str(d.get("eval_date"))
+            )
+            follower_map[day] = {
+                "followers": normalized.get("followerCount"),
+                "follower_growth": normalized.get("followerGrowth"),
+            }
+
+    # Engagement counts by day.
+    engagement_map: dict[str, dict[str, int]] = {}
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                (replied_at AT TIME ZONE 'UTC')::date AS day,
+                COUNT(*)::int AS engagements_total,
+                COUNT(*) FILTER (WHERE COALESCE(source, '') <> 'like')::int AS replies,
+                COUNT(*) FILTER (WHERE source = 'like')::int AS likes_only
+            FROM engagements
+            WHERE replied_at >= %s
+            GROUP BY 1
+            ORDER BY 1 ASC
+            """,
+            (since,),
+        )
+        for row in cur.fetchall():
+            day = row["day"].isoformat()
+            engagement_map[day] = {
+                "engagements_total": int(row.get("engagements_total") or 0),
+                "replies": int(row.get("replies") or 0),
+                "likes_only": int(row.get("likes_only") or 0),
+            }
+
+    # Post counts by day.
+    post_map: dict[str, dict[str, int]] = {}
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                (posted_at AT TIME ZONE 'UTC')::date AS day,
+                COUNT(*)::int AS posts_total,
+                COUNT(*) FILTER (WHERE type = 'post')::int AS original_posts,
+                COUNT(*) FILTER (WHERE type = 'thread')::int AS thread_roots,
+                COUNT(*) FILTER (WHERE type = 'thread_reply')::int AS thread_replies
+            FROM posts
+            WHERE posted_at >= %s
+            GROUP BY 1
+            ORDER BY 1 ASC
+            """,
+            (since,),
+        )
+        for row in cur.fetchall():
+            day = row["day"].isoformat()
+            post_map[day] = {
+                "posts_total": int(row.get("posts_total") or 0),
+                "original_posts": int(row.get("original_posts") or 0),
+                "thread_roots": int(row.get("thread_roots") or 0),
+                "thread_replies": int(row.get("thread_replies") or 0),
+            }
+
+    # Merge over full day range.
+    start_day = since.date()
+    end_day = now.date()
+    series: list[dict] = []
+    day = start_day
+    while day <= end_day:
+        key = day.isoformat()
+        series.append(
+            {
+                "date": key,
+                "followers": follower_map.get(key, {}).get("followers"),
+                "follower_growth": follower_map.get(key, {}).get("follower_growth"),
+                "engagements_total": engagement_map.get(key, {}).get("engagements_total", 0),
+                "replies": engagement_map.get(key, {}).get("replies", 0),
+                "likes_only": engagement_map.get(key, {}).get("likes_only", 0),
+                "posts_total": post_map.get(key, {}).get("posts_total", 0),
+                "original_posts": post_map.get(key, {}).get("original_posts", 0),
+                "thread_roots": post_map.get(key, {}).get("thread_roots", 0),
+                "thread_replies": post_map.get(key, {}).get("thread_replies", 0),
+            }
+        )
+        day += timedelta(days=1)
+    return series
 
 
 # ---------------------------------------------------------------------------
