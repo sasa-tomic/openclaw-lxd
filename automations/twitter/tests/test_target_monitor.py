@@ -122,54 +122,39 @@ def _tweet_ctx(tweet_id: str, author: str = "simonw") -> dict:
 
 
 class TestStatePersistence:
-    def test_load_monitor_state_missing_file(self, tmp_path, monkeypatch):
-        """load_monitor_state returns empty defaults when state file is absent."""
-        monkeypatch.setattr(tm, "STATE_PATH", tmp_path / "nonexistent.json")
-        state = tm.load_monitor_state()
+    def test_load_monitor_state_missing_row(self):
+        """load_monitor_state returns empty defaults when kv row is absent."""
+        with mock.patch.object(tm, "kv_get", return_value=None):
+            state = tm.load_monitor_state(conn=mock.MagicMock())
         assert state == {"accounts": {}, "repliedToIds": [], "lastRunAt": None}
 
-    def test_load_monitor_state_valid_json(self, tmp_path, monkeypatch):
-        """load_monitor_state correctly deserialises existing JSON."""
-        state_file = tmp_path / "state.json"
+    def test_load_monitor_state_valid_json(self):
+        """load_monitor_state correctly deserialises JSON from kv_state."""
         data = {
             "accounts": {"simonw": {"lastCheckedAt": "2026-02-22T10:00:00Z"}},
             "repliedToIds": ["111", "222"],
             "lastRunAt": "2026-02-22T10:00:00Z",
         }
-        state_file.write_text(json.dumps(data))
-        monkeypatch.setattr(tm, "STATE_PATH", state_file)
-
-        loaded = tm.load_monitor_state()
+        with mock.patch.object(tm, "kv_get", return_value=json.dumps(data)):
+            loaded = tm.load_monitor_state(conn=mock.MagicMock())
         assert loaded["repliedToIds"] == ["111", "222"]
         assert "simonw" in loaded["accounts"]
 
-    def test_load_monitor_state_corrupt_json(self, tmp_path, monkeypatch):
-        """load_monitor_state returns defaults when the file contains garbage."""
-        state_file = tmp_path / "state.json"
-        state_file.write_text("not json at all {{{")
-        monkeypatch.setattr(tm, "STATE_PATH", state_file)
-
-        state = tm.load_monitor_state()
+    def test_load_monitor_state_corrupt_json(self):
+        """load_monitor_state returns defaults when kv payload is garbage."""
+        with mock.patch.object(tm, "kv_get", return_value="not json at all {{{"):
+            state = tm.load_monitor_state(conn=mock.MagicMock())
         assert state == {"accounts": {}, "repliedToIds": [], "lastRunAt": None}
 
-    def test_save_monitor_state_roundtrip(self, tmp_path, monkeypatch):
-        """save_monitor_state writes valid JSON that can be re-loaded."""
-        state_file = tmp_path / "state.json"
-        monkeypatch.setattr(tm, "STATE_PATH", state_file)
-
-        tm.save_monitor_state(_make_state(repliedToIds=["abc123"]))
-
-        assert state_file.exists()
-        reloaded = json.loads(state_file.read_text())
-        assert reloaded["repliedToIds"] == ["abc123"]
-
-    def test_save_monitor_state_creates_parent_dirs(self, tmp_path, monkeypatch):
-        """save_monitor_state creates missing parent directories."""
-        deep_path = tmp_path / "a" / "b" / "c" / "state.json"
-        monkeypatch.setattr(tm, "STATE_PATH", deep_path)
-
-        tm.save_monitor_state(_make_state())
-        assert deep_path.exists()
+    def test_save_monitor_state_writes_json_payload(self):
+        """save_monitor_state serializes state and writes via kv_set."""
+        with mock.patch.object(tm, "kv_set") as mocked_set:
+            tm.save_monitor_state(_make_state(repliedToIds=["abc123"]), conn=mock.MagicMock())
+        mocked_set.assert_called_once()
+        _, key, payload = mocked_set.call_args.args
+        assert key == tm.KV_MONITOR_STATE
+        parsed = json.loads(payload)
+        assert parsed["repliedToIds"] == ["abc123"]
 
     def test_get_account_state_initialises_new_account(self):
         """get_account_state creates a fresh entry for unknown usernames."""

@@ -109,6 +109,38 @@ def kv_set(conn, key: str, value: str) -> None:
         )
 
 
+def kv_get_json(conn, key: str, default):
+    """Read JSON from kv_state, returning `default` on missing/parse error."""
+    raw = kv_get(conn, key)
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
+
+
+def kv_set_json(conn, key: str, value) -> None:
+    """Serialize value as JSON into kv_state."""
+    kv_set(conn, key, json.dumps(value, ensure_ascii=False, default=str))
+
+
+def kv_get_prefix(conn, prefix: str) -> dict[str, str]:
+    """Return kv_state rows whose key starts with prefix."""
+    like = f"{prefix}%"
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT key, value
+            FROM kv_state
+            WHERE key LIKE %s
+            """,
+            (like,),
+        )
+        rows = cur.fetchall()
+    return {str(row["key"]): str(row["value"]) for row in rows}
+
+
 # ---------------------------------------------------------------------------
 # Accounts
 # ---------------------------------------------------------------------------

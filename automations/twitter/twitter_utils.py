@@ -28,14 +28,18 @@ logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.config import TWITTER_BASE_URL  # noqa: E402
+from db import get_conn, kv_get, kv_get_json, kv_get_prefix, kv_set, kv_set_json  # noqa: E402
 
 
-THREAD_INDEX_PATH = Path("/home/openclaw/clawd/memory/twitter-thread-index.json")
 STRATEGY_PATH = Path("/projects/automations/twitter/STRATEGY.md")
 HUMANIZE_SCRIPT = Path("/projects/automations/text/humanize.py")
 
 CDP_LOCK_PATH = Path("/tmp/twitter-cdp.lock")
 CDP_LOCK_TIMEOUT = 300  # seconds
+
+KV_THREAD_INDEX_PREFIX = "thread_index:"
+KV_PROFILE_CACHE_PREFIX = "profile_cache:"
+KV_SEARCH_CACHE_PREFIX = "search_cache:"
 
 
 @contextlib.contextmanager
@@ -325,24 +329,31 @@ def run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
 
 
 def load_thread_index() -> dict[str, str]:
-    """Load the tweet_id → note_path index. Returns {} if not found."""
-    if THREAD_INDEX_PATH.exists():
-        try:
-            return json.loads(THREAD_INDEX_PATH.read_text())
-        except Exception as e:
-            logger.debug(f"load_thread_index failed: {e}")
-    return {}
+    """Load tweet_id → note_path index from DB kv_state."""
+    try:
+        with get_conn() as conn:
+            rows = kv_get_prefix(conn, KV_THREAD_INDEX_PREFIX)
+        out: dict[str, str] = {}
+        for key, value in rows.items():
+            tweet_id = key[len(KV_THREAD_INDEX_PREFIX) :]
+            if tweet_id:
+                out[tweet_id] = value
+        return out
+    except Exception as e:
+        logger.debug(f"load_thread_index failed: {e}")
+        return {}
 
 
 def update_thread_index(tweet_ids: list[str], note_path: str) -> None:
-    """Add tweet_id → note_path entries to the index (atomic write)."""
-    index = load_thread_index()
-    for tid in tweet_ids:
-        index[str(tid)] = note_path
-    THREAD_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = THREAD_INDEX_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n")
-    tmp.replace(THREAD_INDEX_PATH)
+    """Add tweet_id → note_path entries to DB kv_state."""
+    if not tweet_ids:
+        return
+    try:
+        with get_conn() as conn:
+            for tid in tweet_ids:
+                kv_set(conn, f"{KV_THREAD_INDEX_PREFIX}{str(tid)}", note_path)
+    except Exception as e:
+        logger.debug(f"update_thread_index failed: {e}")
 
 
 def lookup_our_thread(tweet_ids: list[str]) -> str | None:
@@ -354,15 +365,19 @@ def lookup_our_thread(tweet_ids: list[str]) -> str | None:
     """
     if not tweet_ids:
         return None
-    index = load_thread_index()
-    for tid in tweet_ids:
-        note_path = index.get(str(tid))
-        if note_path:
-            try:
-                return Path(note_path).read_text()
-            except Exception as e:
-                logger.debug(f"lookup_our_thread failed to read {note_path}: {e}")
-                return None
+    try:
+        with get_conn() as conn:
+            for tid in tweet_ids:
+                note_path = kv_get(conn, f"{KV_THREAD_INDEX_PREFIX}{str(tid)}")
+                if not note_path:
+                    continue
+                try:
+                    return Path(note_path).read_text()
+                except Exception as e:
+                    logger.debug(f"lookup_our_thread failed to read {note_path}: {e}")
+                    return None
+    except Exception as e:
+        logger.debug(f"lookup_our_thread kv lookup failed: {e}")
     return None
 
 
@@ -1498,35 +1513,47 @@ def fetch_tweet_context(tweet_id: str) -> dict | None:
         return None
 
 
-PROFILE_CACHE_PATH = Path("/home/openclaw/clawd/memory/twitter-profile-cache.json")
 PROFILE_CACHE_TTL_DAYS = 7
 
-SEARCH_CACHE_PATH = Path("/home/openclaw/clawd/memory/twitter-search-cache.json")
 SEARCH_CACHE_TTL_HOURS = 6
 
 
 def load_profile_cache() -> dict:
-    """Load the profile cache. Returns {} if not found."""
-    if PROFILE_CACHE_PATH.exists():
-        try:
-            return json.loads(PROFILE_CACHE_PATH.read_text())
-        except Exception as e:
-            logger.debug(f"load_profile_cache failed: {e}")
-    return {}
+    """Load profile cache rows from DB kv_state."""
+    try:
+        with get_conn() as conn:
+            rows = kv_get_prefix(conn, KV_PROFILE_CACHE_PREFIX)
+        out: dict = {}
+        for key, value in rows.items():
+            username = key[len(KV_PROFILE_CACHE_PREFIX) :]
+            try:
+                out[username] = json.loads(value)
+            except Exception:
+                continue
+        return out
+    except Exception as e:
+        logger.debug(f"load_profile_cache failed: {e}")
+        return {}
 
 
 def save_profile_cache(cache: dict) -> None:
-    """Save the profile cache atomically."""
-    PROFILE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = PROFILE_CACHE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n")
-    tmp.replace(PROFILE_CACHE_PATH)
+    """Persist profile cache dict into DB kv_state."""
+    try:
+        with get_conn() as conn:
+            for username, entry in cache.items():
+                kv_set_json(conn, f"{KV_PROFILE_CACHE_PREFIX}{username.lower()}", entry)
+    except Exception as e:
+        logger.debug(f"save_profile_cache failed: {e}")
 
 
 def get_cached_profile(username: str) -> dict | None:
-    """Get cached profile if not expired. Returns None if missing/stale."""
-    cache = load_profile_cache()
-    entry = cache.get(username.lower())
+    """Get cached profile from DB kv_state if not expired."""
+    try:
+        with get_conn() as conn:
+            entry = kv_get_json(conn, f"{KV_PROFILE_CACHE_PREFIX}{username.lower()}", None)
+    except Exception as e:
+        logger.debug(f"get_cached_profile kv lookup failed: {e}")
+        return None
     if not entry:
         return None
     try:
@@ -1542,31 +1569,41 @@ def get_cached_profile(username: str) -> dict | None:
 
 
 def cache_profile(username: str, profile: dict) -> None:
-    """Cache a user's profile data."""
-    cache = load_profile_cache()
-    cache[username.lower()] = {
-        "cachedAt": utc_now(),
-        "profile": profile,
-    }
-    save_profile_cache(cache)
+    """Cache a user's profile data in DB kv_state."""
+    entry = {"cachedAt": utc_now(), "profile": profile}
+    try:
+        with get_conn() as conn:
+            kv_set_json(conn, f"{KV_PROFILE_CACHE_PREFIX}{username.lower()}", entry)
+    except Exception as e:
+        logger.debug(f"cache_profile failed: {e}")
 
 
 def _load_search_cache() -> dict:
-    """Load the search results cache. Returns {} if not found."""
-    if SEARCH_CACHE_PATH.exists():
-        try:
-            return json.loads(SEARCH_CACHE_PATH.read_text())
-        except Exception as e:
-            logger.debug(f"_load_search_cache failed: {e}")
-    return {}
+    """Load search cache rows from DB kv_state."""
+    try:
+        with get_conn() as conn:
+            rows = kv_get_prefix(conn, KV_SEARCH_CACHE_PREFIX)
+        out: dict = {}
+        for key, value in rows.items():
+            term = key[len(KV_SEARCH_CACHE_PREFIX) :]
+            try:
+                out[term] = json.loads(value)
+            except Exception:
+                continue
+        return out
+    except Exception as e:
+        logger.debug(f"_load_search_cache failed: {e}")
+        return {}
 
 
 def _save_search_cache(cache: dict) -> None:
-    """Save the search results cache atomically."""
-    SEARCH_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SEARCH_CACHE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n")
-    tmp.replace(SEARCH_CACHE_PATH)
+    """Persist search cache dict into DB kv_state."""
+    try:
+        with get_conn() as conn:
+            for term, entry in cache.items():
+                kv_set_json(conn, f"{KV_SEARCH_CACHE_PREFIX}{term.lower().strip()}", entry)
+    except Exception as e:
+        logger.debug(f"_save_search_cache failed: {e}")
 
 
 def _get_cached_search(cache: dict, term: str) -> list[dict] | None:
@@ -1728,7 +1765,7 @@ def get_user_profile(username: str, use_cache: bool = True) -> dict | None:
 _follower_count_run_cache: dict[str, int] = {}
 
 
-def get_follower_count(username: str) -> int | None:
+def get_follower_count(username: str, *, force_refresh: bool = False) -> int | None:
     """Fetch a user's follower count, with two caching layers:
 
     1. In-process dict (deduplicates within a single run — free)
@@ -1739,24 +1776,36 @@ def get_follower_count(username: str) -> int | None:
     username_lower = username.lower()
 
     # Layer 1: in-process (same author appearing in multiple search results)
-    if username_lower in _follower_count_run_cache:
+    if not force_refresh and username_lower in _follower_count_run_cache:
         return _follower_count_run_cache[username_lower]
 
     # Layer 2: file-based profile cache (cross-run)
-    cached_profile = get_cached_profile(username)
-    if cached_profile is not None and cached_profile.get("followersCount") is not None:
-        count = int(cached_profile["followersCount"])
-        _follower_count_run_cache[username_lower] = count
-        return count
+    if not force_refresh:
+        cached_profile = get_cached_profile(username)
+        if cached_profile is not None and cached_profile.get("followersCount") is not None:
+            count = int(cached_profile["followersCount"])
+            _follower_count_run_cache[username_lower] = count
+            return count
 
     # Cache miss — navigate to profile page
     js = r"""(() => {
-  // Look for the followers link which contains the count
-  const links = document.querySelectorAll('a[href$="/verified_followers"]');
+  // Use total followers (not verified_followers subset).
+  const links = document.querySelectorAll('a[href$="/followers"], a[href*="/followers"]');
   for (const link of links) {
     const text = link.textContent || '';
     // Matches patterns like "1,234 Followers" or "5.2K Followers" or "12M Followers"
     const m = text.match(/([\d,.]+[KkMm]?)\s*Follower/);
+    if (m) {
+      let val = m[1].replace(/,/g, '');
+      if (val.endsWith('K') || val.endsWith('k')) return parseFloat(val) * 1000;
+      if (val.endsWith('M') || val.endsWith('m')) return parseFloat(val) * 1000000;
+      return parseInt(val);
+    }
+  }
+  // Fallback: scan likely stat row text.
+  const statRow = document.querySelector('[data-testid="primaryColumn"]');
+  if (statRow) {
+    const m = (statRow.textContent || '').match(/([\d,.]+[KkMm]?)\s*Followers/i);
     if (m) {
       let val = m[1].replace(/,/g, '');
       if (val.endsWith('K') || val.endsWith('k')) return parseFloat(val) * 1000;
@@ -1795,15 +1844,9 @@ def get_follower_count(username: str) -> int | None:
     if count is not None:
         # Populate both cache layers so subsequent calls are free
         _follower_count_run_cache[username_lower] = count
-        file_cache = load_profile_cache()
-        existing_entry = file_cache.get(username_lower, {})
-        existing_profile = existing_entry.get("profile", {})
+        existing_profile = get_cached_profile(username) or {}
         existing_profile["followersCount"] = count
-        file_cache[username_lower] = {
-            "cachedAt": utc_now(),
-            "profile": existing_profile,
-        }
-        save_profile_cache(file_cache)
+        cache_profile(username, existing_profile)
 
     return count
 

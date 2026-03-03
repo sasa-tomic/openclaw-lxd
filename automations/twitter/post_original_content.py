@@ -44,6 +44,8 @@ from db import (
     get_top_posts,
     get_popular_candidate_tweets,
     insert_post,
+    kv_get_json,
+    kv_set_json,
 )
 
 # Phase 1 hard rules: zero product mentions in original posts
@@ -70,26 +72,19 @@ def has_product_mention(text: str) -> bool:
     return False
 
 
-MORNING_RESEARCH_CACHE = Path("/tmp/twitter-morning-research.json")
-QUEUE_PATH = Path("/home/openclaw/clawd/memory/twitter-content-queue.json")
+KV_MORNING_RESEARCH = "twitter:morning_research"
+KV_CONTENT_QUEUE = "twitter:content_queue"
 
 
-def load_queue() -> list[dict]:
-    """Load the content queue from disk."""
-    if QUEUE_PATH.exists():
-        try:
-            return json.loads(QUEUE_PATH.read_text())
-        except Exception:
-            return []
-    return []
+def load_queue(conn) -> list[dict]:
+    """Load the content queue from DB kv_state."""
+    queue = kv_get_json(conn, KV_CONTENT_QUEUE, [])
+    return queue if isinstance(queue, list) else []
 
 
-def save_queue(queue: list[dict]) -> None:
-    """Atomically save the content queue to disk."""
-    QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = QUEUE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(queue, ensure_ascii=False, indent=2) + "\n")
-    tmp.replace(QUEUE_PATH)
+def save_queue(conn, queue: list[dict]) -> None:
+    """Persist the content queue to DB kv_state."""
+    kv_set_json(conn, KV_CONTENT_QUEUE, queue)
 
 
 def llm_rank_candidates(candidates: list[dict], top_posts: list[dict]) -> list[dict]:
@@ -181,15 +176,10 @@ Output ONLY a JSON array — one object per candidate, in the same order:
         return candidates
 
 
-def load_morning_research() -> dict | None:
-    """Load cached morning research results if available."""
-    if not MORNING_RESEARCH_CACHE.exists():
-        return None
-
-    try:
-        return json.loads(MORNING_RESEARCH_CACHE.read_text())
-    except Exception:
-        return None
+def load_morning_research(conn) -> dict | None:
+    """Load morning research results from DB kv_state."""
+    data = kv_get_json(conn, KV_MORNING_RESEARCH, None)
+    return data if isinstance(data, dict) else None
 
 
 def get_recent_commits(n: int = 5) -> list[str]:
@@ -218,7 +208,7 @@ def _get_engagement_themes(recent_engagements: list[dict], n: int = 10) -> list[
 def draft_batch(conn) -> list[dict]:
     """Use LLM to draft a batch of 3-5 tweets. Returns list of queue entries."""
 
-    research = load_morning_research()
+    research = load_morning_research(conn)
     recent_posts_db = get_recent_posts(conn, days=14, limit=12)
     recent_engagements_db = get_recent_engagements(conn, hours=168, limit=15)
     top_posts_db = get_top_posts(conn, limit=20)
@@ -440,7 +430,7 @@ def draft_single(conn) -> dict | None:
 
     recent_posts = [p.get("text", "")[:200] for p in recent_posts_db]
     engagement_themes = _get_engagement_themes(recent_engagements_db, n=10)
-    research = load_morning_research()
+    research = load_morning_research(conn)
 
     top_posts_with_stats = [p for p in top_posts_db if (p.get("likes") or 0) + (p.get("rts") or 0) > 0]
     top_posts_section = ""
@@ -584,7 +574,7 @@ def main() -> int:
                 return 0
 
             # Load queue and clean up old posted entries (>7 days)
-            queue = load_queue()
+            queue = load_queue(conn)
             cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
             queue = [
                 entry
@@ -600,7 +590,7 @@ def main() -> int:
                 new_entries = draft_batch(conn)
                 if new_entries:
                     queue.extend(new_entries)
-                    save_queue(queue)
+                    save_queue(conn, queue)
                     unposted = [entry for entry in queue if not entry.get("posted")]
                     print(f"Queue after batch: {len(unposted)} unposted", flush=True)
                 else:
@@ -609,7 +599,7 @@ def main() -> int:
                     single = draft_single(conn)
                     if single:
                         queue.append(single)
-                        save_queue(queue)
+                        save_queue(conn, queue)
                         unposted = [entry for entry in queue if not entry.get("posted")]
                         print(
                             f"Queue after single draft: {len(unposted)} unposted",
@@ -652,7 +642,7 @@ def main() -> int:
             # Mark as posted in queue
             best["posted"] = True
             best["postedAt"] = datetime.now(timezone.utc).isoformat()
-            save_queue(queue)
+            save_queue(conn, queue)
 
             # Get the tweet ID from our profile for tracking
             from twitter_utils import jitter_sleep

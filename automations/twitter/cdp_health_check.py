@@ -3,7 +3,7 @@
 
 Checks that Chrome CDP at localhost:9222 is reachable and responsive.
 Sends Telegram alerts on failure and recovery. Tracks state between runs
-in /tmp/cdp-health-state.json.
+in Postgres kv_state.
 
 Independent of twitter_utils.py -- works even if other code is broken.
 """
@@ -21,14 +21,34 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 logger = logging.getLogger(__name__)
 from lib.config import OPENCLAW_BIN, TELEGRAM_TARGET
-from lib.state_utils import load_state, save_state
 from lib.telegram_utils import send_telegram
+from twitter.db import get_conn, kv_get_json, kv_set_json
 
-STATE_FILE = Path("/tmp/cdp-health-state.json")
+KV_CDP_HEALTH_STATE = "twitter:cdp_health_state"
 STATE_DEFAULT = {"down": False, "since": None, "last_check": None}
 CDP_URL = "http://localhost:9222/json/version"
 CDP_TIMEOUT = 10
 SOCAT_SERVICE = "socat-proxy.service"
+
+
+def load_health_state() -> dict:
+    """Load health-check state from DB, falling back to defaults."""
+    try:
+        with get_conn() as conn:
+            state = kv_get_json(conn, KV_CDP_HEALTH_STATE, STATE_DEFAULT)
+        return state if isinstance(state, dict) else dict(STATE_DEFAULT)
+    except Exception as e:
+        logger.warning(f"Could not load health state from DB: {e}")
+        return dict(STATE_DEFAULT)
+
+
+def save_health_state(state: dict) -> None:
+    """Save health-check state to DB (best effort)."""
+    try:
+        with get_conn() as conn:
+            kv_set_json(conn, KV_CDP_HEALTH_STATE, state)
+    except Exception as e:
+        logger.warning(f"Could not save health state to DB: {e}")
 
 
 def send_telegram_alert(message: str) -> None:
@@ -79,7 +99,7 @@ def main() -> None:
 
     logger.info("Starting health check")
 
-    state = load_state(STATE_FILE, STATE_DEFAULT)
+    state = load_health_state()
     was_down = state.get("down", False)
 
     socat_ok, socat_status = check_socat()
@@ -130,7 +150,7 @@ def main() -> None:
             )
 
     state["last_check"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    save_state(STATE_FILE, state)
+    save_health_state(state)
     logger.info("Done")
 
 

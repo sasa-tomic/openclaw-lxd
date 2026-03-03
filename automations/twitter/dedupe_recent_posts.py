@@ -16,12 +16,16 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).parent))
+from db import get_conn, get_recent_posts, kv_get_json
+
+KV_RECENT_POSTS = "twitter:recent_posts"
 
 STOPWORDS = {
     "a",
@@ -212,21 +216,25 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
     ap.add_argument("--title", default="")
-    ap.add_argument(
-        "--state",
-        default="/home/openclaw/clawd/memory/twitter-state.json",
-        help="twitter-state.json path",
-    )
     ap.add_argument("--max", type=int, default=200, help="max recentPosts entries to consider")
     args = ap.parse_args()
-
-    state_path = Path(args.state)
-    if not state_path.exists():
-        print("state file missing", file=sys.stderr)
-        return 1
-
-    state = json.loads(state_path.read_text())
-    rp_raw = list(state.get("recentPosts", []))[-args.max :]
+    with get_conn() as conn:
+        kv_recent = kv_get_json(conn, KV_RECENT_POSTS, [])
+        if not isinstance(kv_recent, list):
+            kv_recent = []
+        rows = get_recent_posts(conn, days=90, limit=args.max)
+    rp_raw = list(kv_recent)[-args.max :]
+    for row in rows:
+        rp_raw.append(
+            {
+                "date": str(row.get("posted_at", ""))[:10],
+                "type": row.get("type", ""),
+                "text": row.get("text", ""),
+                "link": row.get("url"),
+            }
+        )
+    if len(rp_raw) > args.max:
+        rp_raw = rp_raw[-args.max :]
 
     recent: list[RecentPost] = []
     for r in rp_raw:

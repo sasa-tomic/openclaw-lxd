@@ -28,15 +28,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from lib.config import OPENCODE_BIN
-from lib.state_utils import load_state, save_state
 from lib.telegram_utils import send_telegram
+from twitter.db import get_conn, kv_get_json, kv_set_json
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 LOCK_FILE = "/tmp/twitter-repair.lock"
-STATE_FILE = Path("/home/openclaw/clawd/memory/twitter-repair-state.json")
+KV_REPAIR_STATE = "twitter:repair_state"
 LOG_DIR = Path("/home/openclaw/clawd/logs")
 REPAIR_COOLDOWN_HOURS = 2
 MAX_HISTORY = 100
@@ -46,6 +46,26 @@ AUTOMATIONS_DIR = Path("/projects/automations")
 WORKTREES_DIR = AUTOMATIONS_DIR / ".claude" / "worktrees"
 
 _STATE_DEFAULT: dict = {"lastRepairs": {}, "repairHistory": []}
+
+def _load_repair_state() -> dict:
+    """Load repair state from DB. Falls back to defaults on errors."""
+    try:
+        with get_conn() as conn:
+            state = kv_get_json(conn, KV_REPAIR_STATE, _STATE_DEFAULT)
+        return state if isinstance(state, dict) else dict(_STATE_DEFAULT)
+    except Exception as e:
+        print(f"[repair] Warning: failed to load DB repair state: {e}", flush=True)
+        return dict(_STATE_DEFAULT)
+
+
+def _save_repair_state(state: dict) -> None:
+    """Persist repair state into DB. Best-effort."""
+    try:
+        with get_conn() as conn:
+            kv_set_json(conn, KV_REPAIR_STATE, state)
+    except Exception as e:
+        print(f"[repair] Warning: failed to save DB repair state: {e}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Flow → script mapping
@@ -261,7 +281,7 @@ def _do_repair(
     # ------------------------------------------------------------------
     # 2b. Cooldown check
     # ------------------------------------------------------------------
-    state = load_state(STATE_FILE, _STATE_DEFAULT)
+    state = _load_repair_state()
     if _check_cooldown(state, flow_name):
         print(
             f"[repair] Cooldown active for {flow_name} (last repair < {REPAIR_COOLDOWN_HOURS}h ago).",
@@ -452,7 +472,7 @@ def _do_repair(
     # 12. Save cooldown + append to repair log
     # ------------------------------------------------------------------
     # Reload state in case it was updated while opencode ran
-    state = load_state(STATE_FILE, _STATE_DEFAULT)
+    state = _load_repair_state()
     if "lastRepairs" not in state:
         state["lastRepairs"] = {}
     if "repairHistory" not in state:
@@ -476,7 +496,7 @@ def _do_repair(
     if len(state["repairHistory"]) > MAX_HISTORY:
         state["repairHistory"] = state["repairHistory"][-MAX_HISTORY:]
 
-    save_state(STATE_FILE, state)
+    _save_repair_state(state)
 
     # ------------------------------------------------------------------
     # 13. Exit code

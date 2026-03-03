@@ -4,8 +4,8 @@
 Runs once daily to find and draft tweet opportunities.
 
 Output:
-- /tmp/twitter-morning-research.json — JSON cache read by post_original_content.py
-- /tmp/twitter-morning-results.txt  — human-readable summary for review
+- kv_state key `twitter:morning_research` — cache read by post_original_content.py
+- /tmp/twitter-morning-results.txt       — human-readable summary for review
 """
 
 import json
@@ -22,15 +22,16 @@ logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from lib.state_utils import load_state, save_state
+from db import get_conn, kv_get_json, kv_set_json
 
 MEMORY_DIR = Path("/home/openclaw/clawd/memory")
-STATE_FILE = MEMORY_DIR / "twitter-state.json"
 RESULTS_FILE = Path("/tmp/twitter-morning-results.txt")
-RESEARCH_CACHE = Path("/tmp/twitter-morning-research.json")
 NOTES_DIR = Path("/projects/Notes")
 TEASER_FILE = NOTES_DIR / "Pickle/twitter-teasers.md"
 DEDUPE_SCRIPT = Path("/projects/automations/twitter/dedupe_recent_posts.py")
+
+KV_MORNING_STATE = "twitter:morning_state"
+KV_MORNING_RESEARCH = "twitter:morning_research"
 
 HN_QUERIES = [
     "kubernetes clusters hetzner",
@@ -100,7 +101,10 @@ def is_duplicate(url: str, title: str) -> bool:
 def main():
     print("=== DECENT CLOUD TWITTER - MORNING RESEARCH ===")
 
-    state = load_state(STATE_FILE, DEFAULT_STATE)
+    with get_conn() as conn:
+        state = kv_get_json(conn, KV_MORNING_STATE, DEFAULT_STATE)
+        if not isinstance(state, dict):
+            state = dict(DEFAULT_STATE)
     force = os.environ.get("FORCE", "0") == "1"
 
     # Check if we should run
@@ -212,19 +216,19 @@ def main():
 
     # Update state
     state["lastResearchRun"] = datetime.now(timezone.utc).isoformat()
-    save_state(STATE_FILE, state)
+    with get_conn() as conn:
+        kv_set_json(conn, KV_MORNING_STATE, state)
 
-    # Write JSON cache for post_original_content.py to consume
+    # Write research cache for post_original_content.py to consume
     research_cache = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "hnStories": hn_stories,
         "devActivity": dev_activity,
     }
-    tmp = RESEARCH_CACHE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(research_cache, ensure_ascii=False, indent=2) + "\n")
-    tmp.replace(RESEARCH_CACHE)
+    with get_conn() as conn:
+        kv_set_json(conn, KV_MORNING_RESEARCH, research_cache)
     print(
-        f"  Wrote research cache: {len(hn_stories)} HN stories, dev={dev_activity is not None}"
+        f"  Wrote research cache (DB): {len(hn_stories)} HN stories, dev={dev_activity is not None}"
     )
 
     # Report results

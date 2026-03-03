@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Append a structured recentPosts entry to twitter-state.json.
+"""Append a structured recentPosts entry to DB kv_state.
 
 Why: keep duplicate detection reliable by storing the actual link when we post.
 
 Usage:
   log_recent_post.py --type tweet --text "..." --link "https://..." [--tweet-id 123]
 
-Env:
-  TWITTER_STATE=/home/openclaw/clawd/memory/twitter-state.json
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from db import get_conn, kv_get_json, kv_set_json
+
+KV_RECENT_POSTS = "twitter:recent_posts"
+KV_LAST_POST = "twitter:last_post"
+MAX_RECENT_POSTS = 500
 
 
 def utc_now() -> str:
@@ -29,14 +33,7 @@ def main() -> int:
     ap.add_argument("--text", required=True)
     ap.add_argument("--link", default=None)
     ap.add_argument("--tweet-id", dest="tweet_id", default=None)
-    ap.add_argument("--state", default=os.environ.get("TWITTER_STATE", "/home/openclaw/clawd/memory/twitter-state.json"))
     args = ap.parse_args()
-
-    state_path = Path(args.state)
-    if not state_path.exists():
-        raise SystemExit(f"state file not found: {state_path}")
-
-    state = json.loads(state_path.read_text())
     now = utc_now()
 
     entry: dict = {
@@ -49,16 +46,17 @@ def main() -> int:
     if args.tweet_id:
         entry["tweetId"] = args.tweet_id
 
-    state.setdefault("recentPosts", [])
-    state["recentPosts"].append(entry)
+    with get_conn() as conn:
+        recent = kv_get_json(conn, KV_RECENT_POSTS, [])
+        if not isinstance(recent, list):
+            recent = []
+        recent.append(entry)
+        if len(recent) > MAX_RECENT_POSTS:
+            recent = recent[-MAX_RECENT_POSTS:]
+        kv_set_json(conn, KV_RECENT_POSTS, recent)
 
-    # Keep lastPost updated for real posts/replies.
-    if args.type in {"tweet", "reply", "value-drop", "teaser", "repo-update"}:
-        state["lastPost"] = now
-
-    tmp = state_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=False) + "\n")
-    tmp.replace(state_path)
+        if args.type in {"tweet", "reply", "value-drop", "teaser", "repo-update"}:
+            kv_set_json(conn, KV_LAST_POST, now)
     return 0
 
 

@@ -28,7 +28,6 @@ import json
 import random
 import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 sys.path.insert(0, "/projects/automations")
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
@@ -114,28 +113,45 @@ TARGET_ACCOUNTS = [
     "cloudoptimizer",   # Cloud cost
 ]
 
-# File-based state path (used by file-based helpers below)
-STATE_PATH = Path("/home/openclaw/clawd/memory/target-monitor-state.json")
+KV_MONITOR_STATE = "target_monitor:state"
 
 # ---------------------------------------------------------------------------
-# File-based state helpers (used by tests and optional file-backed operation)
+# Monitor state helpers (DB-backed)
 # ---------------------------------------------------------------------------
 
 
-def load_monitor_state() -> dict:
-    """Load monitor state from STATE_PATH JSON file, or return empty defaults."""
+def load_monitor_state(conn=None) -> dict:
+    """Load monitor state from kv_state, or return empty defaults."""
+    default = {"accounts": {}, "repliedToIds": [], "lastRunAt": None}
+    if conn is None:
+        try:
+            with get_conn() as db_conn:
+                return load_monitor_state(conn=db_conn)
+        except Exception:
+            return default
     try:
-        if STATE_PATH.exists():
-            return json.loads(STATE_PATH.read_text())
+        raw = kv_get(conn, KV_MONITOR_STATE)
+        if not raw:
+            return default
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else default
     except Exception:
-        pass
-    return {"accounts": {}, "repliedToIds": [], "lastRunAt": None}
+        return default
 
 
-def save_monitor_state(state: dict) -> None:
-    """Save monitor state dict to STATE_PATH as JSON."""
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2))
+def save_monitor_state(state: dict, conn=None) -> None:
+    """Save monitor state dict to kv_state."""
+    if conn is None:
+        try:
+            with get_conn() as db_conn:
+                save_monitor_state(state, conn=db_conn)
+        except Exception:
+            return
+        return
+    try:
+        kv_set(conn, KV_MONITOR_STATE, json.dumps(state, ensure_ascii=False))
+    except Exception:
+        return
 
 
 def get_account_state(state: dict, username: str) -> dict:

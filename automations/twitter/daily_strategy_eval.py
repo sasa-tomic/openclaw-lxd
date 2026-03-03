@@ -53,8 +53,8 @@ ORIGINAL_POSTS_TARGET_PER_DAY = 5  # deployment: 07:30, 10:30, 13:30, 17:30, 21:
 
 
 def get_follower_count() -> int | None:
-    """Get our own follower count via shared CDP function."""
-    return get_user_follower_count("DecentCloud_org")
+    """Get our own follower count via shared CDP function (fresh fetch)."""
+    return get_user_follower_count("DecentCloud_org", force_refresh=True)
 
 
 def gather_metrics(conn) -> dict:
@@ -69,8 +69,6 @@ def gather_metrics(conn) -> dict:
     posts_24h = get_post_counts_breakdown(conn, since=day_ago)
     posts_7d = get_post_counts_breakdown(conn, since=week_ago)
 
-    follower_count = get_follower_count()
-
     # Follower growth (compare to last eval)
     last_eval = get_last_eval(conn)
     prev_followers = None
@@ -78,6 +76,11 @@ def gather_metrics(conn) -> dict:
     if last_eval:
         prev_followers = last_eval.get("follower_count")
         prev_eval_date = str(last_eval.get("eval_date", ""))
+
+    follower_count = get_follower_count()
+    if follower_count is None and prev_followers is not None:
+        # Keep reports stable if live follower scrape temporarily fails.
+        follower_count = int(prev_followers)
 
     follower_growth = None
     if follower_count is not None and prev_followers is not None:
