@@ -1612,19 +1612,33 @@ def fetch_user_profile(username: str) -> dict | None:
   const verifiedBadge = document.querySelector('[data-testid="icon-verified"]');
   if (verifiedBadge) result.isVerified = true;
 
-  // Get follower/following/tweets counts from profile stats
-  const statLinks = document.querySelectorAll('a[href*="followers"], a[href*="/following"]');
+  // Get follower/following counts from visible stat text.
+  // Current X profile DOM may expose followers via /verified_followers while
+  // still rendering the total "N Followers" label.
+  function parseHumanCount(text) {
+    const m = (text || '').match(/([\\d,.]+[KkMm]?)/);
+    if (!m) return null;
+    let val = m[1].replace(/,/g, '');
+    if (val.endsWith('K') || val.endsWith('k')) return Math.round(parseFloat(val) * 1000);
+    if (val.endsWith('M') || val.endsWith('m')) return Math.round(parseFloat(val) * 1000000);
+    const parsed = parseInt(val, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  const statLinks = document.querySelectorAll('a[href]');
   for (const link of statLinks) {
+    const href = link.getAttribute('href') || '';
     const text = link.textContent || '';
-    const numMatch = text.match(/([\\d,.]+[KkMm]?)/);
-    if (!numMatch) continue;
-    let val = numMatch[1].replace(/,/g, '');
-    if (val.endsWith('K') || val.endsWith('k')) val = parseFloat(val) * 1000;
-    else if (val.endsWith('M') || val.endsWith('m')) val = parseFloat(val) * 1000000;
-    else val = parseInt(val);
-
-    if (text.includes('Follower')) result.followersCount = val;
-    else if (text.includes('Following')) result.followingCount = val;
+    const val = parseHumanCount(text);
+    if (val === null) continue;
+    if (/Following/i.test(text) || /\\/following(?:[/?#]|$)/.test(href)) {
+      result.followingCount = val;
+      continue;
+    }
+    if (/Followers?/i.test(text) || /\\/followers(?:[/?#]|$)/.test(href) || /\\/verified_followers(?:[/?#]|$)/.test(href)) {
+      // Keep the max in case multiple follower variants are present.
+      result.followersCount = Math.max(result.followersCount || 0, val);
+      continue;
+    }
   }
 
   // Get tweets count from profile
@@ -1657,7 +1671,24 @@ def fetch_user_profile(username: str) -> dict | None:
             print(f"  CDP: navigating to profile @{username}...", flush=True)
             if not cdp.navigate(profile_url, wait_sec=5):
                 return None
+            cdp.wait_for('[data-testid="UserName"]', timeout=12, poll=0.5)
             raw = cdp.evaluate(js, timeout=15)
+
+            # Retry once if profile shell loaded slowly and extraction is empty.
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                if (
+                    parsed.get("displayName") is None
+                    and parsed.get("bio") is None
+                    and parsed.get("followersCount") is None
+                    and parsed.get("followingCount") is None
+                ):
+                    if cdp.navigate(profile_url, wait_sec=4):
+                        cdp.wait_for('[data-testid="UserName"]', timeout=12, poll=0.5)
+                        raw = cdp.evaluate(js, timeout=15)
     except Exception as e:
         logger.warning(f"fetch_user_profile CDP failed: {e}")
         return None
@@ -1719,30 +1750,32 @@ def get_follower_count(username: str, *, force_refresh: bool = False) -> int | N
 
     # Cache miss — navigate to profile page
     js = r"""(() => {
-  // Use total followers (not verified_followers subset).
-  const links = document.querySelectorAll('a[href$="/followers"], a[href*="/followers"]');
+  function parseCount(text) {
+    const m = (text || '').match(/([\d,.]+[KkMm]?)/);
+    if (!m) return null;
+    let val = m[1].replace(/,/g, '');
+    if (val.endsWith('K') || val.endsWith('k')) return Math.round(parseFloat(val) * 1000);
+    if (val.endsWith('M') || val.endsWith('m')) return Math.round(parseFloat(val) * 1000000);
+    const parsed = parseInt(val, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  // Use rendered stat text first; hrefs vary (/followers vs /verified_followers).
+  let best = null;
+  const links = document.querySelectorAll('a[href]');
   for (const link of links) {
     const text = link.textContent || '';
-    // Matches patterns like "1,234 Followers" or "5.2K Followers" or "12M Followers"
-    const m = text.match(/([\d,.]+[KkMm]?)\s*Follower/);
-    if (m) {
-      let val = m[1].replace(/,/g, '');
-      if (val.endsWith('K') || val.endsWith('k')) return parseFloat(val) * 1000;
-      if (val.endsWith('M') || val.endsWith('m')) return parseFloat(val) * 1000000;
-      return parseInt(val);
-    }
+    if (!/Followers?/i.test(text)) continue;
+    const val = parseCount(text);
+    if (val === null) continue;
+    if (best === null || val > best) best = val;
   }
-  // Fallback: scan likely stat row text.
-  const statRow = document.querySelector('[data-testid="primaryColumn"]');
-  if (statRow) {
-    const m = (statRow.textContent || '').match(/([\d,.]+[KkMm]?)\s*Followers/i);
-    if (m) {
-      let val = m[1].replace(/,/g, '');
-      if (val.endsWith('K') || val.endsWith('k')) return parseFloat(val) * 1000;
-      if (val.endsWith('M') || val.endsWith('m')) return parseFloat(val) * 1000000;
-      return parseInt(val);
-    }
-  }
+  if (best !== null) return best;
+
+  // Fallback: scan full page text for "N Followers"
+  const pageText = (document.body && document.body.innerText) || '';
+  const m = pageText.match(/([\d,.]+[KkMm]?)\s*Followers/i);
+  if (m) return parseCount(m[1]);
   return null;
 })()"""
 
@@ -1756,7 +1789,15 @@ def get_follower_count(username: str, *, force_refresh: bool = False) -> int | N
             )
             if not cdp.navigate(profile_url, wait_sec=3):
                 return None
+            cdp.wait_for('[data-testid="UserName"]', timeout=10, poll=0.5)
             raw = cdp.evaluate(js, timeout=10)
+
+            # One retry when profile shell loaded but stats weren't ready yet.
+            if raw in (None, "", "null"):
+                if not cdp.navigate(profile_url, wait_sec=4):
+                    return None
+                cdp.wait_for('[data-testid="UserName"]', timeout=10, poll=0.5)
+                raw = cdp.evaluate(js, timeout=10)
     except Exception as e:
         logger.warning(f"get_follower_count CDP failed: {e}")
         return None

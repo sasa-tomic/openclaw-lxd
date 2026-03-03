@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from lib.llm_utils import call_llm
 from twitter_utils import (
-    get_follower_count as get_user_follower_count,
     get_tweet_stats,
     load_project_context,
     utc_now,
@@ -45,6 +44,7 @@ from db import (
     update_search_term_perf,
     update_engagement_perf,
     update_post_stats,
+    get_account,
 )
 
 ENGAGEMENT_RUNS_PER_DAY = 48  # deployment: :07 and :38 every hour
@@ -52,9 +52,18 @@ ENGAGEMENT_ACTION_CAP_PER_RUN = 8
 ORIGINAL_POSTS_TARGET_PER_DAY = 5  # deployment: 07:30, 10:30, 13:30, 17:30, 21:30 UTC
 
 
-def get_follower_count() -> int | None:
-    """Get our own follower count via shared CDP function (fresh fetch)."""
-    return get_user_follower_count("DecentCloud_org", force_refresh=True)
+OUR_HANDLE = "DecentCloud_org"
+
+
+def get_follower_count(conn) -> int | None:
+    """Get our own follower count from DB (written by reply_monitor refresh)."""
+    acct = get_account(conn, OUR_HANDLE)
+    if acct and acct.get("follower_count") is not None:
+        try:
+            return int(acct["follower_count"])
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 def gather_metrics(conn) -> dict:
@@ -77,10 +86,7 @@ def gather_metrics(conn) -> dict:
         prev_followers = last_eval.get("follower_count")
         prev_eval_date = str(last_eval.get("eval_date", ""))
 
-    follower_count = get_follower_count()
-    if follower_count is None and prev_followers is not None:
-        # Keep reports stable if live follower scrape temporarily fails.
-        follower_count = int(prev_followers)
+    follower_count = get_follower_count(conn)
 
     follower_growth = None
     if follower_count is not None and prev_followers is not None:

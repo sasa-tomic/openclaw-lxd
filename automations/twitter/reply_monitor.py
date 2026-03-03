@@ -59,7 +59,6 @@ from twitter_utils import (
     cdp_tab,
     check_follows_back,
     fetch_tweet_context,
-    get_follower_count,
     get_user_profile,
     humanize,
     jitter_sleep,
@@ -80,16 +79,13 @@ MAX_MENTIONS_PER_RUN = 5
 SEEN_TTL_DAYS = 2
 
 KV_POST_FAILURE_STREAK = "reply_monitor:post_failure_streak"
-KV_OWN_FOLLOWER_REFRESH_AT = "reply_monitor:own_follower_refresh_at"
-KV_OWN_FOLLOWER_COUNT = "reply_monitor:own_follower_count"
-KV_OWN_PROFILE_REFRESH_AT = "reply_monitor:own_profile_refresh_at"
+KV_OWN_STATS_REFRESH_AT = "reply_monitor:own_stats_refresh_at"
 KV_MAINTENANCE_LAST_AT = "reply_monitor:maintenance_last_at"
 
 # Escalate repeated post failures into a flow failure so Prefect on_failure can
 # trigger repair_service.py. Single failures stay non-fatal.
 MAX_POST_FAILURE_STREAK_BEFORE_FAIL = 3
-OWN_FOLLOWER_REFRESH_INTERVAL_HOURS = 2
-OWN_PROFILE_REFRESH_INTERVAL_HOURS = 6
+OWN_STATS_REFRESH_INTERVAL_HOURS = 2
 FOLLOWBACK_CHECK_INTERVAL_HOURS = 72
 MAX_FOLLOWBACK_CHECKS_PER_RUN = 2
 MAINTENANCE_INTERVAL_HOURS = 24
@@ -152,59 +148,47 @@ def save_post_failure_streak(conn, streak: int) -> None:
     kv_set(conn, KV_POST_FAILURE_STREAK, str(max(0, int(streak))))
 
 
-def maybe_refresh_own_follower_count(conn) -> int | None:
-    """Refresh @DecentCloud_org follower count (rate-limited) and upsert DB."""
-    now = datetime.now(timezone.utc)
-    raw = kv_get(conn, KV_OWN_FOLLOWER_REFRESH_AT)
-    if raw:
-        try:
-            last = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if now - last < timedelta(hours=OWN_FOLLOWER_REFRESH_INTERVAL_HOURS):
-                cached = kv_get(conn, KV_OWN_FOLLOWER_COUNT)
-                return int(cached) if cached and str(cached).isdigit() else None
-        except Exception:
-            pass
-
-    count = get_follower_count(OUR_HANDLE, force_refresh=True)
-    if count is None:
+def _to_int_or_none(value) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
         return None
 
-    upsert_account(conn, username=OUR_HANDLE, follower_count=count)
-    kv_set(conn, KV_OWN_FOLLOWER_COUNT, str(count))
-    kv_set(conn, KV_OWN_FOLLOWER_REFRESH_AT, utc_now())
-    return count
 
-
-def maybe_refresh_own_profile_fields(conn) -> None:
-    """Refresh our profile metadata periodically and upsert accounts row."""
+def maybe_refresh_own_account_stats(conn) -> dict | None:
+    """Refresh all own-account stats from profile page and persist to DB."""
     now = datetime.now(timezone.utc)
-    raw = kv_get(conn, KV_OWN_PROFILE_REFRESH_AT)
+    raw = kv_get(conn, KV_OWN_STATS_REFRESH_AT)
     if raw:
         try:
             last = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if now - last < timedelta(hours=OWN_PROFILE_REFRESH_INTERVAL_HOURS):
-                return
+            if now - last < timedelta(hours=OWN_STATS_REFRESH_INTERVAL_HOURS):
+                return None
         except Exception:
             pass
 
     profile = get_user_profile(OUR_HANDLE, use_cache=False)
     if not profile:
-        return
+        return None
 
-    following_count = profile.get("followingCount")
-    try:
-        following_int = int(following_count) if following_count is not None else None
-    except (TypeError, ValueError):
-        following_int = None
+    follower_int = _to_int_or_none(profile.get("followersCount"))
+    following_int = _to_int_or_none(profile.get("followingCount"))
 
     upsert_account(
         conn,
         username=OUR_HANDLE,
+        follower_count=follower_int,
         display_name=profile.get("displayName"),
         bio=profile.get("bio"),
         following_count=following_int,
     )
-    kv_set(conn, KV_OWN_PROFILE_REFRESH_AT, utc_now())
+    kv_set(conn, KV_OWN_STATS_REFRESH_AT, utc_now())
+    return {
+        "followerCount": follower_int,
+        "followingCount": following_int,
+        "displayName": profile.get("displayName"),
+        "bio": profile.get("bio"),
+    }
 
 
 def refresh_followback_status(conn) -> int:
@@ -596,10 +580,14 @@ def main() -> int:
                     flush=True,
                 )
 
-            own_followers = maybe_refresh_own_follower_count(conn)
-            if own_followers is not None:
-                print(f"Own follower count refreshed: {own_followers}", flush=True)
-            maybe_refresh_own_profile_fields(conn)
+            own_stats = maybe_refresh_own_account_stats(conn)
+            if own_stats is not None:
+                print(
+                    "Own account stats refreshed: "
+                    f"followers={own_stats.get('followerCount')} "
+                    f"following={own_stats.get('followingCount')}",
+                    flush=True,
+                )
 
             followback_checks = refresh_followback_status(conn)
             if followback_checks:

@@ -109,38 +109,6 @@ def kv_set(conn, key: str, value: str) -> None:
         )
 
 
-def kv_get_json(conn, key: str, default):
-    """Read JSON from kv_state, returning `default` on missing/parse error."""
-    raw = kv_get(conn, key)
-    if not raw:
-        return default
-    try:
-        return json.loads(raw)
-    except Exception:
-        return default
-
-
-def kv_set_json(conn, key: str, value) -> None:
-    """Serialize value as JSON into kv_state."""
-    kv_set(conn, key, json.dumps(value, ensure_ascii=False, default=str))
-
-
-def kv_get_prefix(conn, prefix: str) -> dict[str, str]:
-    """Return kv_state rows whose key starts with prefix."""
-    like = f"{prefix}%"
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            """
-            SELECT key, value
-            FROM kv_state
-            WHERE key LIKE %s
-            """,
-            (like,),
-        )
-        rows = cur.fetchall()
-    return {str(row["key"]): str(row["value"]) for row in rows}
-
-
 # ---------------------------------------------------------------------------
 # Typed runtime state/cache (no JSON state blobs)
 # ---------------------------------------------------------------------------
@@ -835,6 +803,10 @@ def upsert_account(
     extra: dict | None = None,
 ) -> None:
     """Insert or update an account. Only updates non-None fields on conflict."""
+    username = (username or "").strip().lower()
+    if not username:
+        return
+
     # Build INSERT columns and values
     cols = ["username"]
     vals: list[Any] = [username]
@@ -908,7 +880,10 @@ def upsert_account(
 def get_account(conn, username: str) -> dict | None:
     """Fetch a single account by username. Returns None if not found."""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT * FROM accounts WHERE username = %s", (username,))
+        cur.execute(
+            "SELECT * FROM accounts WHERE LOWER(username) = LOWER(%s) LIMIT 1",
+            (username,),
+        )
         row = cur.fetchone()
         return dict(row) if row else None
 
@@ -917,7 +892,7 @@ def set_account_stage(conn, username: str, stage: str) -> None:
     """Update the stage of an account."""
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE accounts SET stage = %s WHERE username = %s",
+            "UPDATE accounts SET stage = %s WHERE LOWER(username) = LOWER(%s)",
             (stage, username),
         )
 
@@ -929,7 +904,7 @@ def set_followed(conn, username: str) -> None:
             """
             UPDATE accounts
             SET stage = 'followed', followed_at = now()
-            WHERE username = %s
+            WHERE LOWER(username) = LOWER(%s)
             """,
             (username,),
         )
@@ -942,7 +917,7 @@ def set_follows_us_back(conn, username: str, follows: bool) -> None:
             """
             UPDATE accounts
             SET follows_us_back = %s, follows_checked_at = now()
-            WHERE username = %s
+            WHERE LOWER(username) = LOWER(%s)
             """,
             (follows, username),
         )
@@ -993,7 +968,7 @@ def set_account_last_seen_tweet_at(conn, username: str, seen_at: datetime) -> No
                     EXCLUDED.last_seen_tweet_at
               )
             """,
-            (username, seen_at),
+            ((username or "").strip().lower(), seen_at),
         )
 
 
@@ -1004,7 +979,7 @@ def increment_engagement_count(conn, username: str) -> None:
             """
             UPDATE accounts
             SET engagement_count = engagement_count + 1, last_engaged_at = now()
-            WHERE username = %s
+            WHERE LOWER(username) = LOWER(%s)
             """,
             (username,),
         )
@@ -1014,7 +989,7 @@ def increment_reply_back_count(conn, username: str) -> None:
     """Increment reply_back_count for an account."""
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE accounts SET reply_back_count = reply_back_count + 1 WHERE username = %s",
+            "UPDATE accounts SET reply_back_count = reply_back_count + 1 WHERE LOWER(username) = LOWER(%s)",
             (username,),
         )
 
@@ -1055,7 +1030,7 @@ def is_followed(conn, username: str) -> bool:
         cur.execute(
             """
             SELECT 1 FROM accounts
-            WHERE username = %s
+            WHERE LOWER(username) = LOWER(%s)
               AND stage IN ('followed', 'engaged', 'warm', 'follower')
             LIMIT 1
             """,
@@ -2654,6 +2629,98 @@ def store_tweet_context(conn, tweet_id: str, context: dict) -> None:
         )
 
 
+def _dedupe_accounts_case(conn) -> int:
+    """Merge case-variant duplicate usernames into one lowercase row."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT LOWER(username) AS uname
+            FROM accounts
+            GROUP BY LOWER(username)
+            HAVING COUNT(*) > 1
+            """
+        )
+        dupes = [str(r[0]) for r in cur.fetchall()]
+
+    merged = 0
+    for uname in dupes:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM accounts
+                WHERE LOWER(username) = %s
+                ORDER BY discovered_at DESC NULLS LAST, username DESC
+                """,
+                (uname,),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        if len(rows) < 2:
+            continue
+
+        def pick_text(key: str) -> str | None:
+            for row in rows:
+                val = row.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val
+            return None
+
+        def pick_num_max(key: str):
+            vals = [row.get(key) for row in rows if row.get(key) is not None]
+            return max(vals) if vals else None
+
+        def pick_dt_max(key: str):
+            vals = [row.get(key) for row in rows if isinstance(row.get(key), datetime)]
+            return max(vals) if vals else None
+
+        merged_row = {
+            "username": uname,
+            "display_name": pick_text("display_name"),
+            "bio": pick_text("bio"),
+            "follower_count": pick_num_max("follower_count"),
+            "following_count": pick_num_max("following_count"),
+            "relevance_score": pick_num_max("relevance_score"),
+            "relevance_notes": pick_text("relevance_notes"),
+            "discovery_source": pick_text("discovery_source"),
+            "discovered_via": pick_text("discovered_via"),
+            "discovered_at": pick_dt_max("discovered_at"),
+            "stage": pick_text("stage") or "candidate",
+            "followed_at": pick_dt_max("followed_at"),
+            "follows_us_back": any(bool(r.get("follows_us_back")) for r in rows),
+            "follows_checked_at": pick_dt_max("follows_checked_at"),
+            "engagement_count": int(pick_num_max("engagement_count") or 0),
+            "reply_back_count": int(pick_num_max("reply_back_count") or 0),
+            "last_engaged_at": pick_dt_max("last_engaged_at"),
+            "last_seen_tweet_at": pick_dt_max("last_seen_tweet_at"),
+            "skip_reason": pick_text("skip_reason"),
+            "extra": next((r.get("extra") for r in rows if r.get("extra") is not None), None),
+        }
+
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM accounts WHERE LOWER(username) = %s", (uname,))
+            cur.execute(
+                """
+                INSERT INTO accounts (
+                    username, display_name, bio, follower_count, following_count,
+                    relevance_score, relevance_notes, discovery_source, discovered_via,
+                    discovered_at, stage, followed_at, follows_us_back, follows_checked_at,
+                    engagement_count, reply_back_count, last_engaged_at, last_seen_tweet_at,
+                    skip_reason, extra
+                ) VALUES (
+                    %(username)s, %(display_name)s, %(bio)s, %(follower_count)s, %(following_count)s,
+                    %(relevance_score)s, %(relevance_notes)s, %(discovery_source)s, %(discovered_via)s,
+                    %(discovered_at)s, %(stage)s, %(followed_at)s, %(follows_us_back)s, %(follows_checked_at)s,
+                    %(engagement_count)s, %(reply_back_count)s, %(last_engaged_at)s, %(last_seen_tweet_at)s,
+                    %(skip_reason)s, %(extra)s
+                )
+                """,
+                merged_row,
+            )
+        merged += 1
+
+    return merged
+
+
 def ensure_schema(conn) -> None:
     """Run CREATE TABLE IF NOT EXISTS DDL and seed initial accounts.
 
@@ -2662,12 +2729,21 @@ def ensure_schema(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(_SCHEMA_SQL)
 
+    # Normalize historical case-variant duplicates once schema exists.
+    merged = _dedupe_accounts_case(conn)
+    if merged:
+        print(f"Schema maintenance: merged {merged} case-duplicate account row(s)", flush=True)
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_username_lower_unique ON accounts ((LOWER(username)))"
+        )
+
     # Seed accounts: insert candidates that don't exist yet
     for acct in SEED_ACCOUNTS:
         # Only insert if not already present — never overwrite existing data
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM accounts WHERE username = %s LIMIT 1",
+                "SELECT 1 FROM accounts WHERE LOWER(username) = LOWER(%s) LIMIT 1",
                 (acct["username"],),
             )
             exists = cur.fetchone() is not None
