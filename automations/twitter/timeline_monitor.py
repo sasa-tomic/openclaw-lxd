@@ -29,6 +29,7 @@ from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from db import (
     get_conn,
     get_engaged_tweet_ids,
+    get_all_followed_usernames,
     get_our_thread_context,
     get_recent_engagements,
     get_recent_posts,
@@ -37,6 +38,7 @@ from db import (
     is_engaged,
     kv_get,
     kv_set,
+    set_account_last_seen_tweet_at,
     upsert_account,
 )
 from twitter_utils import (
@@ -88,6 +90,19 @@ def is_recent(tweet: dict, max_age_min: int = MAX_TWEET_AGE_MIN) -> bool:
         return age_min <= max_age_min
     except Exception:
         return True  # parse failure, don't filter
+
+
+def parse_tweet_timestamp(ts: str | None) -> datetime | None:
+    """Parse an ISO tweet timestamp, returning timezone-aware datetime."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -431,9 +446,8 @@ def main() -> int:
             last_seen_id = kv_get(conn, "timeline:last_seen_id")
             engaged_ids = get_engaged_tweet_ids(conn)
 
-            # Tracked accounts: all accounts with stage in followed/engaged/warm/follower
-            from db import get_all_followed_usernames
             tracked_usernames = get_all_followed_usernames(conn)
+            tracked_usernames_lc = {u.lower() for u in tracked_usernames}
 
             # Voice consistency context
             recent_engagements = get_recent_engagements(conn, hours=168, limit=8)
@@ -486,15 +500,24 @@ def main() -> int:
                 tid = str(tweet["tweetId"])
                 author = tweet.get("author", "unknown")
                 text = tweet.get("text", "")
+                author_lc = author.lower()
 
                 # Skip our own tweets
-                if author.lower() == OUR_HANDLE_LOWER:
+                if author_lc == OUR_HANDLE_LOWER:
                     continue
 
                 # Skip blocked authors
-                if author.lower() in {a.lower() for a in BLOCKED_AUTHORS}:
+                if author_lc in {a.lower() for a in BLOCKED_AUTHORS}:
                     print(f"  Skipping blocked author @{author}", flush=True)
                     continue
+
+                # Following feed can include recommendations/ads; process only tracked accounts
+                if author_lc not in tracked_usernames_lc:
+                    continue
+
+                seen_at = parse_tweet_timestamp(tweet.get("timestamp"))
+                if seen_at:
+                    set_account_last_seen_tweet_at(conn, author, seen_at)
 
                 # Skip already-engaged tweets
                 if tid in engaged_ids:

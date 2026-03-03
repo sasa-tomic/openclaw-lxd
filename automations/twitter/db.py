@@ -230,6 +230,19 @@ def upsert_profile_cache(conn, username: str, profile: dict) -> None:
         )
 
 
+def prune_profile_cache(conn, *, older_than_days: int = 180) -> int:
+    """Delete profile cache rows older than the configured retention window."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM profile_cache
+            WHERE cached_at < (now() - (%s::int * INTERVAL '1 day'))
+            """,
+            (max(1, int(older_than_days)),),
+        )
+        return int(cur.rowcount or 0)
+
+
 def get_cached_search_results(conn, term: str, ttl_hours: int) -> list[dict] | None:
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
@@ -522,6 +535,65 @@ def get_recent_post_log(conn, limit: int = 200) -> list[dict]:
             }
         )
     return out
+
+
+def prune_recent_post_log(conn, *, older_than_days: int = 90) -> int:
+    """Delete recent_post_log rows older than the configured retention window."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM recent_post_log
+            WHERE created_at < (now() - (%s::int * INTERVAL '1 day'))
+            """,
+            (max(1, int(older_than_days)),),
+        )
+        return int(cur.rowcount or 0)
+
+
+def get_reply_monitor_seen(conn) -> dict[str, str]:
+    """Return reply monitor seen tweet IDs as {tweet_id: iso_timestamp}."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT tweet_id, seen_at
+            FROM reply_monitor_seen
+            ORDER BY seen_at DESC
+            """
+        )
+        rows = cur.fetchall()
+    out: dict[str, str] = {}
+    for row in rows:
+        seen_at = row.get("seen_at")
+        if isinstance(seen_at, datetime):
+            out[str(row["tweet_id"])] = seen_at.isoformat()
+    return out
+
+
+def add_reply_monitor_seen(conn, tweet_id: str, *, seen_at: datetime | None = None) -> None:
+    """Mark a mention tweet as seen (idempotent)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO reply_monitor_seen (tweet_id, seen_at)
+            VALUES (%s, %s)
+            ON CONFLICT (tweet_id) DO UPDATE SET
+                seen_at = EXCLUDED.seen_at
+            """,
+            (str(tweet_id), seen_at or datetime.now(timezone.utc)),
+        )
+
+
+def prune_reply_monitor_seen(conn, *, older_than_days: int = 2) -> int:
+    """Delete seen mention rows older than retention window."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM reply_monitor_seen
+            WHERE seen_at < (now() - (%s::int * INTERVAL '1 day'))
+            """,
+            (max(1, int(older_than_days)),),
+        )
+        return int(cur.rowcount or 0)
 
 
 def get_target_monitor_account_state(conn, username: str) -> dict:
@@ -873,6 +945,55 @@ def set_follows_us_back(conn, username: str, follows: bool) -> None:
             WHERE username = %s
             """,
             (follows, username),
+        )
+
+
+def get_accounts_needing_followback_check(
+    conn,
+    *,
+    min_hours_between_checks: int = 72,
+    limit: int = 3,
+    exclude_username: str | None = None,
+) -> list[str]:
+    """Return followed/engaged accounts whose follow-back status is stale."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT username
+            FROM accounts
+            WHERE stage IN ('followed', 'engaged', 'warm', 'follower')
+              AND (%s IS NULL OR LOWER(username) <> LOWER(%s))
+              AND (
+                follows_checked_at IS NULL
+                OR follows_checked_at < (now() - (%s::int * INTERVAL '1 hour'))
+              )
+            ORDER BY follows_checked_at ASC NULLS FIRST, followed_at ASC NULLS FIRST
+            LIMIT %s
+            """,
+            (
+                exclude_username,
+                exclude_username,
+                max(1, int(min_hours_between_checks)),
+                max(1, int(limit)),
+            ),
+        )
+        return [str(row[0]) for row in cur.fetchall()]
+
+
+def set_account_last_seen_tweet_at(conn, username: str, seen_at: datetime) -> None:
+    """Upsert last_seen_tweet_at, keeping the most recent timestamp."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO accounts (username, last_seen_tweet_at)
+            VALUES (%s, %s)
+            ON CONFLICT (username) DO UPDATE
+              SET last_seen_tweet_at = GREATEST(
+                    COALESCE(accounts.last_seen_tweet_at, '-infinity'::timestamptz),
+                    EXCLUDED.last_seen_tweet_at
+              )
+            """,
+            (username, seen_at),
         )
 
 
@@ -2154,6 +2275,11 @@ CREATE TABLE IF NOT EXISTS recent_post_log (
     tweet_id      TEXT
 );
 
+CREATE TABLE IF NOT EXISTS reply_monitor_seen (
+    tweet_id TEXT PRIMARY KEY,
+    seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS target_monitor_accounts (
     username        TEXT PRIMARY KEY,
     last_checked_at TIMESTAMPTZ,
@@ -2212,6 +2338,7 @@ CREATE INDEX IF NOT EXISTS idx_posts_time      ON posts(posted_at DESC);
 CREATE INDEX IF NOT EXISTS idx_search_cache_results_term_ord ON search_cache_results(term, ord);
 CREATE INDEX IF NOT EXISTS idx_content_queue_posted ON content_queue(posted, drafted_at);
 CREATE INDEX IF NOT EXISTS idx_recent_post_log_time ON recent_post_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reply_monitor_seen_time ON reply_monitor_seen(seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_target_monitor_replied_time ON target_monitor_replied(replied_at DESC);
 CREATE INDEX IF NOT EXISTS idx_repair_history_time ON twitter_repair_history(happened_at DESC);
 

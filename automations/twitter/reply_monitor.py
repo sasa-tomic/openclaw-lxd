@@ -33,24 +33,34 @@ sys.path.insert(0, "/projects/automations")
 from lib.config import TWITTER_BASE_URL
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from db import (
+    add_reply_monitor_seen,
+    ensure_schema,
+    get_accounts_needing_followback_check,
     get_conn,
     get_engaged_tweet_ids,
     get_engagements_with_user,
     get_our_thread_context,
+    get_reply_monitor_seen,
+    prune_profile_cache,
+    prune_reply_monitor_seen,
+    prune_recent_post_log,
     get_recent_engagements,
     get_recent_posts,
     insert_engagement,
     is_engaged,
     kv_get,
     kv_set,
+    set_follows_us_back,
     upsert_account,
 )
 from twitter_utils import (
     BLOCKED_AUTHORS,
     auto_follow_after_engagement,
     cdp_tab,
+    check_follows_back,
     fetch_tweet_context,
     get_follower_count,
+    get_user_profile,
     humanize,
     jitter_sleep,
     like_tweet,
@@ -69,63 +79,61 @@ MAX_MENTIONS_PER_RUN = 5
 # Prune seenMentionIds older than this
 SEEN_TTL_DAYS = 2
 
-# KV state key for seen mention IDs (stored as JSON string)
-KV_SEEN_MENTIONS = "reply_monitor:seen_mentions"
 KV_POST_FAILURE_STREAK = "reply_monitor:post_failure_streak"
 KV_OWN_FOLLOWER_REFRESH_AT = "reply_monitor:own_follower_refresh_at"
 KV_OWN_FOLLOWER_COUNT = "reply_monitor:own_follower_count"
+KV_OWN_PROFILE_REFRESH_AT = "reply_monitor:own_profile_refresh_at"
+KV_MAINTENANCE_LAST_AT = "reply_monitor:maintenance_last_at"
 
 # Escalate repeated post failures into a flow failure so Prefect on_failure can
 # trigger repair_service.py. Single failures stay non-fatal.
 MAX_POST_FAILURE_STREAK_BEFORE_FAIL = 3
 OWN_FOLLOWER_REFRESH_INTERVAL_HOURS = 2
+OWN_PROFILE_REFRESH_INTERVAL_HOURS = 6
+FOLLOWBACK_CHECK_INTERVAL_HOURS = 72
+MAX_FOLLOWBACK_CHECKS_PER_RUN = 2
+MAINTENANCE_INTERVAL_HOURS = 24
+RECENT_POST_LOG_RETENTION_DAYS = 90
+PROFILE_CACHE_RETENTION_DAYS = 180
 
 
 # ---------------------------------------------------------------------------
-# Seen-mention helpers (backed by kv_state)
+# Seen-mention helpers (backed by typed table)
 # ---------------------------------------------------------------------------
 
 
 def load_seen_mentions(conn) -> dict[str, str]:
-    """Load seen mention IDs from kv_state. Returns {tweet_id: timestamp}."""
-    raw = kv_get(conn, KV_SEEN_MENTIONS)
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {}
-
-
-def save_seen_mentions(conn, seen: dict[str, str]) -> None:
-    """Save seen mention IDs to kv_state."""
-    kv_set(conn, KV_SEEN_MENTIONS, json.dumps(seen))
+    """Load seen mention IDs. Returns {tweet_id: timestamp}."""
+    return get_reply_monitor_seen(conn)
 
 
 def mark_mention_seen(conn, seen: dict[str, str], tweet_id: str) -> None:
     """Record a mention as seen (timestamped). Call BEFORE fetching context."""
-    seen[str(tweet_id)] = utc_now()
-    save_seen_mentions(conn, seen)
+    ts = utc_now()
+    seen[str(tweet_id)] = ts
+    try:
+        seen_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        seen_dt = datetime.now(timezone.utc)
+    add_reply_monitor_seen(conn, str(tweet_id), seen_at=seen_dt)
 
 
 def prune_seen_mentions(conn, seen: dict[str, str]) -> int:
     """Remove seenMentionIds older than SEEN_TTL_DAYS. Returns count pruned."""
-    if not seen:
-        return 0
-    cutoff = datetime.now(timezone.utc) - timedelta(days=SEEN_TTL_DAYS)
-    expired = []
-    for tid, ts_str in seen.items():
-        try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            if ts < cutoff:
-                expired.append(tid)
-        except (ValueError, TypeError):
-            expired.append(tid)
-    for tid in expired:
-        del seen[tid]
-    if expired:
-        save_seen_mentions(conn, seen)
-    return len(expired)
+    pruned = prune_reply_monitor_seen(conn, older_than_days=SEEN_TTL_DAYS)
+    if pruned:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=SEEN_TTL_DAYS)
+        stale = []
+        for tid, ts_str in seen.items():
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if ts < cutoff:
+                    stale.append(tid)
+            except (ValueError, TypeError):
+                stale.append(tid)
+        for tid in stale:
+            seen.pop(tid, None)
+    return pruned
 
 
 def load_post_failure_streak(conn) -> int:
@@ -165,6 +173,74 @@ def maybe_refresh_own_follower_count(conn) -> int | None:
     kv_set(conn, KV_OWN_FOLLOWER_COUNT, str(count))
     kv_set(conn, KV_OWN_FOLLOWER_REFRESH_AT, utc_now())
     return count
+
+
+def maybe_refresh_own_profile_fields(conn) -> None:
+    """Refresh our profile metadata periodically and upsert accounts row."""
+    now = datetime.now(timezone.utc)
+    raw = kv_get(conn, KV_OWN_PROFILE_REFRESH_AT)
+    if raw:
+        try:
+            last = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if now - last < timedelta(hours=OWN_PROFILE_REFRESH_INTERVAL_HOURS):
+                return
+        except Exception:
+            pass
+
+    profile = get_user_profile(OUR_HANDLE, use_cache=False)
+    if not profile:
+        return
+
+    following_count = profile.get("followingCount")
+    try:
+        following_int = int(following_count) if following_count is not None else None
+    except (TypeError, ValueError):
+        following_int = None
+
+    upsert_account(
+        conn,
+        username=OUR_HANDLE,
+        display_name=profile.get("displayName"),
+        bio=profile.get("bio"),
+        following_count=following_int,
+    )
+    kv_set(conn, KV_OWN_PROFILE_REFRESH_AT, utc_now())
+
+
+def refresh_followback_status(conn) -> int:
+    """Check a small batch of followed accounts for follow-back status."""
+    usernames = get_accounts_needing_followback_check(
+        conn,
+        min_hours_between_checks=FOLLOWBACK_CHECK_INTERVAL_HOURS,
+        limit=MAX_FOLLOWBACK_CHECKS_PER_RUN,
+        exclude_username=OUR_HANDLE,
+    )
+    checked = 0
+    for username in usernames:
+        follows = check_follows_back(username)
+        if follows is None:
+            continue
+        set_follows_us_back(conn, username, follows)
+        checked += 1
+    return checked
+
+
+def maybe_run_housekeeping(conn) -> tuple[int, int]:
+    """Run low-frequency DB cleanup tasks."""
+    now = datetime.now(timezone.utc)
+    raw = kv_get(conn, KV_MAINTENANCE_LAST_AT)
+    if raw:
+        try:
+            last = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if now - last < timedelta(hours=MAINTENANCE_INTERVAL_HOURS):
+                return (0, 0)
+        except Exception:
+            pass
+
+    pruned_recent = prune_recent_post_log(conn, older_than_days=RECENT_POST_LOG_RETENTION_DAYS)
+    pruned_profiles = prune_profile_cache(conn, older_than_days=PROFILE_CACHE_RETENTION_DAYS)
+    kv_set(conn, KV_MAINTENANCE_LAST_AT, utc_now())
+    return (pruned_recent, pruned_profiles)
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +586,7 @@ def main() -> int:
 
     try:
         with get_conn() as conn:
+            ensure_schema(conn)
             # Load state from DB
             seen_mentions = load_seen_mentions(conn)
             post_failure_streak = load_post_failure_streak(conn)
@@ -522,6 +599,19 @@ def main() -> int:
             own_followers = maybe_refresh_own_follower_count(conn)
             if own_followers is not None:
                 print(f"Own follower count refreshed: {own_followers}", flush=True)
+            maybe_refresh_own_profile_fields(conn)
+
+            followback_checks = refresh_followback_status(conn)
+            if followback_checks:
+                print(f"Updated follow-back status for {followback_checks} account(s)", flush=True)
+
+            pruned_recent, pruned_profiles = maybe_run_housekeeping(conn)
+            if pruned_recent or pruned_profiles:
+                print(
+                    "Housekeeping: pruned "
+                    f"{pruned_recent} recent_post_log row(s), {pruned_profiles} profile_cache row(s)",
+                    flush=True,
+                )
 
             # Prune stale seen IDs
             pruned = prune_seen_mentions(conn, seen_mentions)

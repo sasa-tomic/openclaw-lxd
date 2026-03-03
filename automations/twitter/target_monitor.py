@@ -42,6 +42,7 @@ from db import (
     get_recent_posts,
     insert_engagement,
     is_engaged,
+    set_account_last_seen_tweet_at,
     set_target_monitor_last_run,
     set_target_monitor_account_state,
     trim_target_monitor_replied,
@@ -589,6 +590,7 @@ def process_account(
     ts_str = latest.get("timestamp")
     tweet_ts = parse_tweet_timestamp(ts_str)
     if tweet_ts:
+        set_account_last_seen_tweet_at(conn, username, tweet_ts)
         age_min = (now - tweet_ts).total_seconds() / 60
         if age_min > MAX_TWEET_AGE_MIN:
             print(
