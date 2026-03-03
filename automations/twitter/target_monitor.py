@@ -32,14 +32,19 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, "/projects/automations")
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from db import (
+    add_target_monitor_replied_id,
+    ensure_schema,
     get_conn,
+    get_target_monitor_account_state,
+    get_target_monitor_replied_ids,
     get_our_thread_context,
     get_recent_engagements,
     get_recent_posts,
     insert_engagement,
     is_engaged,
-    kv_get,
-    kv_set,
+    set_target_monitor_last_run,
+    set_target_monitor_account_state,
+    trim_target_monitor_replied,
     upsert_account,
 )
 from twitter_utils import (
@@ -75,11 +80,6 @@ CONV_LIKELIHOOD_THRESHOLD = 7
 # Max replies per run across all target accounts
 MAX_REPLIES_PER_RUN = 3
 
-# KV key prefix for per-account state
-KV_PREFIX = "target_monitor:account:"
-
-# KV key for global replied IDs (stored as JSON list, capped)
-KV_REPLIED_IDS = "target_monitor:replied_ids"
 MAX_REPLIED_IDS = 500
 
 TARGET_ACCOUNTS = [
@@ -112,66 +112,6 @@ TARGET_ACCOUNTS = [
     "cloudeconomist",   # AWS pricing
     "cloudoptimizer",   # Cloud cost
 ]
-
-KV_MONITOR_STATE = "target_monitor:state"
-
-# ---------------------------------------------------------------------------
-# Monitor state helpers (DB-backed)
-# ---------------------------------------------------------------------------
-
-
-def load_monitor_state(conn=None) -> dict:
-    """Load monitor state from kv_state, or return empty defaults."""
-    default = {"accounts": {}, "repliedToIds": [], "lastRunAt": None}
-    if conn is None:
-        try:
-            with get_conn() as db_conn:
-                return load_monitor_state(conn=db_conn)
-        except Exception:
-            return default
-    try:
-        raw = kv_get(conn, KV_MONITOR_STATE)
-        if not raw:
-            return default
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else default
-    except Exception:
-        return default
-
-
-def save_monitor_state(state: dict, conn=None) -> None:
-    """Save monitor state dict to kv_state."""
-    if conn is None:
-        try:
-            with get_conn() as db_conn:
-                save_monitor_state(state, conn=db_conn)
-        except Exception:
-            return
-        return
-    try:
-        kv_set(conn, KV_MONITOR_STATE, json.dumps(state, ensure_ascii=False))
-    except Exception:
-        return
-
-
-def get_account_state(state: dict, username: str) -> dict:
-    """Return (and initialize if missing) per-account state in the state dict."""
-    accounts = state.setdefault("accounts", {})
-    if username not in accounts:
-        accounts[username] = {"lastCheckedAt": None, "lastTweetId": None, "lastTweetAt": None}
-    return accounts[username]
-
-
-def add_replied_id(state: dict, tweet_id) -> None:
-    """Add tweet_id to state['repliedToIds'] list, deduped, capped at MAX_REPLIED_IDS."""
-    tid = str(tweet_id)
-    ids = state.setdefault("repliedToIds", [])
-    if tid not in ids:
-        ids.append(tid)
-    if len(ids) > MAX_REPLIED_IDS:
-        state["repliedToIds"] = ids[-MAX_REPLIED_IDS:]
-
-
 # ---------------------------------------------------------------------------
 # Peak hours check
 # ---------------------------------------------------------------------------
@@ -198,45 +138,30 @@ def is_peak_hours(now: datetime | None = None) -> bool:
 
 
 def get_account_kv(conn, username: str) -> dict:
-    """Get per-account state dict from kv_state."""
-    key = f"{KV_PREFIX}{username.lower()}"
-    raw = kv_get(conn, key)
-    if not raw:
-        return {"lastCheckedAt": None, "lastTweetId": None, "lastTweetAt": None}
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {"lastCheckedAt": None, "lastTweetId": None, "lastTweetAt": None}
+    """Get per-account state dict from typed table."""
+    return get_target_monitor_account_state(conn, username)
 
 
 def set_account_kv(conn, username: str, data: dict) -> None:
-    """Save per-account state dict to kv_state."""
-    key = f"{KV_PREFIX}{username.lower()}"
-    kv_set(conn, key, json.dumps(data))
+    """Save per-account state dict to typed table."""
+    set_target_monitor_account_state(conn, username, data)
 
 
 def load_replied_ids(conn) -> set[str]:
-    """Load the set of replied tweet IDs from kv_state."""
-    raw = kv_get(conn, KV_REPLIED_IDS)
-    if not raw:
-        return set()
-    try:
-        return set(json.loads(raw))
-    except Exception:
-        return set()
+    """Load the set of replied tweet IDs from typed table."""
+    return get_target_monitor_replied_ids(conn, limit=MAX_REPLIED_IDS)
 
 
 def save_replied_ids(conn, replied_ids: set[str]) -> None:
-    """Save replied tweet IDs to kv_state (capped at MAX_REPLIED_IDS)."""
-    lst = list(replied_ids)
-    if len(lst) > MAX_REPLIED_IDS:
-        lst = lst[-MAX_REPLIED_IDS:]
-    kv_set(conn, KV_REPLIED_IDS, json.dumps(lst))
+    """Persist replied tweet IDs to typed table (capped)."""
+    _ = replied_ids
+    trim_target_monitor_replied(conn, keep=MAX_REPLIED_IDS)
 
 
 def _persist_replied_id(conn, replied_ids: set[str], tweet_id: str) -> None:
     """Add a tweet ID to the in-memory replied set and persist to DB."""
     replied_ids.add(str(tweet_id))
+    add_target_monitor_replied_id(conn, str(tweet_id))
     save_replied_ids(conn, replied_ids)
 
 
@@ -792,6 +717,7 @@ def main() -> int:
 
     try:
         with get_conn() as conn:
+            ensure_schema(conn)
             replied_ids = load_replied_ids(conn)
 
             # Voice consistency context
@@ -842,7 +768,7 @@ def main() -> int:
                     jitter_sleep(min_sec=3, max_sec=10)
 
             # Final state save
-            kv_set(conn, "target_monitor:last_run", utc_now())
+            set_target_monitor_last_run(conn, now)
 
         noun = "reply" if replies_posted == 1 else "replies"
         print(f"\nDone. Posted {replies_posted} target {noun}.", flush=True)

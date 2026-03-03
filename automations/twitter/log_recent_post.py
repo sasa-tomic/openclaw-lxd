@@ -16,11 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from db import get_conn, kv_get_json, kv_set_json
-
-KV_RECENT_POSTS = "twitter:recent_posts"
-KV_LAST_POST = "twitter:last_post"
-MAX_RECENT_POSTS = 500
+from db import ensure_schema, get_conn, insert_recent_post_log
 
 
 def utc_now() -> str:
@@ -47,16 +43,15 @@ def main() -> int:
         entry["tweetId"] = args.tweet_id
 
     with get_conn() as conn:
-        recent = kv_get_json(conn, KV_RECENT_POSTS, [])
-        if not isinstance(recent, list):
-            recent = []
-        recent.append(entry)
-        if len(recent) > MAX_RECENT_POSTS:
-            recent = recent[-MAX_RECENT_POSTS:]
-        kv_set_json(conn, KV_RECENT_POSTS, recent)
-
-        if args.type in {"tweet", "reply", "value-drop", "teaser", "repo-update"}:
-            kv_set_json(conn, KV_LAST_POST, now)
+        ensure_schema(conn)
+        insert_recent_post_log(
+            conn,
+            activity_type=args.type,
+            text=args.text,
+            link=args.link,
+            tweet_id=args.tweet_id,
+            created_at=datetime.fromisoformat(now.replace("Z", "+00:00")),
+        )
     return 0
 
 

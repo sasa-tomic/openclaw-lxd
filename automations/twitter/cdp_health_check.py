@@ -22,9 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 logger = logging.getLogger(__name__)
 from lib.config import OPENCLAW_BIN, TELEGRAM_TARGET
 from lib.telegram_utils import send_telegram
-from twitter.db import get_conn, kv_get_json, kv_set_json
-
-KV_CDP_HEALTH_STATE = "twitter:cdp_health_state"
+from twitter.db import ensure_schema, get_cdp_health_state, get_conn, set_cdp_health_state
 STATE_DEFAULT = {"down": False, "since": None, "last_check": None}
 CDP_URL = "http://localhost:9222/json/version"
 CDP_TIMEOUT = 10
@@ -35,8 +33,8 @@ def load_health_state() -> dict:
     """Load health-check state from DB, falling back to defaults."""
     try:
         with get_conn() as conn:
-            state = kv_get_json(conn, KV_CDP_HEALTH_STATE, STATE_DEFAULT)
-        return state if isinstance(state, dict) else dict(STATE_DEFAULT)
+            ensure_schema(conn)
+            return get_cdp_health_state(conn)
     except Exception as e:
         logger.warning(f"Could not load health state from DB: {e}")
         return dict(STATE_DEFAULT)
@@ -46,7 +44,13 @@ def save_health_state(state: dict) -> None:
     """Save health-check state to DB (best effort)."""
     try:
         with get_conn() as conn:
-            kv_set_json(conn, KV_CDP_HEALTH_STATE, state)
+            ensure_schema(conn)
+            set_cdp_health_state(
+                conn,
+                down=bool(state.get("down", False)),
+                since=state.get("since"),
+                last_check=state.get("last_check"),
+            )
     except Exception as e:
         logger.warning(f"Could not save health state to DB: {e}")
 

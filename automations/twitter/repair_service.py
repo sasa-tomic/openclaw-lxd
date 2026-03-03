@@ -29,14 +29,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from lib.config import OPENCODE_BIN
 from lib.telegram_utils import send_telegram
-from twitter.db import get_conn, kv_get_json, kv_set_json
+from twitter.db import (
+    append_repair_history,
+    ensure_schema,
+    get_conn,
+    get_repair_last_map,
+    trim_repair_history,
+    upsert_repair_last,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 LOCK_FILE = "/tmp/twitter-repair.lock"
-KV_REPAIR_STATE = "twitter:repair_state"
 LOG_DIR = Path("/home/openclaw/clawd/logs")
 REPAIR_COOLDOWN_HOURS = 2
 MAX_HISTORY = 100
@@ -48,21 +54,30 @@ WORKTREES_DIR = AUTOMATIONS_DIR / ".claude" / "worktrees"
 _STATE_DEFAULT: dict = {"lastRepairs": {}, "repairHistory": []}
 
 def _load_repair_state() -> dict:
-    """Load repair state from DB. Falls back to defaults on errors."""
+    """Load repair state from typed DB tables."""
     try:
         with get_conn() as conn:
-            state = kv_get_json(conn, KV_REPAIR_STATE, _STATE_DEFAULT)
-        return state if isinstance(state, dict) else dict(_STATE_DEFAULT)
+            ensure_schema(conn)
+            return {"lastRepairs": get_repair_last_map(conn), "repairHistory": []}
     except Exception as e:
         print(f"[repair] Warning: failed to load DB repair state: {e}", flush=True)
         return dict(_STATE_DEFAULT)
 
 
 def _save_repair_state(state: dict) -> None:
-    """Persist repair state into DB. Best-effort."""
+    """Persist repair state into typed DB tables. Best-effort."""
     try:
         with get_conn() as conn:
-            kv_set_json(conn, KV_REPAIR_STATE, state)
+            ensure_schema(conn)
+            for flow_name, when_str in (state.get("lastRepairs") or {}).items():
+                try:
+                    when = datetime.fromisoformat(str(when_str).replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                upsert_repair_last(conn, flow_name, when)
+            for entry in state.get("repairHistory") or []:
+                append_repair_history(conn, entry)
+            trim_repair_history(conn, keep=MAX_HISTORY)
     except Exception as e:
         print(f"[repair] Warning: failed to save DB repair state: {e}", flush=True)
 
@@ -492,9 +507,8 @@ def _do_repair(
         "durationSeconds": duration,
     }
     state["repairHistory"].append(history_entry)
-    # Cap at MAX_HISTORY
-    if len(state["repairHistory"]) > MAX_HISTORY:
-        state["repairHistory"] = state["repairHistory"][-MAX_HISTORY:]
+    # Keep only latest entry in-memory; persistence layer keeps durable history.
+    state["repairHistory"] = state["repairHistory"][-1:]
 
     _save_repair_state(state)
 

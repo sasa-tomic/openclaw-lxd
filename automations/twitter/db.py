@@ -142,6 +142,606 @@ def kv_get_prefix(conn, prefix: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Typed runtime state/cache (no JSON state blobs)
+# ---------------------------------------------------------------------------
+
+
+def get_thread_index_map(conn) -> dict[str, str]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT tweet_id, note_path FROM thread_index")
+        rows = cur.fetchall()
+    return {str(r["tweet_id"]): str(r["note_path"]) for r in rows}
+
+
+def upsert_thread_index(conn, tweet_id: str, note_path: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO thread_index (tweet_id, note_path, updated_at)
+            VALUES (%s, %s, now())
+            ON CONFLICT (tweet_id) DO UPDATE SET
+                note_path = EXCLUDED.note_path,
+                updated_at = now()
+            """,
+            (tweet_id, note_path),
+        )
+
+
+def get_thread_note_path(conn, tweet_id: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT note_path FROM thread_index WHERE tweet_id = %s", (tweet_id,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def get_profile_cache(conn, username: str) -> dict | None:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT username, cached_at, display_name, bio, location, website,
+                   followers_count, following_count, tweets_count,
+                   is_verified, is_blue_verified, recent_tweets
+            FROM profile_cache
+            WHERE username = %s
+            """,
+            (username.lower(),),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return dict(row)
+
+
+def upsert_profile_cache(conn, username: str, profile: dict) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO profile_cache (
+                username, cached_at, display_name, bio, location, website,
+                followers_count, following_count, tweets_count,
+                is_verified, is_blue_verified, recent_tweets
+            ) VALUES (%s, now(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (username) DO UPDATE SET
+                cached_at = now(),
+                display_name = EXCLUDED.display_name,
+                bio = EXCLUDED.bio,
+                location = EXCLUDED.location,
+                website = EXCLUDED.website,
+                followers_count = EXCLUDED.followers_count,
+                following_count = EXCLUDED.following_count,
+                tweets_count = EXCLUDED.tweets_count,
+                is_verified = EXCLUDED.is_verified,
+                is_blue_verified = EXCLUDED.is_blue_verified,
+                recent_tweets = EXCLUDED.recent_tweets
+            """,
+            (
+                username.lower(),
+                profile.get("displayName"),
+                profile.get("bio"),
+                profile.get("location"),
+                profile.get("website"),
+                profile.get("followersCount"),
+                profile.get("followingCount"),
+                profile.get("tweetsCount"),
+                bool(profile.get("isVerified", False)),
+                bool(profile.get("isBlueVerified", False)),
+                list(profile.get("recentTweets") or []),
+            ),
+        )
+
+
+def get_cached_search_results(conn, term: str, ttl_hours: int) -> list[dict] | None:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT cached_at
+            FROM search_cache_terms
+            WHERE term = %s
+            """,
+            (term.lower().strip(),),
+        )
+        head = cur.fetchone()
+        if not head:
+            return None
+        cached_at = head.get("cached_at")
+        if not isinstance(cached_at, datetime):
+            return None
+        if datetime.now(timezone.utc) - cached_at > timedelta(hours=ttl_hours):
+            return None
+        cur.execute(
+            """
+            SELECT tweet_id, author, text, url, tweet_datetime, likes, retweets, replies, ord
+            FROM search_cache_results
+            WHERE term = %s
+            ORDER BY ord ASC
+            """,
+            (term.lower().strip(),),
+        )
+        rows = cur.fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        out.append(
+            {
+                "tweetId": d.get("tweet_id"),
+                "author": d.get("author") or "unknown",
+                "text": d.get("text") or "",
+                "searchTerm": term,
+                "url": d.get("url"),
+                "datetime": (
+                    d["tweet_datetime"].isoformat()
+                    if isinstance(d.get("tweet_datetime"), datetime)
+                    else d.get("tweet_datetime")
+                ),
+                "likes": int(d.get("likes") or 0),
+                "retweets": int(d.get("retweets") or 0),
+                "replies": int(d.get("replies") or 0),
+            }
+        )
+    return out
+
+
+def store_search_cache_results(conn, term: str, results: list[dict]) -> None:
+    norm_term = term.lower().strip()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO search_cache_terms (term, cached_at)
+            VALUES (%s, now())
+            ON CONFLICT (term) DO UPDATE SET cached_at = now()
+            """,
+            (norm_term,),
+        )
+        cur.execute("DELETE FROM search_cache_results WHERE term = %s", (norm_term,))
+        for i, r in enumerate(results):
+            raw_dt = r.get("datetime")
+            dt_val = None
+            if raw_dt:
+                try:
+                    dt_val = datetime.fromisoformat(str(raw_dt).replace("Z", "+00:00"))
+                except Exception:
+                    dt_val = None
+            cur.execute(
+                """
+                INSERT INTO search_cache_results (
+                    term, tweet_id, author, text, url, tweet_datetime,
+                    likes, retweets, replies, ord
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    norm_term,
+                    r.get("tweetId"),
+                    r.get("author"),
+                    (r.get("text") or "")[:500],
+                    r.get("url"),
+                    dt_val,
+                    int(r.get("likes") or 0),
+                    int(r.get("retweets") or 0),
+                    int(r.get("replies") or 0),
+                    i,
+                ),
+            )
+
+
+def get_content_queue(conn) -> list[dict]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, text, drafted_at, llm_score, posted, posted_at
+            FROM content_queue
+            ORDER BY drafted_at ASC, id ASC
+            """
+        )
+        rows = cur.fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        out.append(
+            {
+                "id": d.get("id"),
+                "text": d.get("text") or "",
+                "draftedAt": (
+                    d["drafted_at"].isoformat()
+                    if isinstance(d.get("drafted_at"), datetime)
+                    else None
+                ),
+                "llm_score": int(d.get("llm_score") or 0),
+                "posted": bool(d.get("posted")),
+                "postedAt": (
+                    d["posted_at"].isoformat()
+                    if isinstance(d.get("posted_at"), datetime)
+                    else None
+                ),
+            }
+        )
+    return out
+
+
+def insert_content_queue_entries(conn, entries: list[dict]) -> int:
+    inserted = 0
+    for e in entries:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO content_queue (text, drafted_at, llm_score, posted, posted_at)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    (e.get("text") or "")[:500],
+                    datetime.fromisoformat(str(e.get("draftedAt")).replace("Z", "+00:00"))
+                    if e.get("draftedAt")
+                    else datetime.now(timezone.utc),
+                    int(e.get("llm_score") or 0),
+                    bool(e.get("posted", False)),
+                    datetime.fromisoformat(str(e.get("postedAt")).replace("Z", "+00:00"))
+                    if e.get("postedAt")
+                    else None,
+                ),
+            )
+            inserted += 1
+    return inserted
+
+
+def mark_content_queue_posted(conn, row_id: int, posted_at: datetime | None = None) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE content_queue
+            SET posted = TRUE,
+                posted_at = %s
+            WHERE id = %s
+            """,
+            (posted_at or datetime.now(timezone.utc), row_id),
+        )
+
+
+def prune_content_queue(conn, posted_older_than_days: int = 7) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=posted_older_than_days)
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM content_queue WHERE posted = TRUE AND posted_at IS NOT NULL AND posted_at < %s",
+            (cutoff,),
+        )
+        return int(cur.rowcount or 0)
+
+
+def get_morning_state(conn) -> dict:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT last_research_run FROM twitter_morning_state WHERE id = 1")
+        row = cur.fetchone()
+    if not row:
+        return {"lastResearchRun": None}
+    dt = row.get("last_research_run")
+    return {
+        "lastResearchRun": dt.isoformat() if isinstance(dt, datetime) else None,
+    }
+
+
+def set_morning_state_last_run(conn, run_at: datetime) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO twitter_morning_state (id, last_research_run)
+            VALUES (1, %s)
+            ON CONFLICT (id) DO UPDATE SET last_research_run = EXCLUDED.last_research_run
+            """,
+            (run_at,),
+        )
+
+
+def store_morning_research(conn, *, run_at: datetime, hn_stories: list[dict], dev_activity: str | None) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM twitter_morning_hn WHERE run_at = %s", (run_at,))
+        for i, s in enumerate(hn_stories):
+            cur.execute(
+                """
+                INSERT INTO twitter_morning_hn (run_at, ord, title, url, points)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (run_at, i, s.get("title"), s.get("url"), int(s.get("points") or 0)),
+            )
+        cur.execute(
+            """
+            INSERT INTO twitter_morning_latest (id, run_at, dev_activity)
+            VALUES (1, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                run_at = EXCLUDED.run_at,
+                dev_activity = EXCLUDED.dev_activity
+            """,
+            (run_at, dev_activity),
+        )
+
+
+def get_latest_morning_research(conn) -> dict | None:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT run_at, dev_activity FROM twitter_morning_latest WHERE id = 1")
+        head = cur.fetchone()
+        if not head:
+            return None
+        run_at = head.get("run_at")
+        cur.execute(
+            """
+            SELECT title, url, points
+            FROM twitter_morning_hn
+            WHERE run_at = %s
+            ORDER BY ord ASC
+            """,
+            (run_at,),
+        )
+        stories = [dict(r) for r in cur.fetchall()]
+    return {
+        "timestamp": run_at.isoformat() if isinstance(run_at, datetime) else None,
+        "hnStories": stories,
+        "devActivity": head.get("dev_activity"),
+    }
+
+
+def insert_recent_post_log(
+    conn,
+    *,
+    activity_type: str,
+    text: str,
+    link: str | None = None,
+    tweet_id: str | None = None,
+    created_at: datetime | None = None,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO recent_post_log (created_at, activity_type, text, link, tweet_id)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (created_at or datetime.now(timezone.utc), activity_type, text[:500], link, tweet_id),
+        )
+
+
+def get_recent_post_log(conn, limit: int = 200) -> list[dict]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT created_at, activity_type, text, link, tweet_id
+            FROM recent_post_log
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        out.append(
+            {
+                "date": d["created_at"].date().isoformat()
+                if isinstance(d.get("created_at"), datetime)
+                else "",
+                "type": d.get("activity_type", ""),
+                "text": d.get("text", ""),
+                "link": d.get("link"),
+                "tweetId": d.get("tweet_id"),
+            }
+        )
+    return out
+
+
+def get_target_monitor_account_state(conn, username: str) -> dict:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT last_checked_at, last_tweet_id, last_tweet_at
+            FROM target_monitor_accounts
+            WHERE username = %s
+            """,
+            (username.lower(),),
+        )
+        row = cur.fetchone()
+    if not row:
+        return {"lastCheckedAt": None, "lastTweetId": None, "lastTweetAt": None}
+    return {
+        "lastCheckedAt": (
+            row["last_checked_at"].isoformat()
+            if isinstance(row.get("last_checked_at"), datetime)
+            else None
+        ),
+        "lastTweetId": row.get("last_tweet_id"),
+        "lastTweetAt": (
+            row["last_tweet_at"].isoformat()
+            if isinstance(row.get("last_tweet_at"), datetime)
+            else None
+        ),
+    }
+
+
+def set_target_monitor_account_state(conn, username: str, data: dict) -> None:
+    def _to_dt(v):
+        if not v:
+            return None
+        if isinstance(v, datetime):
+            return v
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO target_monitor_accounts (username, last_checked_at, last_tweet_id, last_tweet_at, updated_at)
+            VALUES (%s, %s, %s, %s, now())
+            ON CONFLICT (username) DO UPDATE SET
+                last_checked_at = EXCLUDED.last_checked_at,
+                last_tweet_id = EXCLUDED.last_tweet_id,
+                last_tweet_at = EXCLUDED.last_tweet_at,
+                updated_at = now()
+            """,
+            (
+                username.lower(),
+                _to_dt(data.get("lastCheckedAt")),
+                data.get("lastTweetId"),
+                _to_dt(data.get("lastTweetAt")),
+            ),
+        )
+
+
+def get_target_monitor_replied_ids(conn, limit: int = 500) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT tweet_id
+            FROM target_monitor_replied
+            ORDER BY replied_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    return {str(r[0]) for r in rows}
+
+
+def add_target_monitor_replied_id(conn, tweet_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO target_monitor_replied (tweet_id, replied_at)
+            VALUES (%s, now())
+            ON CONFLICT (tweet_id) DO NOTHING
+            """,
+            (tweet_id,),
+        )
+
+
+def trim_target_monitor_replied(conn, keep: int = 500) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM target_monitor_replied
+            WHERE tweet_id IN (
+                SELECT tweet_id
+                FROM target_monitor_replied
+                ORDER BY replied_at DESC
+                OFFSET %s
+            )
+            """,
+            (keep,),
+        )
+
+
+def set_target_monitor_last_run(conn, when: datetime) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO target_monitor_meta (id, last_run_at, updated_at)
+            VALUES (1, %s, now())
+            ON CONFLICT (id) DO UPDATE SET
+                last_run_at = EXCLUDED.last_run_at,
+                updated_at = now()
+            """,
+            (when,),
+        )
+
+
+def get_cdp_health_state(conn) -> dict:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT down, since, last_check FROM twitter_cdp_health_state WHERE id = 1")
+        row = cur.fetchone()
+    if not row:
+        return {"down": False, "since": None, "last_check": None}
+    return {
+        "down": bool(row.get("down")),
+        "since": row["since"].strftime("%Y-%m-%dT%H:%M:%S%z") if row.get("since") else None,
+        "last_check": row["last_check"].strftime("%Y-%m-%dT%H:%M:%S%z") if row.get("last_check") else None,
+    }
+
+
+def set_cdp_health_state(conn, *, down: bool, since: str | None, last_check: str | None) -> None:
+    def _parse(v: str | None):
+        if not v:
+            return None
+        try:
+            return datetime.strptime(v, "%Y-%m-%dT%H:%M:%S%z")
+        except Exception:
+            return None
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO twitter_cdp_health_state (id, down, since, last_check, updated_at)
+            VALUES (1, %s, %s, %s, now())
+            ON CONFLICT (id) DO UPDATE SET
+                down = EXCLUDED.down,
+                since = EXCLUDED.since,
+                last_check = EXCLUDED.last_check,
+                updated_at = now()
+            """,
+            (down, _parse(since), _parse(last_check)),
+        )
+
+
+def get_repair_last_map(conn) -> dict[str, str]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT flow_name, last_repair_at FROM twitter_repair_last")
+        rows = cur.fetchall()
+    out: dict[str, str] = {}
+    for r in rows:
+        dt = r.get("last_repair_at")
+        out[str(r.get("flow_name"))] = dt.isoformat() if isinstance(dt, datetime) else str(dt)
+    return out
+
+
+def upsert_repair_last(conn, flow_name: str, when: datetime) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO twitter_repair_last (flow_name, last_repair_at)
+            VALUES (%s, %s)
+            ON CONFLICT (flow_name) DO UPDATE SET last_repair_at = EXCLUDED.last_repair_at
+            """,
+            (flow_name, when),
+        )
+
+
+def append_repair_history(conn, entry: dict) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO twitter_repair_history (
+                happened_at, flow_name, flow_run_id, error_summary,
+                opencode_exit_code, test_result, merged, worktree_branch, duration_seconds
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                datetime.fromisoformat(str(entry.get("timestamp")).replace("Z", "+00:00"))
+                if entry.get("timestamp")
+                else datetime.now(timezone.utc),
+                entry.get("flowName"),
+                entry.get("flowRunId"),
+                entry.get("errorSummary"),
+                entry.get("opencodeExitCode"),
+                entry.get("testResult"),
+                bool(entry.get("merged")),
+                entry.get("worktreeBranch"),
+                int(entry.get("durationSeconds") or 0),
+            ),
+        )
+
+
+def trim_repair_history(conn, keep: int = 100) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM twitter_repair_history
+            WHERE id IN (
+                SELECT id
+                FROM twitter_repair_history
+                ORDER BY happened_at DESC
+                OFFSET %s
+            )
+            """,
+            (keep,),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Accounts
 # ---------------------------------------------------------------------------
 
@@ -1476,6 +2076,129 @@ CREATE TABLE IF NOT EXISTS kv_state (
     updated_at TIMESTAMPTZ DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS thread_index (
+    tweet_id   TEXT PRIMARY KEY,
+    note_path  TEXT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS profile_cache (
+    username         TEXT PRIMARY KEY,
+    cached_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    display_name     TEXT,
+    bio              TEXT,
+    location         TEXT,
+    website          TEXT,
+    followers_count  INTEGER,
+    following_count  INTEGER,
+    tweets_count     INTEGER,
+    is_verified      BOOLEAN DEFAULT FALSE,
+    is_blue_verified BOOLEAN DEFAULT FALSE,
+    recent_tweets    TEXT[] DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS search_cache_terms (
+    term      TEXT PRIMARY KEY,
+    cached_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS search_cache_results (
+    term           TEXT NOT NULL REFERENCES search_cache_terms(term) ON DELETE CASCADE,
+    tweet_id       TEXT NOT NULL,
+    author         TEXT,
+    text           TEXT,
+    url            TEXT,
+    tweet_datetime TIMESTAMPTZ,
+    likes          INTEGER DEFAULT 0,
+    retweets       INTEGER DEFAULT 0,
+    replies        INTEGER DEFAULT 0,
+    ord            INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (term, tweet_id)
+);
+
+CREATE TABLE IF NOT EXISTS content_queue (
+    id         BIGSERIAL PRIMARY KEY,
+    text       TEXT NOT NULL,
+    drafted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    llm_score  INTEGER DEFAULT 0,
+    posted     BOOLEAN NOT NULL DEFAULT FALSE,
+    posted_at  TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS twitter_morning_state (
+    id                SMALLINT PRIMARY KEY,
+    last_research_run TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS twitter_morning_latest (
+    id           SMALLINT PRIMARY KEY,
+    run_at       TIMESTAMPTZ NOT NULL,
+    dev_activity TEXT
+);
+
+CREATE TABLE IF NOT EXISTS twitter_morning_hn (
+    run_at TIMESTAMPTZ NOT NULL,
+    ord    INTEGER NOT NULL,
+    title  TEXT NOT NULL,
+    url    TEXT,
+    points INTEGER DEFAULT 0,
+    PRIMARY KEY (run_at, ord)
+);
+
+CREATE TABLE IF NOT EXISTS recent_post_log (
+    id            BIGSERIAL PRIMARY KEY,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    activity_type TEXT NOT NULL,
+    text          TEXT NOT NULL,
+    link          TEXT,
+    tweet_id      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS target_monitor_accounts (
+    username        TEXT PRIMARY KEY,
+    last_checked_at TIMESTAMPTZ,
+    last_tweet_id   TEXT,
+    last_tweet_at   TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS target_monitor_replied (
+    tweet_id   TEXT PRIMARY KEY,
+    replied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS target_monitor_meta (
+    id          SMALLINT PRIMARY KEY,
+    last_run_at TIMESTAMPTZ,
+    updated_at  TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS twitter_cdp_health_state (
+    id         SMALLINT PRIMARY KEY,
+    down       BOOLEAN NOT NULL DEFAULT FALSE,
+    since      TIMESTAMPTZ,
+    last_check TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS twitter_repair_last (
+    flow_name      TEXT PRIMARY KEY,
+    last_repair_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS twitter_repair_history (
+    id                 BIGSERIAL PRIMARY KEY,
+    happened_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    flow_name          TEXT NOT NULL,
+    flow_run_id        TEXT NOT NULL,
+    error_summary      TEXT,
+    opencode_exit_code INTEGER,
+    test_result        TEXT,
+    merged             BOOLEAN DEFAULT FALSE,
+    worktree_branch    TEXT,
+    duration_seconds   INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_queue_unprocessed ON candidate_queue(queued_at) WHERE processed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_eng_pipe_status ON engagement_pipeline_queue(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_accounts_stage  ON accounts(stage);
@@ -1486,6 +2209,11 @@ CREATE INDEX IF NOT EXISTS idx_edges_target    ON social_edges(target);
 CREATE INDEX IF NOT EXISTS idx_eng_user        ON engagements(target_username);
 CREATE INDEX IF NOT EXISTS idx_eng_time        ON engagements(replied_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_time      ON posts(posted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_search_cache_results_term_ord ON search_cache_results(term, ord);
+CREATE INDEX IF NOT EXISTS idx_content_queue_posted ON content_queue(posted, drafted_at);
+CREATE INDEX IF NOT EXISTS idx_recent_post_log_time ON recent_post_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_target_monitor_replied_time ON target_monitor_replied(replied_at DESC);
+CREATE INDEX IF NOT EXISTS idx_repair_history_time ON twitter_repair_history(happened_at DESC);
 
 CREATE TABLE IF NOT EXISTS tweet_replies (
     reply_tweet_id  TEXT PRIMARY KEY,

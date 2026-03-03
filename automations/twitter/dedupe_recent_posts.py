@@ -23,9 +23,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
-from db import get_conn, get_recent_posts, kv_get_json
-
-KV_RECENT_POSTS = "twitter:recent_posts"
+from db import ensure_schema, get_conn, get_recent_post_log, get_recent_posts
 
 STOPWORDS = {
     "a",
@@ -219,11 +217,10 @@ def main() -> int:
     ap.add_argument("--max", type=int, default=200, help="max recentPosts entries to consider")
     args = ap.parse_args()
     with get_conn() as conn:
-        kv_recent = kv_get_json(conn, KV_RECENT_POSTS, [])
-        if not isinstance(kv_recent, list):
-            kv_recent = []
+        ensure_schema(conn)
+        logged_recent = get_recent_post_log(conn, limit=args.max)
         rows = get_recent_posts(conn, days=90, limit=args.max)
-    rp_raw = list(kv_recent)[-args.max :]
+    rp_raw = list(logged_recent)[-args.max :]
     for row in rows:
         rp_raw.append(
             {

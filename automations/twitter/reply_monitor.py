@@ -43,12 +43,14 @@ from db import (
     is_engaged,
     kv_get,
     kv_set,
+    upsert_account,
 )
 from twitter_utils import (
     BLOCKED_AUTHORS,
     auto_follow_after_engagement,
     cdp_tab,
     fetch_tweet_context,
+    get_follower_count,
     humanize,
     jitter_sleep,
     like_tweet,
@@ -70,10 +72,13 @@ SEEN_TTL_DAYS = 2
 # KV state key for seen mention IDs (stored as JSON string)
 KV_SEEN_MENTIONS = "reply_monitor:seen_mentions"
 KV_POST_FAILURE_STREAK = "reply_monitor:post_failure_streak"
+KV_OWN_FOLLOWER_REFRESH_AT = "reply_monitor:own_follower_refresh_at"
+KV_OWN_FOLLOWER_COUNT = "reply_monitor:own_follower_count"
 
 # Escalate repeated post failures into a flow failure so Prefect on_failure can
 # trigger repair_service.py. Single failures stay non-fatal.
 MAX_POST_FAILURE_STREAK_BEFORE_FAIL = 3
+OWN_FOLLOWER_REFRESH_INTERVAL_HOURS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +142,29 @@ def load_post_failure_streak(conn) -> int:
 def save_post_failure_streak(conn, streak: int) -> None:
     """Persist consecutive reply-post failure streak to kv_state."""
     kv_set(conn, KV_POST_FAILURE_STREAK, str(max(0, int(streak))))
+
+
+def maybe_refresh_own_follower_count(conn) -> int | None:
+    """Refresh @DecentCloud_org follower count (rate-limited) and upsert DB."""
+    now = datetime.now(timezone.utc)
+    raw = kv_get(conn, KV_OWN_FOLLOWER_REFRESH_AT)
+    if raw:
+        try:
+            last = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if now - last < timedelta(hours=OWN_FOLLOWER_REFRESH_INTERVAL_HOURS):
+                cached = kv_get(conn, KV_OWN_FOLLOWER_COUNT)
+                return int(cached) if cached and str(cached).isdigit() else None
+        except Exception:
+            pass
+
+    count = get_follower_count(OUR_HANDLE, force_refresh=True)
+    if count is None:
+        return None
+
+    upsert_account(conn, username=OUR_HANDLE, follower_count=count)
+    kv_set(conn, KV_OWN_FOLLOWER_COUNT, str(count))
+    kv_set(conn, KV_OWN_FOLLOWER_REFRESH_AT, utc_now())
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +518,10 @@ def main() -> int:
                     f"Loaded reply post failure streak={post_failure_streak}",
                     flush=True,
                 )
+
+            own_followers = maybe_refresh_own_follower_count(conn)
+            if own_followers is not None:
+                print(f"Own follower count refreshed: {own_followers}", flush=True)
 
             # Prune stale seen IDs
             pruned = prune_seen_mentions(conn, seen_mentions)

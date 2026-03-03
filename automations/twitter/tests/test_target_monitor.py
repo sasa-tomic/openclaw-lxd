@@ -85,12 +85,6 @@ def _dt_at(hour: int) -> datetime:
     return datetime(2026, 2, 22, hour, 0, tzinfo=timezone.utc)
 
 
-def _make_state(**overrides) -> dict:
-    base = {"accounts": {}, "repliedToIds": [], "lastRunAt": None}
-    base.update(overrides)
-    return base
-
-
 def _fresh_tweet(tweet_id: str, age_min: float = 5.0) -> dict:
     """Create a fake CDP tweet result that is age_min minutes old relative to now."""
     ts = datetime.now(timezone.utc) - timedelta(minutes=age_min)
@@ -114,62 +108,6 @@ def _tweet_ctx(tweet_id: str, author: str = "simonw") -> dict:
         "threadContinuation": None,
         "quotedTweet": None,
     }
-
-
-# ---------------------------------------------------------------------------
-# State loading / saving
-# ---------------------------------------------------------------------------
-
-
-class TestStatePersistence:
-    def test_load_monitor_state_missing_row(self):
-        """load_monitor_state returns empty defaults when kv row is absent."""
-        with mock.patch.object(tm, "kv_get", return_value=None):
-            state = tm.load_monitor_state(conn=mock.MagicMock())
-        assert state == {"accounts": {}, "repliedToIds": [], "lastRunAt": None}
-
-    def test_load_monitor_state_valid_json(self):
-        """load_monitor_state correctly deserialises JSON from kv_state."""
-        data = {
-            "accounts": {"simonw": {"lastCheckedAt": "2026-02-22T10:00:00Z"}},
-            "repliedToIds": ["111", "222"],
-            "lastRunAt": "2026-02-22T10:00:00Z",
-        }
-        with mock.patch.object(tm, "kv_get", return_value=json.dumps(data)):
-            loaded = tm.load_monitor_state(conn=mock.MagicMock())
-        assert loaded["repliedToIds"] == ["111", "222"]
-        assert "simonw" in loaded["accounts"]
-
-    def test_load_monitor_state_corrupt_json(self):
-        """load_monitor_state returns defaults when kv payload is garbage."""
-        with mock.patch.object(tm, "kv_get", return_value="not json at all {{{"):
-            state = tm.load_monitor_state(conn=mock.MagicMock())
-        assert state == {"accounts": {}, "repliedToIds": [], "lastRunAt": None}
-
-    def test_save_monitor_state_writes_json_payload(self):
-        """save_monitor_state serializes state and writes via kv_set."""
-        with mock.patch.object(tm, "kv_set") as mocked_set:
-            tm.save_monitor_state(_make_state(repliedToIds=["abc123"]), conn=mock.MagicMock())
-        mocked_set.assert_called_once()
-        _, key, payload = mocked_set.call_args.args
-        assert key == tm.KV_MONITOR_STATE
-        parsed = json.loads(payload)
-        assert parsed["repliedToIds"] == ["abc123"]
-
-    def test_get_account_state_initialises_new_account(self):
-        """get_account_state creates a fresh entry for unknown usernames."""
-        state = _make_state()
-        acct = tm.get_account_state(state, "newuser")
-        assert acct == {"lastCheckedAt": None, "lastTweetId": None, "lastTweetAt": None}
-        assert "newuser" in state["accounts"]
-
-    def test_get_account_state_returns_existing(self):
-        """get_account_state returns the existing dict if already present."""
-        state = _make_state(
-            accounts={"simonw": {"lastCheckedAt": "ts", "lastTweetId": "99", "lastTweetAt": None}}
-        )
-        acct = tm.get_account_state(state, "simonw")
-        assert acct["lastTweetId"] == "99"
 
 
 # ---------------------------------------------------------------------------
@@ -381,39 +319,6 @@ class TestNewTweetDetection:
 
         assert result is False
         assert "fail_tweet" not in replied_ids
-
-
-# ---------------------------------------------------------------------------
-# Replied IDs deduplication and cap
-# ---------------------------------------------------------------------------
-
-
-class TestRepliedIdsCap:
-    def test_add_replied_id_basic(self):
-        state = _make_state()
-        tm.add_replied_id(state, "tweet1")
-        assert "tweet1" in state["repliedToIds"]
-
-    def test_add_replied_id_no_duplicates(self):
-        state = _make_state(repliedToIds=["tweet1"])
-        tm.add_replied_id(state, "tweet1")
-        assert state["repliedToIds"].count("tweet1") == 1
-
-    def test_add_replied_id_cap_enforced(self):
-        """add_replied_id drops oldest entries to stay within MAX_REPLIED_IDS."""
-        ids = [str(i) for i in range(tm.MAX_REPLIED_IDS)]
-        state = _make_state(repliedToIds=ids)
-
-        tm.add_replied_id(state, "new_id")
-
-        assert len(state["repliedToIds"]) == tm.MAX_REPLIED_IDS
-        assert "new_id" in state["repliedToIds"]
-        assert "0" not in state["repliedToIds"]  # oldest dropped
-
-    def test_add_replied_id_coerces_to_string(self):
-        state = _make_state()
-        tm.add_replied_id(state, 123456)
-        assert "123456" in state["repliedToIds"]
 
 
 # ---------------------------------------------------------------------------

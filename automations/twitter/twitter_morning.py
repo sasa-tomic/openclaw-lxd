@@ -4,8 +4,8 @@
 Runs once daily to find and draft tweet opportunities.
 
 Output:
-- kv_state key `twitter:morning_research` — cache read by post_original_content.py
-- /tmp/twitter-morning-results.txt       — human-readable summary for review
+- DB tables (`twitter_morning_latest`, `twitter_morning_hn`) — cache read by post_original_content.py
+- /tmp/twitter-morning-results.txt — human-readable summary for review
 """
 
 import json
@@ -22,16 +22,19 @@ logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from db import get_conn, kv_get_json, kv_set_json
+from db import (
+    ensure_schema,
+    get_conn,
+    get_morning_state,
+    set_morning_state_last_run,
+    store_morning_research,
+)
 
 MEMORY_DIR = Path("/home/openclaw/clawd/memory")
 RESULTS_FILE = Path("/tmp/twitter-morning-results.txt")
 NOTES_DIR = Path("/projects/Notes")
 TEASER_FILE = NOTES_DIR / "Pickle/twitter-teasers.md"
 DEDUPE_SCRIPT = Path("/projects/automations/twitter/dedupe_recent_posts.py")
-
-KV_MORNING_STATE = "twitter:morning_state"
-KV_MORNING_RESEARCH = "twitter:morning_research"
 
 HN_QUERIES = [
     "kubernetes clusters hetzner",
@@ -102,9 +105,10 @@ def main():
     print("=== DECENT CLOUD TWITTER - MORNING RESEARCH ===")
 
     with get_conn() as conn:
-        state = kv_get_json(conn, KV_MORNING_STATE, DEFAULT_STATE)
-        if not isinstance(state, dict):
-            state = dict(DEFAULT_STATE)
+        ensure_schema(conn)
+        db_state = get_morning_state(conn)
+    state = dict(DEFAULT_STATE)
+    state["lastResearchRun"] = db_state.get("lastResearchRun")
     force = os.environ.get("FORCE", "0") == "1"
 
     # Check if we should run
@@ -215,18 +219,26 @@ def main():
             print(f"Could not read teaser file: {e}")
 
     # Update state
-    state["lastResearchRun"] = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    state["lastResearchRun"] = now_dt.isoformat()
     with get_conn() as conn:
-        kv_set_json(conn, KV_MORNING_STATE, state)
+        ensure_schema(conn)
+        set_morning_state_last_run(conn, now_dt)
 
     # Write research cache for post_original_content.py to consume
     research_cache = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now_dt.isoformat(),
         "hnStories": hn_stories,
         "devActivity": dev_activity,
     }
     with get_conn() as conn:
-        kv_set_json(conn, KV_MORNING_RESEARCH, research_cache)
+        ensure_schema(conn)
+        store_morning_research(
+            conn,
+            run_at=now_dt,
+            hn_stories=hn_stories,
+            dev_activity=dev_activity,
+        )
     print(
         f"  Wrote research cache (DB): {len(hn_stories)} HN stories, dev={dev_activity is not None}"
     )

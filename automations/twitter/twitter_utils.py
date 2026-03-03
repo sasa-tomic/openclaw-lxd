@@ -28,7 +28,16 @@ logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.config import TWITTER_BASE_URL  # noqa: E402
-from db import get_conn, kv_get, kv_get_json, kv_get_prefix, kv_set, kv_set_json  # noqa: E402
+from db import (  # noqa: E402
+    get_conn,
+    get_cached_search_results,
+    get_profile_cache,
+    get_thread_index_map,
+    get_thread_note_path,
+    store_search_cache_results,
+    upsert_profile_cache,
+    upsert_thread_index,
+)
 
 
 STRATEGY_PATH = Path("/projects/automations/twitter/STRATEGY.md")
@@ -37,9 +46,6 @@ HUMANIZE_SCRIPT = Path("/projects/automations/text/humanize.py")
 CDP_LOCK_PATH = Path("/tmp/twitter-cdp.lock")
 CDP_LOCK_TIMEOUT = 300  # seconds
 
-KV_THREAD_INDEX_PREFIX = "thread_index:"
-KV_PROFILE_CACHE_PREFIX = "profile_cache:"
-KV_SEARCH_CACHE_PREFIX = "search_cache:"
 
 
 @contextlib.contextmanager
@@ -329,29 +335,23 @@ def run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
 
 
 def load_thread_index() -> dict[str, str]:
-    """Load tweet_id → note_path index from DB kv_state."""
+    """Load tweet_id → note_path index from typed DB table."""
     try:
         with get_conn() as conn:
-            rows = kv_get_prefix(conn, KV_THREAD_INDEX_PREFIX)
-        out: dict[str, str] = {}
-        for key, value in rows.items():
-            tweet_id = key[len(KV_THREAD_INDEX_PREFIX) :]
-            if tweet_id:
-                out[tweet_id] = value
-        return out
+            return get_thread_index_map(conn)
     except Exception as e:
         logger.debug(f"load_thread_index failed: {e}")
         return {}
 
 
 def update_thread_index(tweet_ids: list[str], note_path: str) -> None:
-    """Add tweet_id → note_path entries to DB kv_state."""
+    """Add tweet_id → note_path entries to typed DB table."""
     if not tweet_ids:
         return
     try:
         with get_conn() as conn:
             for tid in tweet_ids:
-                kv_set(conn, f"{KV_THREAD_INDEX_PREFIX}{str(tid)}", note_path)
+                upsert_thread_index(conn, str(tid), note_path)
     except Exception as e:
         logger.debug(f"update_thread_index failed: {e}")
 
@@ -368,7 +368,7 @@ def lookup_our_thread(tweet_ids: list[str]) -> str | None:
     try:
         with get_conn() as conn:
             for tid in tweet_ids:
-                note_path = kv_get(conn, f"{KV_THREAD_INDEX_PREFIX}{str(tid)}")
+                note_path = get_thread_note_path(conn, str(tid))
                 if not note_path:
                     continue
                 try:
@@ -1170,13 +1170,12 @@ def search_candidates(
             flush=True,
         )
     else:
-        search_cache = _load_search_cache()
         terms_to_fetch: list[str] = []
         cache_hits = 0
 
         # Serve cached results immediately; collect terms that need a live search
         for term in search_terms:
-            cached = _get_cached_search(search_cache, term)
+            cached = _get_cached_search({}, term)
             if cached is not None:
                 cache_hits += 1
                 candidates.extend(cached)
@@ -1203,7 +1202,6 @@ def search_candidates(
                 flush=True,
             )
 
-        cache_updated = False
         _fixed_since_dt: datetime | None = None
         if bypass_cache:
             _fixed_since_dt = datetime.now(timezone.utc) - timedelta(
@@ -1216,24 +1214,9 @@ def search_candidates(
             else:
                 # Use the last time we searched this term as the since cutoff.
                 # Falls back to SEARCH_CACHE_TTL_HOURS ago for first-time queries.
-                raw_entry = search_cache.get(term.lower().strip())
-                since_dt: datetime
-                if raw_entry and raw_entry.get("cachedAt"):
-                    try:
-                        since_dt = datetime.fromisoformat(
-                            raw_entry["cachedAt"].replace("Z", "+00:00")
-                        )
-                    except (ValueError, TypeError):
-                        logger.debug(
-                            f"search_candidates cache date parse failed for '{term}'"
-                        )
-                        since_dt = datetime.now(timezone.utc) - timedelta(
-                            hours=SEARCH_CACHE_TTL_HOURS
-                        )
-                else:
-                    since_dt = datetime.now(timezone.utc) - timedelta(
-                        hours=SEARCH_CACHE_TTL_HOURS
-                    )
+                since_dt = datetime.now(timezone.utc) - timedelta(
+                    hours=SEARCH_CACHE_TTL_HOURS
+                )
 
             try:
                 tweets = _cdp_search(cdp, term, limit=limit, since_dt=since_dt)
@@ -1281,16 +1264,13 @@ def search_candidates(
 
                 candidates.extend(fresh_candidates)
                 if not bypass_cache:
-                    search_cache[term.lower().strip()] = {
-                        "cachedAt": utc_now(),
-                        "results": fresh_candidates,
-                    }
-                    cache_updated = True
+                    try:
+                        with get_conn() as conn:
+                            store_search_cache_results(conn, term, fresh_candidates)
+                    except Exception as e:
+                        logger.debug(f"search cache store failed for '{term}': {e}")
             except Exception as e:
                 print(f"  CDP search error for '{term}': {e}", flush=True)
-
-        if not bypass_cache and cache_updated:
-            _save_search_cache(search_cache)
 
     print(f"  CDP: {len(candidates)} fresh candidates across all terms", flush=True)
     return candidates
@@ -1518,46 +1498,20 @@ PROFILE_CACHE_TTL_DAYS = 7
 SEARCH_CACHE_TTL_HOURS = 6
 
 
-def load_profile_cache() -> dict:
-    """Load profile cache rows from DB kv_state."""
-    try:
-        with get_conn() as conn:
-            rows = kv_get_prefix(conn, KV_PROFILE_CACHE_PREFIX)
-        out: dict = {}
-        for key, value in rows.items():
-            username = key[len(KV_PROFILE_CACHE_PREFIX) :]
-            try:
-                out[username] = json.loads(value)
-            except Exception:
-                continue
-        return out
-    except Exception as e:
-        logger.debug(f"load_profile_cache failed: {e}")
-        return {}
-
-
-def save_profile_cache(cache: dict) -> None:
-    """Persist profile cache dict into DB kv_state."""
-    try:
-        with get_conn() as conn:
-            for username, entry in cache.items():
-                kv_set_json(conn, f"{KV_PROFILE_CACHE_PREFIX}{username.lower()}", entry)
-    except Exception as e:
-        logger.debug(f"save_profile_cache failed: {e}")
-
-
 def get_cached_profile(username: str) -> dict | None:
-    """Get cached profile from DB kv_state if not expired."""
+    """Get cached profile from typed DB table if not expired."""
     try:
         with get_conn() as conn:
-            entry = kv_get_json(conn, f"{KV_PROFILE_CACHE_PREFIX}{username.lower()}", None)
+            row = get_profile_cache(conn, username)
     except Exception as e:
         logger.debug(f"get_cached_profile kv lookup failed: {e}")
         return None
-    if not entry:
+    if not row:
         return None
     try:
-        cached_at = datetime.fromisoformat(entry["cachedAt"].replace("Z", "+00:00"))
+        cached_at = row.get("cached_at")
+        if not isinstance(cached_at, datetime):
+            return None
         if datetime.now(timezone.utc) - cached_at > timedelta(
             days=PROFILE_CACHE_TTL_DAYS
         ):
@@ -1565,62 +1519,38 @@ def get_cached_profile(username: str) -> dict | None:
     except (KeyError, ValueError) as e:
         logger.debug(f"get_cached_profile date parse failed: {e}")
         return None
-    return entry.get("profile")
+    return {
+        "displayName": row.get("display_name"),
+        "bio": row.get("bio"),
+        "location": row.get("location"),
+        "website": row.get("website"),
+        "followersCount": row.get("followers_count"),
+        "followingCount": row.get("following_count"),
+        "tweetsCount": row.get("tweets_count"),
+        "isVerified": bool(row.get("is_verified", False)),
+        "isBlueVerified": bool(row.get("is_blue_verified", False)),
+        "recentTweets": list(row.get("recent_tweets") or []),
+    }
 
 
 def cache_profile(username: str, profile: dict) -> None:
-    """Cache a user's profile data in DB kv_state."""
-    entry = {"cachedAt": utc_now(), "profile": profile}
+    """Cache a user's profile data in typed DB table."""
     try:
         with get_conn() as conn:
-            kv_set_json(conn, f"{KV_PROFILE_CACHE_PREFIX}{username.lower()}", entry)
+            upsert_profile_cache(conn, username, profile)
     except Exception as e:
         logger.debug(f"cache_profile failed: {e}")
 
 
-def _load_search_cache() -> dict:
-    """Load search cache rows from DB kv_state."""
-    try:
-        with get_conn() as conn:
-            rows = kv_get_prefix(conn, KV_SEARCH_CACHE_PREFIX)
-        out: dict = {}
-        for key, value in rows.items():
-            term = key[len(KV_SEARCH_CACHE_PREFIX) :]
-            try:
-                out[term] = json.loads(value)
-            except Exception:
-                continue
-        return out
-    except Exception as e:
-        logger.debug(f"_load_search_cache failed: {e}")
-        return {}
-
-
-def _save_search_cache(cache: dict) -> None:
-    """Persist search cache dict into DB kv_state."""
-    try:
-        with get_conn() as conn:
-            for term, entry in cache.items():
-                kv_set_json(conn, f"{KV_SEARCH_CACHE_PREFIX}{term.lower().strip()}", entry)
-    except Exception as e:
-        logger.debug(f"_save_search_cache failed: {e}")
-
-
 def _get_cached_search(cache: dict, term: str) -> list[dict] | None:
-    """Return cached results for a search term if fresh, else None."""
-    entry = cache.get(term.lower().strip())
-    if not entry:
-        return None
+    """Return cached search results from typed DB cache tables."""
+    _ = cache
     try:
-        cached_at = datetime.fromisoformat(entry["cachedAt"].replace("Z", "+00:00"))
-        if datetime.now(timezone.utc) - cached_at > timedelta(
-            hours=SEARCH_CACHE_TTL_HOURS
-        ):
-            return None
-    except (KeyError, ValueError) as e:
-        logger.debug(f"_get_cached_search date parse failed: {e}")
+        with get_conn() as conn:
+            return get_cached_search_results(conn, term, SEARCH_CACHE_TTL_HOURS)
+    except Exception as e:
+        logger.debug(f"_get_cached_search failed: {e}")
         return None
-    return entry.get("results", [])
 
 
 def fetch_user_profile(username: str) -> dict | None:
