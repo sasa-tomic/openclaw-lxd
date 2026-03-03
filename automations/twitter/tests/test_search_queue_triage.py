@@ -21,3 +21,18 @@ def test_triage_for_queue_uses_ranked_ids_order():
 
 def test_triage_for_queue_empty_safe():
     assert sq._triage_for_queue([], top_n=10) == []
+
+
+def test_default_invocation_sets_fill_defaults():
+    with (
+        mock.patch.object(sys, "argv", ["search_queue.py"]),
+        mock.patch.object(sq, "cmd_fill", return_value=0) as mock_fill,
+    ):
+        rc = sq.main()
+    assert rc == 0
+    args = mock_fill.call_args[0][0]
+    assert args.cmd == "fill"
+    assert args.all is False
+    assert args.n is None
+    assert args.prepare is False
+    assert args.triage_top == 20

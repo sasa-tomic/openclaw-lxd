@@ -398,6 +398,8 @@ def main() -> int:
         args.cmd = "fill"
         args.all = False
         args.n = None
+        args.prepare = False
+        args.triage_top = 20
 
     dispatch = {
         "fill": cmd_fill,
