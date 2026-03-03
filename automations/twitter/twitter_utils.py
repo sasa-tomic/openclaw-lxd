@@ -277,7 +277,7 @@ SKIP_PATTERNS = [
 # ---------------------------------------------------------------------------
 
 _CLOUD = "(aws OR gcp OR azure OR k8s OR vultr OR linode OR digitalocean OR hetzner OR contabo OR cloud)"
-_SUPPORT = "(down OR broken OR unreliable OR support OR trust OR ghost OR ghosted OR nightmare OR painful OR stuck)"
+_SUPPORT = "(down OR broken OR unreliable OR \"no support\" OR trust OR ghost OR ghosted OR nightmare OR painful OR stuck)"
 _P2P = "(runpod OR akash OR 'vast.ai' OR 'lambda labs' OR decentralized)"
 _PAAS = "(fly.io OR heroku OR 'render.com' OR railway)"
 _GPU = "(h100 OR a100 OR gpu OR B100 OR B300)"
