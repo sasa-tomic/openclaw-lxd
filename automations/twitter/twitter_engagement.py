@@ -21,7 +21,6 @@ Environment variables:
 from __future__ import annotations
 
 import json
-import re
 import sys
 import time as _time
 from collections import Counter
@@ -53,12 +52,8 @@ from db import (
 )
 from twitter_utils import (
     BLOCKED_AUTHORS,
-    SEARCH_TERMS,
     auto_follow_after_engagement,
-    weighted_sample_terms,
-    check_follows_back,
     fetch_tweet_context,
-    follow_user,
     get_user_profile,
     humanize,
     is_english_text,
@@ -68,39 +63,10 @@ from twitter_utils import (
     post_quote_tweet,
     post_reply,
     send_error_alert,
-    unfollow_user,
     utc_now,
 )
 
 LLM_CACHE_TTL_DAYS = 7
-
-PLATFORM_TERMS = [
-    "cloud",
-    "aws",
-    "gcp",
-    "azure",
-    "k8s",
-    "kubernetes",
-    "serverless",
-    "firebase",
-    "vercel",
-    "netlify",
-    "cloudflare",
-]
-
-PROBLEM_TERMS = [
-    "expensive",
-    "costs",
-    "pricing",
-    "bill",
-    "fees",
-    "bill shock",
-    "pricing complaint",
-    "costs rising",
-    "too expensive",
-    "pricing high",
-    "costs too high",
-]
 
 
 def get_cached_decision(decision_cache: dict, tweet_id: str) -> dict | None:
@@ -493,81 +459,6 @@ Output ONLY valid JSON, nothing else.
         return None
 
 
-FOLLOW_CHURN_DAYS_MIN = 7
-FOLLOW_CHURN_DAYS_MAX = 14
-MAX_FOLLOWS_PER_RUN = 8  # match engagement cap — follow each account we reply to
-
-
-def generate_dynamic_keywords(
-    recent_engagements: list[dict], max_terms: int = 15
-) -> list[str]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=14)
-    recent = []
-
-    for eng in recent_engagements:
-        ts = eng.get("replied_at")
-        if not ts:
-            continue
-        try:
-            if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            if ts > cutoff:
-                recent.append(eng)
-        except Exception:
-            continue
-
-    if not recent:
-        print("  No recent engagements to analyze, using sensible defaults", flush=True)
-        return [
-            "cloud expensive",
-            "aws pricing",
-            "kubernetes costs",
-            "serverless pricing",
-            "cloud bill shock",
-            "gpu expensive",
-        ]
-
-    keywords = set()
-    all_words = []
-
-    for eng in recent:
-        search_term = eng.get("search_term", "")
-        if search_term:
-            search_term = search_term.lower().strip()
-            keywords.add(search_term)
-            words = re.findall(r"\b\w+\b", search_term)
-            all_words.extend(words)
-
-    new_terms = set()
-
-    for eng in recent[:10]:
-        term = (eng.get("search_term") or "").lower()
-        if term and len(term.split()) > 1:
-            new_terms.add(term)
-
-    relevant_platforms = [
-        p for p in PLATFORM_TERMS if p in keywords or any(p in k for k in keywords)
-    ]
-    relevant_problems = [
-        p for p in PROBLEM_TERMS if any(word in p or p in keywords for word in keywords)
-    ]
-
-    if not relevant_platforms:
-        relevant_platforms = ["cloud", "aws", "kubernetes", "serverless"]
-    if not relevant_problems:
-        relevant_problems = ["expensive", "costs", "pricing"]
-
-    for platform in relevant_platforms[:4]:
-        for problem in relevant_problems[:3]:
-            new_terms.add(f"{platform} {problem}")
-            if len(new_terms) >= max_terms * 2:
-                break
-
-    return list(new_terms)[:max_terms]
-
-
 def main() -> int:
     print("=== AUTONOMOUS TWITTER ENGAGEMENT ===", flush=True)
     print(f"Time: {utc_now()}", flush=True)
@@ -607,34 +498,8 @@ def main() -> int:
 
                 if not candidates:
                     print("No candidates from search", flush=True)
-                    print(
-                        "  Generating fresh keywords from recent successful engagements...",
-                        flush=True,
-                    )
-
-                    # LLM call — browser lock intentionally released here
-                    new_keywords = generate_dynamic_keywords(
-                        recent_engagements, max_terms=15
-                    )
-                    print(f"  Generated {len(new_keywords)} new keywords", flush=True)
-
-                    global SEARCH_TERMS
-                    SEARCH_TERMS[:] = new_keywords
-
-                    print("  Retrying search with fresh keywords...", flush=True)
-                    with concurrency("twitter-browser", occupy=1):
-                        candidates = search_candidates(terms=new_keywords)
-                    print(
-                        f"  Found {len(candidates)} candidates with new keywords",
-                        flush=True,
-                    )
-
-                    if not candidates:
-                        print(
-                            "  Still no candidates - might just be quiet period",
-                            flush=True,
-                        )
-                        return 0
+                    print("  Quiet period likely — exiting.", flush=True)
+                    return 0
 
             top_combos = get_top_reply_combos(conn, limit=20)
             bottom_combos = get_bottom_reply_combos(conn, limit=10)
