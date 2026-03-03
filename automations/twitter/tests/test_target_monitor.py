@@ -247,7 +247,7 @@ class TestNewTweetDetection:
             mock.patch.object(tm, "fetch_tweet_context", return_value=_tweet_ctx("t456")),
             mock.patch.object(tm, "get_user_profile", return_value=None),
             mock.patch.object(tm, "draft_target_reply", return_value=rejected),
-            mock.patch.object(tm, "post_reply") as mock_post,
+            mock.patch.object(tm, "post_reply_with_retries") as mock_post,
         ):
             result = tm.process_account(mock_conn, "simonw", set(), [], [], _real_now())
         assert result is False
@@ -278,7 +278,7 @@ class TestNewTweetDetection:
                                return_value={"followersCount": 50000}),
             mock.patch.object(tm, "draft_target_reply", return_value=good_decision),
             mock.patch.object(tm, "humanize", side_effect=lambda x: x),
-            mock.patch.object(tm, "post_reply", return_value=(True, "our_reply_id")),
+            mock.patch.object(tm, "post_reply_with_retries", return_value=(True, "our_reply_id")),
             mock.patch.object(tm, "auto_follow_after_engagement"),
             mock.patch.object(tm, "insert_engagement"),
             mock.patch.object(tm, "save_replied_ids"),
@@ -312,7 +312,7 @@ class TestNewTweetDetection:
             mock.patch.object(tm, "get_user_profile", return_value=None),
             mock.patch.object(tm, "draft_target_reply", return_value=good_decision),
             mock.patch.object(tm, "humanize", side_effect=lambda x: x),
-            mock.patch.object(tm, "post_reply", return_value=(False, None)),
+            mock.patch.object(tm, "post_reply_with_retries", return_value=(False, None)),
             mock.patch.object(tm, "send_error_alert"),
         ):
             result = tm.process_account(mock_conn, "simonw", replied_ids, [], [], _real_now())

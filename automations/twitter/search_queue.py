@@ -9,9 +9,9 @@ Subcommands:
   drop   Remove specific tweet IDs
 
 Examples:
-  uv run python search_queue.py              # fill: weighted sample of terms
+  uv run python search_queue.py              # fill: all SEARCH_TERMS
   uv run python search_queue.py fill --all   # fill: all SEARCH_TERMS
-  uv run python search_queue.py fill -n 5    # fill: sample 5 terms
+  uv run python search_queue.py fill -n 5    # fill: random sample 5 terms
   uv run python search_queue.py show
   uv run python search_queue.py show --limit 20
   uv run python search_queue.py stats
@@ -22,6 +22,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import random
 import subprocess
 import sys
 from collections import Counter
@@ -32,21 +33,20 @@ sys.path.insert(0, "/projects/automations")
 
 import psycopg2.extras
 
-from engagement_triage import llm_triage_candidates, reach_score
+from engagement_triage import filter_candidates_for_engagement, llm_triage_candidates, reach_score
 from db import (
     ensure_schema,
     get_conn,
     get_engaged_tweet_ids,
     get_queued_candidates,
-    get_search_term_stats,
     insert_candidate_queue,
     queue_size,
 )
 from twitter_utils import (
+    BLOCKED_AUTHORS,
     SEARCH_TERMS,
     search_candidates,
     utc_now,
-    weighted_sample_terms,
 )
 
 DEFAULT_SAMPLE_SIZE = len(SEARCH_TERMS)  # search all terms by default
@@ -63,11 +63,16 @@ def _candidates_for_term(
     already_queued_ids: set[str],
 ) -> list[dict]:
     """Filter CDP results down to new candidates not already seen or engaged."""
+    eligible, _discard = filter_candidates_for_engagement(
+        cdp_candidates,
+        engaged_ids={str(i) for i in engaged_ids},
+        blocked_authors=set(BLOCKED_AUTHORS),
+        extra_skip_ids={str(i) for i in already_queued_ids},
+    )
+
     result = []
-    for c in cdp_candidates:
+    for c in eligible:
         tid = str(c.get("tweetId", ""))
-        if not tid or tid in engaged_ids or tid in already_queued_ids:
-            continue
         result.append(
             {
                 "tweet_id": tid,
@@ -108,7 +113,6 @@ def cmd_fill(args: argparse.Namespace) -> int:
     with get_conn() as conn:
         ensure_schema(conn)
         engaged_ids = get_engaged_tweet_ids(conn)
-        term_stats = get_search_term_stats(conn)
         already_queued_ids = {c["tweetId"] for c in get_queued_candidates(conn, limit=10000)}
 
     if args.all:
@@ -116,10 +120,8 @@ def cmd_fill(args: argparse.Namespace) -> int:
         print(f"Searching all {len(terms)} terms...", flush=True)
     else:
         n = args.n or DEFAULT_SAMPLE_SIZE
-        terms = weighted_sample_terms(
-            SEARCH_TERMS, term_stats, min(n, len(SEARCH_TERMS))
-        )
-        print(f"Searching {len(terms)} weighted terms...", flush=True)
+        terms = random.sample(SEARCH_TERMS, min(n, len(SEARCH_TERMS)))
+        print(f"Searching {len(terms)} random terms...", flush=True)
 
     # Phase 2+3 interleaved: search one term at a time and insert immediately.
     # This way a timeout only loses the terms not yet searched, not everything.
@@ -128,7 +130,7 @@ def cmd_fill(args: argparse.Namespace) -> int:
         print(f"  [{i}/{len(terms)}] '{term}'", flush=True)
 
         cdp_candidates = search_candidates(
-            terms=[term], term_stats=term_stats, bypass_cache=True, since_hours=1, limit=50
+            terms=[term], bypass_cache=True, since_hours=1, limit=50
         )
         new_candidates = _candidates_for_term(cdp_candidates, engaged_ids, already_queued_ids)
         if args.triage_top and new_candidates:

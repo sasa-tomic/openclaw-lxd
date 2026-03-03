@@ -33,7 +33,9 @@ def _load_db_url() -> str:
 
 
 DATABASE_URL = _load_db_url()
-ANALYTICS_HANDLE = os.environ.get("TWITTER_ACCOUNT_USERNAME", "decentcloud_org").strip().lower()
+TWITTER_ACCOUNT_USERNAME = os.environ.get("TWITTER_ACCOUNT_USERNAME", "DecentCloud_org").strip()
+TWITTER_ACCOUNT_USERNAME_LOWER = TWITTER_ACCOUNT_USERNAME.lower()
+ANALYTICS_HANDLE = TWITTER_ACCOUNT_USERNAME_LOWER
 
 # ---------------------------------------------------------------------------
 # Seed accounts inserted during ensure_schema()

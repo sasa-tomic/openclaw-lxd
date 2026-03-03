@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import sys
-import time as _time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -31,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, "/projects/automations")
 from prefect.concurrency.sync import concurrency
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
-from engagement_triage import llm_triage_candidates, reach_score
+from engagement_triage import filter_candidates_for_engagement, llm_triage_candidates, reach_score
 from db import (
     ensure_schema,
     get_conn,
@@ -49,6 +48,7 @@ from db import (
     mark_queue_processed,
     upsert_search_term_stats,
     upsert_tweet_replies,
+    TWITTER_ACCOUNT_USERNAME,
 )
 from twitter_utils import (
     BLOCKED_AUTHORS,
@@ -60,8 +60,8 @@ from twitter_utils import (
     jitter_sleep,
     like_tweet,
     load_project_context,
-    post_quote_tweet,
-    post_reply,
+    post_quote_with_retries,
+    post_reply_with_retries,
     send_error_alert,
     utc_now,
 )
@@ -505,26 +505,11 @@ def main() -> int:
             bottom_combos = get_bottom_reply_combos(conn, limit=10)
 
             # ── Candidate filtering (hard rules only — no keyword content filter) ──
-            discard_ids: list[str] = []
-            eligible: list[dict] = []
-
-            for c in candidates:
-                tid = c.get("tweetId")
-                if not tid or str(tid) in engaged_ids:
-                    if tid:
-                        discard_ids.append(str(tid))
-                    continue
-                author = (c.get("author") or "").lower()
-                if author in {a.lower() for a in BLOCKED_AUTHORS}:
-                    print(f"  Skipping blocked author @{author}", flush=True)
-                    discard_ids.append(str(tid))
-                    continue
-                if not is_english_text(c.get("text")):
-                    print(f"  Skipping non-English candidate {tid} (@{author})", flush=True)
-                    if tid:
-                        discard_ids.append(str(tid))
-                    continue
-                eligible.append(c)
+            eligible, discard_ids = filter_candidates_for_engagement(
+                candidates,
+                engaged_ids={str(i) for i in engaged_ids},
+                blocked_authors=set(BLOCKED_AUTHORS),
+            )
 
             if using_queue and discard_ids:
                 mark_queue_processed(conn, discard_ids)
@@ -708,13 +693,13 @@ def main() -> int:
                             print(f"  Humanize failed: {e}")
                             continue
                         MAX_REPLY_ATTEMPTS = 3
-                        for attempt in range(1, MAX_REPLY_ATTEMPTS + 1):
-                            posted, our_reply_id = post_quote_tweet(tweet_id, reply_text)
-                            if posted:
-                                break
-                            if attempt < MAX_REPLY_ATTEMPTS:
-                                print(f"  Quote attempt {attempt} failed, retrying in 5s...", flush=True)
-                                _time.sleep(5)
+                        posted, our_reply_id = post_quote_with_retries(
+                            tweet_id,
+                            reply_text,
+                            attempts=MAX_REPLY_ATTEMPTS,
+                            retry_delay_sec=5,
+                            our_username=TWITTER_ACCOUNT_USERNAME,
+                        )
                         if not posted:
                             send_error_alert(f"Failed to quote-tweet {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
                             continue
@@ -729,13 +714,13 @@ def main() -> int:
                             print(f"  Humanize failed: {e}")
                             continue
                         MAX_REPLY_ATTEMPTS = 3
-                        for attempt in range(1, MAX_REPLY_ATTEMPTS + 1):
-                            posted, our_reply_id = post_reply(tweet_id, reply_text)
-                            if posted:
-                                break
-                            if attempt < MAX_REPLY_ATTEMPTS:
-                                print(f"  Reply attempt {attempt} failed, retrying in 5s...", flush=True)
-                                _time.sleep(5)
+                        posted, our_reply_id = post_reply_with_retries(
+                            tweet_id,
+                            reply_text,
+                            attempts=MAX_REPLY_ATTEMPTS,
+                            retry_delay_sec=5,
+                            our_username=TWITTER_ACCOUNT_USERNAME,
+                        )
                         if not posted:
                             send_error_alert(f"Failed to post reply to {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
                             continue

@@ -13,6 +13,7 @@ from collections import Counter
 sys.path.insert(0, "/projects/automations")
 
 from prefect.concurrency.sync import concurrency
+from engagement_triage import filter_candidates_for_engagement, reach_score
 from db import (
     ensure_schema,
     get_conn,
@@ -20,19 +21,16 @@ from db import (
     get_engagements_with_user,
     get_our_thread_context,
     get_queued_candidates,
-    get_search_term_stats,
     is_engaged,
     mark_queue_processed,
     upsert_prepared_candidate,
     upsert_search_term_stats,
     upsert_tweet_replies,
 )
-from twitter_engagement import _reach_score
 from twitter_utils import (
     BLOCKED_AUTHORS,
     fetch_tweet_context,
     get_user_profile,
-    search_candidates,
     utc_now,
 )
 
@@ -45,35 +43,20 @@ def main() -> int:
         with get_conn() as conn:
             ensure_schema(conn)
             engaged_ids = get_engaged_tweet_ids(conn)
-            term_stats = get_search_term_stats(conn)
             candidates = get_queued_candidates(conn, limit=100)
 
         using_queue = bool(candidates)
         if using_queue:
             print(f"Using {len(candidates)} candidates from queue", flush=True)
         else:
-            print("Queue empty — falling back to CDP search...", flush=True)
-            with concurrency("twitter-browser", occupy=1):
-                candidates = search_candidates(term_stats=term_stats)
-            print(f"Found {len(candidates)} candidates from search", flush=True)
-            if not candidates:
-                print("No candidates to prepare", flush=True)
-                return 0
+            print("Queue empty — nothing to prepare", flush=True)
+            return 0
 
-        discard_ids: list[str] = []
-        eligible: list[dict] = []
-        blocked = {a.lower() for a in BLOCKED_AUTHORS}
-        for c in candidates:
-            tid = str(c.get("tweetId") or "")
-            if not tid or tid in engaged_ids:
-                if tid:
-                    discard_ids.append(tid)
-                continue
-            author = (c.get("author") or "").lower()
-            if author in blocked:
-                discard_ids.append(tid)
-                continue
-            eligible.append(c)
+        eligible, discard_ids = filter_candidates_for_engagement(
+            candidates,
+            engaged_ids={str(i) for i in engaged_ids},
+            blocked_authors=set(BLOCKED_AUTHORS),
+        )
 
         if using_queue and discard_ids:
             with get_conn() as conn:
@@ -83,7 +66,7 @@ def main() -> int:
             print("No suitable candidates after filtering", flush=True)
             return 0
 
-        eligible.sort(key=_reach_score, reverse=True)
+        eligible.sort(key=reach_score, reverse=True)
         selected = eligible[:30]
         print(f"Preparing context for {len(selected)} candidates", flush=True)
 

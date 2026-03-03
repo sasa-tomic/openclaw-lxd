@@ -48,6 +48,7 @@ from db import (
     update_engagement_perf,
     update_post_stats,
     get_account,
+    TWITTER_ACCOUNT_USERNAME,
 )
 
 ENGAGEMENT_RUNS_PER_DAY = 48  # deployment: :07 and :38 every hour
@@ -55,7 +56,7 @@ ENGAGEMENT_ACTION_CAP_PER_RUN = 8
 ORIGINAL_POSTS_TARGET_PER_DAY = 5  # deployment: 07:30, 10:30, 13:30, 17:30, 21:30 UTC
 
 
-OUR_HANDLE = "DecentCloud_org"
+OUR_HANDLE = TWITTER_ACCOUNT_USERNAME
 
 
 def get_follower_count(conn) -> int | None:

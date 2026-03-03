@@ -5,6 +5,7 @@ from __future__ import annotations
 import time as _time
 
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
+from twitter_utils import is_english_text
 
 
 def reach_score(candidate: dict) -> int:
@@ -75,3 +76,38 @@ Example: ["1234567890", "9876543210"]"""
     except Exception as e:
         print(f"  LLM triage failed ({e}) — using reach-sort fallback", flush=True)
         return fallback[:top_n]
+
+
+def filter_candidates_for_engagement(
+    candidates: list[dict],
+    *,
+    engaged_ids: set[str],
+    blocked_authors: set[str],
+    extra_skip_ids: set[str] | None = None,
+) -> tuple[list[dict], list[str]]:
+    """Shared hard filters for engagement candidate lists.
+
+    Returns (eligible, discard_ids).
+    """
+    eligible: list[dict] = []
+    discard_ids: list[str] = []
+    skip_ids = extra_skip_ids or set()
+    blocked = {a.lower() for a in blocked_authors}
+
+    for c in candidates:
+        tid = str(c.get("tweetId") or c.get("tweet_id") or "")
+        if not tid:
+            continue
+        if tid in engaged_ids or tid in skip_ids:
+            discard_ids.append(tid)
+            continue
+        author = (c.get("author") or "").lower()
+        if author in blocked:
+            discard_ids.append(tid)
+            continue
+        if not is_english_text(c.get("text")):
+            discard_ids.append(tid)
+            continue
+        eligible.append(c)
+
+    return eligible, discard_ids

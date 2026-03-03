@@ -45,6 +45,7 @@ from db import (
     set_account_last_seen_tweet_at,
     set_target_monitor_last_run,
     set_target_monitor_account_state,
+    TWITTER_ACCOUNT_USERNAME,
     trim_target_monitor_replied,
     upsert_account,
 )
@@ -57,7 +58,7 @@ from twitter_utils import (
     is_english_text,
     jitter_sleep,
     load_project_context,
-    post_reply,
+    post_reply_with_retries,
     send_error_alert,
     utc_now,
 )
@@ -658,7 +659,9 @@ def process_account(
         return False
 
     # Post the reply
-    posted, our_reply_id = post_reply(tweet_id, reply_text)
+    posted, our_reply_id = post_reply_with_retries(
+        tweet_id, reply_text, attempts=1, retry_delay_sec=5, our_username=TWITTER_ACCOUNT_USERNAME
+    )
     if not posted:
         send_error_alert(
             f"Target monitor: failed to post reply to {tweet_id} (@{username})"

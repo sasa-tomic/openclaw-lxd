@@ -39,6 +39,7 @@ from db import (
     kv_get,
     kv_set,
     set_account_last_seen_tweet_at,
+    TWITTER_ACCOUNT_USERNAME,
     upsert_account,
 )
 from twitter_utils import (
@@ -50,12 +51,12 @@ from twitter_utils import (
     is_english_text,
     jitter_sleep,
     load_project_context,
-    post_reply,
+    post_reply_with_retries,
     send_error_alert,
     utc_now,
 )
 
-OUR_HANDLE = "DecentCloud_org"
+OUR_HANDLE = TWITTER_ACCOUNT_USERNAME
 OUR_HANDLE_LOWER = OUR_HANDLE.lower()
 
 # Max tweets to process per run (keeps each run within 5 min budget)
@@ -584,7 +585,9 @@ def main() -> int:
 
                 url = tweet.get("url") or f"{TWITTER_BASE_URL}/i/web/status/{tid}"
 
-                posted, our_reply_id = post_reply(tid, reply_text)
+                posted, our_reply_id = post_reply_with_retries(
+                    tid, reply_text, attempts=1, retry_delay_sec=5, our_username=OUR_HANDLE
+                )
                 if not posted:
                     send_error_alert(
                         f"Timeline monitor: failed to post reply to {tid} (@{author})"

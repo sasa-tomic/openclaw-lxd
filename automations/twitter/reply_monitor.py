@@ -52,6 +52,7 @@ from db import (
     kv_get,
     kv_set,
     set_follows_us_back,
+    TWITTER_ACCOUNT_USERNAME,
     upsert_account,
 )
 from twitter_utils import (
@@ -66,12 +67,12 @@ from twitter_utils import (
     jitter_sleep,
     like_tweet,
     load_project_context,
-    post_reply,
+    post_reply_with_retries,
     send_error_alert,
     utc_now,
 )
 
-OUR_HANDLE = "DecentCloud_org"
+OUR_HANDLE = TWITTER_ACCOUNT_USERNAME
 OUR_HANDLE_LOWER = OUR_HANDLE.lower()
 
 # How many mentions to process per run (keeps runs fast — 5 min budget)
@@ -765,7 +766,9 @@ def main() -> int:
                         print(f"  Humanize failed: {e}", flush=True)
                         continue
 
-                    posted, our_reply_id = post_reply(tid, reply_text)
+                    posted, our_reply_id = post_reply_with_retries(
+                        tid, reply_text, attempts=1, retry_delay_sec=5, our_username=OUR_HANDLE
+                    )
                     if not posted:
                         post_failure_streak += 1
                         save_post_failure_streak(conn, post_failure_streak)

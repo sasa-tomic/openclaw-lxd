@@ -316,9 +316,6 @@ _GPU = "(h100 OR a100 OR gpu OR B100 OR B300)"
 _PAIN = "(terrible OR useless OR ghosted OR broken)"
 _COST = "(expensive OR insane OR overpriced OR scam OR overpaying OR cheaper)"
 
-# Kept for backwards-compat with generate_dynamic_keywords()
-PROVIDERS = _CLOUD
-
 SEARCH_TERMS = [
     # Provider support failures — named providers anchor to real incidents
     f"({_CLOUD} OR {_P2P} OR {_PAAS}) AND {_SUPPORT}",
@@ -678,6 +675,46 @@ def post_quote_tweet(
     except Exception as e:
         logger.warning(f"post_quote_tweet CDP failed: {e}")
         return False, None
+
+
+def post_reply_with_retries(
+    tweet_id: str,
+    reply_text: str,
+    *,
+    attempts: int = 1,
+    retry_delay_sec: int = 5,
+    our_username: str = "DecentCloud_org",
+) -> tuple[bool, str | None]:
+    """Post reply with bounded retries."""
+    max_attempts = max(1, int(attempts))
+    for attempt in range(1, max_attempts + 1):
+        posted, reply_id = post_reply(tweet_id, reply_text, our_username=our_username)
+        if posted:
+            return True, reply_id
+        if attempt < max_attempts:
+            print(f"  Reply attempt {attempt} failed, retrying in {retry_delay_sec}s...", flush=True)
+            time.sleep(retry_delay_sec)
+    return False, None
+
+
+def post_quote_with_retries(
+    tweet_id: str,
+    quote_text: str,
+    *,
+    attempts: int = 1,
+    retry_delay_sec: int = 5,
+    our_username: str = "DecentCloud_org",
+) -> tuple[bool, str | None]:
+    """Post quote-tweet with bounded retries."""
+    max_attempts = max(1, int(attempts))
+    for attempt in range(1, max_attempts + 1):
+        posted, quote_id = post_quote_tweet(tweet_id, quote_text, our_username=our_username)
+        if posted:
+            return True, quote_id
+        if attempt < max_attempts:
+            print(f"  Quote attempt {attempt} failed, retrying in {retry_delay_sec}s...", flush=True)
+            time.sleep(retry_delay_sec)
+    return False, None
 
 
 def post_tweet(text: str) -> bool:
