@@ -33,6 +33,7 @@ def _load_db_url() -> str:
 
 
 DATABASE_URL = _load_db_url()
+ANALYTICS_HANDLE = os.environ.get("TWITTER_ACCOUNT_USERNAME", "decentcloud_org").strip().lower()
 
 # ---------------------------------------------------------------------------
 # Seed accounts inserted during ensure_schema()
@@ -848,33 +849,40 @@ def upsert_account(
     col_str = ", ".join(cols)
     placeholder_str = ", ".join(["%s"] * len(cols))
 
-    # Build UPDATE SET clause — only update fields that were explicitly passed
-    update_parts = []
-    for col in cols:
-        if col == "username":
-            continue
-        if col == "extra":
-            update_parts.append(f"{col} = EXCLUDED.{col}")
-        else:
-            update_parts.append(f"{col} = EXCLUDED.{col}")
-
-    if not update_parts:
-        # Nothing to update — just ensure the row exists
-        sql = f"""
-            INSERT INTO accounts ({col_str})
-            VALUES ({placeholder_str})
-            ON CONFLICT (username) DO NOTHING
-        """
-    else:
-        update_str = ", ".join(update_parts)
-        sql = f"""
-            INSERT INTO accounts ({col_str})
-            VALUES ({placeholder_str})
-            ON CONFLICT (username) DO UPDATE SET {update_str}
-        """
+    # Build UPDATE SET clause — only update fields that were explicitly passed.
+    update_cols = [c for c in cols if c != "username"]
+    update_set = ", ".join(f"{c} = %s" for c in update_cols)
+    update_vals = [vals[cols.index(c)] for c in update_cols]
 
     with conn.cursor() as cur:
-        cur.execute(sql, vals)
+        # Find any existing row case-insensitively.
+        cur.execute(
+            "SELECT username FROM accounts WHERE LOWER(username) = LOWER(%s) LIMIT 1",
+            (username,),
+        )
+        existing = cur.fetchone()
+
+        if existing:
+            existing_username = str(existing[0])
+            # Normalize key casing in-place so future writes use canonical lowercase.
+            if existing_username != username:
+                cur.execute(
+                    "UPDATE accounts SET username = %s WHERE username = %s",
+                    (username, existing_username),
+                )
+
+            if update_cols:
+                cur.execute(
+                    f"UPDATE accounts SET {update_set} WHERE username = %s",
+                    (*update_vals, username),
+                )
+            return
+
+        # Brand-new account row.
+        cur.execute(
+            f"INSERT INTO accounts ({col_str}) VALUES ({placeholder_str})",
+            vals,
+        )
 
 
 def get_account(conn, username: str) -> dict | None:
@@ -969,6 +977,36 @@ def set_account_last_seen_tweet_at(conn, username: str, seen_at: datetime) -> No
               )
             """,
             ((username or "").strip().lower(), seen_at),
+        )
+
+
+def insert_account_stats_snapshot(
+    conn,
+    *,
+    username: str,
+    follower_count: int | None,
+    following_count: int | None,
+    display_name: str | None = None,
+    bio: str | None = None,
+    source: str = "reply_monitor",
+) -> None:
+    """Persist a point-in-time account stats snapshot for analytics time-series."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO account_stats_history (
+                username, captured_at, follower_count, following_count,
+                display_name, bio, source
+            ) VALUES (%s, now(), %s, %s, %s, %s, %s)
+            """,
+            (
+                (username or "").strip().lower(),
+                follower_count,
+                following_count,
+                display_name,
+                bio,
+                source,
+            ),
         )
 
 
@@ -1922,8 +1960,44 @@ def get_daily_analytics_series(conn, days: int = 30) -> list[dict]:
     now = datetime.now(timezone.utc)
     since = (now - timedelta(days=max(1, days))).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Followers from eval_history (one row/day by schema).
+    # Followers by day from high-frequency account snapshots.
     follower_map: dict[str, dict[str, int | None]] = {}
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            WITH ranked AS (
+              SELECT
+                (captured_at AT TIME ZONE 'UTC')::date AS day,
+                follower_count,
+                ROW_NUMBER() OVER (
+                  PARTITION BY (captured_at AT TIME ZONE 'UTC')::date
+                  ORDER BY captured_at DESC
+                ) AS rn
+              FROM account_stats_history
+              WHERE username = %s
+                AND captured_at >= %s
+                AND follower_count IS NOT NULL
+            )
+            SELECT day, follower_count
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY day ASC
+            """,
+            (ANALYTICS_HANDLE, since),
+        )
+        for row in cur.fetchall():
+            d = dict(row)
+            day = (
+                d["day"].isoformat()
+                if isinstance(d.get("day"), date)
+                else str(d.get("day"))
+            )
+            follower_map[day] = {
+                "followers": int(d.get("follower_count")) if d.get("follower_count") is not None else None,
+                "follower_growth": None,
+            }
+
+    # Backfill missing follower days from eval_history so historical charts remain populated.
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
@@ -1948,10 +2022,21 @@ def get_daily_analytics_series(conn, days: int = 30) -> list[dict]:
                 if isinstance(d.get("eval_date"), date)
                 else str(d.get("eval_date"))
             )
-            follower_map[day] = {
-                "followers": normalized.get("followerCount"),
-                "follower_growth": normalized.get("followerGrowth"),
-            }
+            if day not in follower_map:
+                follower_map[day] = {
+                    "followers": normalized.get("followerCount"),
+                    "follower_growth": normalized.get("followerGrowth"),
+                }
+
+    # Compute follower growth as day-over-day diff using the merged follower map.
+    prev_followers: int | None = None
+    for day_key in sorted(follower_map.keys()):
+        followers = follower_map[day_key].get("followers")
+        if followers is None:
+            continue
+        if prev_followers is not None:
+            follower_map[day_key]["follower_growth"] = int(followers) - int(prev_followers)
+        prev_followers = int(followers)
 
     # Engagement counts by day.
     engagement_map: dict[str, dict[str, int]] = {}
@@ -2250,6 +2335,17 @@ CREATE TABLE IF NOT EXISTS recent_post_log (
     tweet_id      TEXT
 );
 
+CREATE TABLE IF NOT EXISTS account_stats_history (
+    id              BIGSERIAL PRIMARY KEY,
+    username        TEXT NOT NULL,
+    captured_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    follower_count  INTEGER,
+    following_count INTEGER,
+    display_name    TEXT,
+    bio             TEXT,
+    source          TEXT NOT NULL DEFAULT 'reply_monitor'
+);
+
 CREATE TABLE IF NOT EXISTS reply_monitor_seen (
     tweet_id TEXT PRIMARY KEY,
     seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -2313,6 +2409,7 @@ CREATE INDEX IF NOT EXISTS idx_posts_time      ON posts(posted_at DESC);
 CREATE INDEX IF NOT EXISTS idx_search_cache_results_term_ord ON search_cache_results(term, ord);
 CREATE INDEX IF NOT EXISTS idx_content_queue_posted ON content_queue(posted, drafted_at);
 CREATE INDEX IF NOT EXISTS idx_recent_post_log_time ON recent_post_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_account_stats_history_user_time ON account_stats_history(username, captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reply_monitor_seen_time ON reply_monitor_seen(seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_target_monitor_replied_time ON target_monitor_replied(replied_at DESC);
 CREATE INDEX IF NOT EXISTS idx_repair_history_time ON twitter_repair_history(happened_at DESC);
@@ -2733,6 +2830,8 @@ def ensure_schema(conn) -> None:
     merged = _dedupe_accounts_case(conn)
     if merged:
         print(f"Schema maintenance: merged {merged} case-duplicate account row(s)", flush=True)
+    with conn.cursor() as cur:
+        cur.execute("UPDATE accounts SET username = LOWER(username) WHERE username <> LOWER(username)")
     with conn.cursor() as cur:
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_username_lower_unique ON accounts ((LOWER(username)))"

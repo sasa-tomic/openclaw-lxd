@@ -93,9 +93,15 @@ def _summary(rows: list[dict]) -> dict:
     followers = [r.get("followers") for r in rows if r.get("followers") is not None]
     follower_start = followers[0] if followers else None
     follower_end = followers[-1] if followers else None
-    follower_delta = (
+    follower_delta_window = (
         int(follower_end) - int(follower_start)
         if follower_start is not None and follower_end is not None
+        else None
+    )
+    prev_followers = followers[-2] if len(followers) >= 2 else None
+    follower_delta_24h = (
+        int(follower_end) - int(prev_followers)
+        if follower_end is not None and prev_followers is not None
         else None
     )
     return {
@@ -105,7 +111,8 @@ def _summary(rows: list[dict]) -> dict:
         "total_posts": total_posts,
         "follower_start": follower_start,
         "follower_end": follower_end,
-        "follower_delta": follower_delta,
+        "follower_delta_window": follower_delta_window,
+        "follower_delta_24h": follower_delta_24h,
     }
 
 
@@ -138,7 +145,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
                 "Summary: "
                 f"days={summary['days']} "
                 f"followers {summary['follower_start']} -> {summary['follower_end']} "
-                f"(delta={summary['follower_delta']}) "
+                f"(24h_delta={summary['follower_delta_24h']}, window_delta={summary['follower_delta_window']}) "
                 f"replies={summary['total_replies']} likes_only={summary['total_likes_only']} posts={summary['total_posts']}",
                 flush=True,
             )
@@ -158,8 +165,9 @@ def _draw_tui(stdscr, rows: list[dict], days: int) -> None:
 
         s = _summary(rows)
         line1 = (
-            f"Followers: {_fmt_int(s.get('follower_start'))} -> {_fmt_int(s.get('follower_end'))} "
-            f"(delta={_fmt_int(s.get('follower_delta'))})"
+            f"Followers: {_fmt_int(s.get('follower_end'))} "
+            f"(24h Δ={_fmt_int(s.get('follower_delta_24h'))}, "
+            f"window Δ={_fmt_int(s.get('follower_delta_window'))})"
         )
         line2 = (
             f"Replies: {_fmt_int(s.get('total_replies'))}   "

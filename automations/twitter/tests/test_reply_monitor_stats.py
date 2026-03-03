@@ -54,6 +54,7 @@ def test_refresh_own_account_stats_persists_all_fields():
         mock.patch.object(rm, "kv_get", return_value=None),
         mock.patch.object(rm, "get_user_profile", return_value=profile),
         mock.patch.object(rm, "upsert_account") as upsert,
+        mock.patch.object(rm, "insert_account_stats_snapshot") as insert_snapshot,
         mock.patch.object(rm, "kv_set") as kv_set,
         mock.patch.object(rm, "utc_now", return_value="2026-03-03T12:00:00+00:00"),
     ):
@@ -69,6 +70,15 @@ def test_refresh_own_account_stats_persists_all_fields():
         display_name="Decent Cloud",
         bio="p2p cloud",
         following_count=321,
+    )
+    insert_snapshot.assert_called_once_with(
+        conn,
+        username=rm.OUR_HANDLE,
+        follower_count=1234,
+        following_count=321,
+        display_name="Decent Cloud",
+        bio="p2p cloud",
+        source="reply_monitor",
     )
     kv_set.assert_called_once()
 

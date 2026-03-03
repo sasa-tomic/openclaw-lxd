@@ -14,10 +14,11 @@ def test_upsert_account_normalizes_username_to_lowercase():
     cur = mock.MagicMock()
     conn = mock.MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
+    cur.fetchone.return_value = None
 
     db.upsert_account(conn, "DecentCloud_org", follower_count=10)
 
     assert cur.execute.called
-    args, _kwargs = cur.execute.call_args
-    params = args[1]
-    assert params[0] == "decentcloud_org"
+    first_call = cur.execute.call_args_list[0]
+    first_params = first_call.args[1]
+    assert first_params[0] == "decentcloud_org"

@@ -41,6 +41,7 @@ from db import (
     get_engagements_with_user,
     get_our_thread_context,
     get_reply_monitor_seen,
+    insert_account_stats_snapshot,
     prune_profile_cache,
     prune_reply_monitor_seen,
     prune_recent_post_log,
@@ -181,6 +182,15 @@ def maybe_refresh_own_account_stats(conn) -> dict | None:
         display_name=profile.get("displayName"),
         bio=profile.get("bio"),
         following_count=following_int,
+    )
+    insert_account_stats_snapshot(
+        conn,
+        username=OUR_HANDLE,
+        follower_count=follower_int,
+        following_count=following_int,
+        display_name=profile.get("displayName"),
+        bio=profile.get("bio"),
+        source="reply_monitor",
     )
     kv_set(conn, KV_OWN_STATS_REFRESH_AT, utc_now())
     return {
