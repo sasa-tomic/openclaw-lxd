@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
+    "langdetect>=1.0.9",
     "prefect>=3.6.18",
     "psycopg2-binary>=2.9.11",
     "requests>=2.32.5",

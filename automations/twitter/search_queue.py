@@ -32,6 +32,7 @@ sys.path.insert(0, "/projects/automations")
 
 import psycopg2.extras
 
+from engagement_triage import llm_triage_candidates, reach_score
 from db import (
     ensure_schema,
     get_conn,
@@ -83,6 +84,22 @@ def _candidates_for_term(
     return result
 
 
+def _triage_for_queue(candidates: list[dict], top_n: int) -> list[dict]:
+    """Use the same fast LLM triage as engagement flow before queue insert."""
+    if not candidates:
+        return []
+    ranked_pool = sorted(candidates, key=reach_score, reverse=True)
+    keep = min(max(1, int(top_n)), len(ranked_pool))
+    ranked_ids = llm_triage_candidates(ranked_pool, top_n=keep)
+    by_id = {str(c.get("tweet_id")): c for c in ranked_pool}
+    out: list[dict] = []
+    for tid in ranked_ids:
+        c = by_id.get(str(tid))
+        if c is not None:
+            out.append(c)
+    return out[:keep]
+
+
 def cmd_fill(args: argparse.Namespace) -> int:
     print("=== SEARCH QUEUE FILL ===", flush=True)
     print(f"Time: {utc_now()}", flush=True)
@@ -114,6 +131,10 @@ def cmd_fill(args: argparse.Namespace) -> int:
             terms=[term], term_stats=term_stats, bypass_cache=True, since_hours=1, limit=50
         )
         new_candidates = _candidates_for_term(cdp_candidates, engaged_ids, already_queued_ids)
+        if args.triage_top and new_candidates:
+            before = len(new_candidates)
+            new_candidates = _triage_for_queue(new_candidates, top_n=args.triage_top)
+            print(f"    triaged {before} -> {len(new_candidates)}", flush=True)
 
         if new_candidates:
             with get_conn() as conn:
@@ -339,6 +360,13 @@ def main() -> int:
         "--prepare",
         action="store_true",
         help="Run engagement prepare phase after queue fill",
+    )
+    p_fill.add_argument(
+        "--triage-top",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Keep top N per-term via shared LLM triage before queue insert (default: 20)",
     )
 
     # show

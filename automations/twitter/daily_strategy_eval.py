@@ -17,8 +17,11 @@ from __future__ import annotations
 import json
 import sys
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import psycopg2
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
@@ -142,6 +145,7 @@ def _refresh_reply_performances(conn) -> dict:
     candidates = get_engagements_for_perf_refresh(conn)
     checked = 0
     first_checks = 0
+    per_term_perf: dict[str, dict[str, int]] = {}
 
     for eng in candidates:
         reply_id = eng.get("our_reply_id")
@@ -175,15 +179,39 @@ def _refresh_reply_performances(conn) -> dict:
             term = eng.get("search_term")
             if term:
                 zero_perf = 1 if likes == 0 and replies == 0 else 0
+                agg = per_term_perf.setdefault(term, {"likes": 0, "reply_backs": 0, "zero_perf": 0})
+                agg["likes"] += int(likes or 0)
+                agg["reply_backs"] += 1 if got_reply_back else 0
+                agg["zero_perf"] += int(zero_perf)
+
+        checked += 1
+
+    # Apply search-term aggregates in deterministic order with deadlock-safe retries.
+    for term in sorted(per_term_perf):
+        agg = per_term_perf[term]
+        for attempt in range(1, 4):
+            savepoint = f"sp_term_perf_{attempt}"
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"SAVEPOINT {savepoint}")
                 update_search_term_perf(
                     conn,
                     term=term,
-                    likes=likes,
-                    reply_backs=1 if got_reply_back else 0,
-                    zero_perf=zero_perf,
+                    likes=agg["likes"],
+                    reply_backs=agg["reply_backs"],
+                    zero_perf=agg["zero_perf"],
                 )
-
-        checked += 1
+                with conn.cursor() as cur:
+                    cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                break
+            except psycopg2.errors.DeadlockDetected:
+                with conn.cursor() as cur:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                if attempt == 3:
+                    print(f"  search_term_perf deadlock for term '{term}' after retries; skipping", flush=True)
+                    break
+                time.sleep(0.2 * attempt)
 
     rechecked = checked - first_checks
     print(f"  Reply perf refreshed: {first_checks} first-check, {rechecked} re-checked", flush=True)

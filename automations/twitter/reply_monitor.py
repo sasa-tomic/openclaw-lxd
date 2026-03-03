@@ -62,6 +62,7 @@ from twitter_utils import (
     fetch_tweet_context,
     get_user_profile,
     humanize,
+    is_english_text,
     jitter_sleep,
     like_tweet,
     load_project_context,
@@ -639,6 +640,11 @@ def main() -> int:
 
                 if not tid:
                     continue
+                if not is_english_text(text):
+                    print(f"  Skipping non-English mention {tid} (@{author})", flush=True)
+                    mark_mention_seen(conn, seen_mentions, tid)
+                    seen_ids.add(tid)
+                    continue
                 if tid in seen_ids:
                     continue
                 if tid in engaged_ids:
@@ -685,6 +691,9 @@ def main() -> int:
                 tweet_context = fetch_tweet_context(tid)
                 if not tweet_context:
                     print(f"  Failed to fetch context for {tid}", flush=True)
+                    continue
+                if not is_english_text(tweet_context.get("text")):
+                    print(f"  Mention {tid} non-English after context fetch — skipping", flush=True)
                     continue
 
                 # Guard: skip if the tweet itself is ours

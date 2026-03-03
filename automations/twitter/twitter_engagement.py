@@ -32,6 +32,7 @@ from pathlib import Path
 sys.path.insert(0, "/projects/automations")
 from prefect.concurrency.sync import concurrency
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
+from engagement_triage import llm_triage_candidates, reach_score
 from db import (
     ensure_schema,
     get_conn,
@@ -60,6 +61,7 @@ from twitter_utils import (
     follow_user,
     get_user_profile,
     humanize,
+    is_english_text,
     jitter_sleep,
     like_tweet,
     load_project_context,
@@ -566,87 +568,6 @@ def generate_dynamic_keywords(
     return list(new_terms)[:max_terms]
 
 
-def _reach_score(c: dict) -> int:
-    """Simple reach proxy: higher = reply gets more eyeballs.
-
-    Each like implies ~20 impressions; each RT ~50 (amplification to new feeds).
-    We use a simplified ratio: likes × 1 + retweets × 3.
-    Freshness bonus: tweets <30min old get +500, <60min get +200.
-    """
-    base = (c.get("likes") or 0) + (c.get("retweets") or 0) * 3
-    tweet_id = int(c.get("tweetId") or c.get("tweet_id") or 0)
-    if tweet_id:
-        ms = (tweet_id >> 22) + 1288834974657
-        age_min = (_time.time() * 1000 - ms) / 60000
-        if age_min < 30:
-            base += 500
-        elif age_min < 60:
-            base += 200
-    return base
-
-
-def llm_triage_candidates(candidates: list[dict], top_n: int = 15) -> list[str]:
-    """Single LLM call to rank candidates by engagement potential before CDP fetch.
-
-    Takes tweet text + reach stats (no browser fetch needed). Returns a list of
-    tweet IDs in priority order.  Falls back to reach-sort order on any failure.
-    """
-    fallback = [str(c.get("tweetId") or c.get("tweet_id") or "") for c in candidates]
-
-    lines = []
-    id_set: set[str] = set()
-    for i, c in enumerate(candidates, 1):
-        tid = str(c.get("tweetId") or c.get("tweet_id") or "")
-        if not tid:
-            continue
-        id_set.add(tid)
-        text = (c.get("text") or "")[:200].replace("\n", " ")
-        likes = c.get("likes") or 0
-        rts = c.get("retweets") or 0
-        est = likes * 20 + rts * 50
-        lines.append(f'[{i}] ID:{tid} [{likes}L {rts}RT ~{est:,} est.impressions] "{text}"')
-
-    if not lines:
-        return fallback
-
-    prompt = f"""You are triaging Twitter candidates for @DecentCloud_org to reply to.
-
-Strategy: We build a p2p AI-driven marketplace where providers earn reputation that's hard to build and easy to lose, and AI helps users and providers achieve their objectives. Goal: grow follower base by dropping sharp, human-sounding takes in high-visibility threads. Phase 1: no product pitches — just point out the pain.
-
-For each candidate, assess:
-- Reach opportunity (estimated impressions = how many people would see our reply) — this is the primary signal
-- Hook potential: is there a specific fact, stat, or honest observation we could drop that earns likes from people reading this thread?
-- Skip only: accounts with zero followers (no reach benefit)
-
-Candidates (sorted by reach):
-{chr(10).join(lines)}
-
-Return ONLY a JSON array of the top {top_n} tweet IDs, ranked best-first (most worth replying to).
-Include only IDs from the list above.  No explanation, no markdown — just the JSON array.
-Example: ["1234567890", "9876543210"]"""
-
-    try:
-        raw = call_llm(prompt, timeout=60, json_mode=True)
-        if not raw:
-            return fallback[:top_n]
-
-        parsed = extract_json(raw)
-        if not isinstance(parsed, list):
-            return fallback[:top_n]
-
-        ranked = [str(x) for x in parsed if str(x) in id_set]
-        # Append any IDs the LLM omitted so we never lose candidates silently
-        seen = set(ranked)
-        for tid in fallback:
-            if tid not in seen:
-                ranked.append(tid)
-
-        return ranked
-    except Exception as e:
-        print(f"  LLM triage failed ({e}) — using reach-sort fallback", flush=True)
-        return fallback[:top_n]
-
-
 def main() -> int:
     print("=== AUTONOMOUS TWITTER ENGAGEMENT ===", flush=True)
     print(f"Time: {utc_now()}", flush=True)
@@ -733,6 +654,11 @@ def main() -> int:
                     print(f"  Skipping blocked author @{author}", flush=True)
                     discard_ids.append(str(tid))
                     continue
+                if not is_english_text(c.get("text")):
+                    print(f"  Skipping non-English candidate {tid} (@{author})", flush=True)
+                    if tid:
+                        discard_ids.append(str(tid))
+                    continue
                 eligible.append(c)
 
             if using_queue and discard_ids:
@@ -743,7 +669,7 @@ def main() -> int:
                 return 0
 
             # ── Layer 1: reach-sort — highest-visibility tweets first ─────────
-            eligible.sort(key=_reach_score, reverse=True)
+            eligible.sort(key=reach_score, reverse=True)
 
             # ── Layer 2: LLM batch triage — rank top 30, fetch context for all 30 ─
             TRIAGE_POOL = min(len(eligible), 30)
@@ -797,6 +723,9 @@ def main() -> int:
                         print(
                             f"  Skipping {tweet_id} - failed to fetch context", flush=True
                         )
+                        continue
+                    if not is_english_text(tweet_context.get("text")):
+                        print(f"  Skipping {tweet_id} - non-English after context fetch", flush=True)
                         continue
 
                     # Check if this tweet is part of one of our own threads (DB lookup).

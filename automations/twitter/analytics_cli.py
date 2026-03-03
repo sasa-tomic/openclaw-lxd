@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from db import backfill_eval_metrics, get_conn, get_daily_analytics_series
+from db import ANALYTICS_HANDLE, get_account_stats_snapshot_handles
 
 
 def _fmt_int(value) -> str:
@@ -129,6 +130,15 @@ def cmd_backfill(args: argparse.Namespace) -> int:
 
 def cmd_daily(args: argparse.Namespace) -> int:
     with get_conn() as conn:
+        handles = get_account_stats_snapshot_handles(conn, limit=5)
+        if handles and ANALYTICS_HANDLE not in handles:
+            print(
+                "WARNING: analytics handle "
+                f"'{ANALYTICS_HANDLE}' has no snapshots. Available handles: {', '.join(handles)}. "
+                "Set TWITTER_ACCOUNT_USERNAME correctly.",
+                file=sys.stderr,
+                flush=True,
+            )
         rows = get_daily_analytics_series(conn, days=args.days)
 
     if args.last and args.last > 0:
@@ -210,6 +220,15 @@ def _draw_tui(stdscr, rows: list[dict], days: int) -> None:
 
 def cmd_tui(args: argparse.Namespace) -> int:
     with get_conn() as conn:
+        handles = get_account_stats_snapshot_handles(conn, limit=5)
+        if handles and ANALYTICS_HANDLE not in handles:
+            print(
+                "WARNING: analytics handle "
+                f"'{ANALYTICS_HANDLE}' has no snapshots. Available handles: {', '.join(handles)}. "
+                "Set TWITTER_ACCOUNT_USERNAME correctly.",
+                file=sys.stderr,
+                flush=True,
+            )
         rows = get_daily_analytics_series(conn, days=args.days)
     curses.wrapper(_draw_tui, rows, args.days)
     return 0

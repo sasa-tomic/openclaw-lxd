@@ -54,6 +54,7 @@ from twitter_utils import (
     fetch_tweet_context,
     get_user_profile,
     humanize,
+    is_english_text,
     jitter_sleep,
     load_project_context,
     post_reply,
@@ -620,6 +621,9 @@ def process_account(
     tweet_context = fetch_tweet_context(tweet_id)
     if not tweet_context:
         print(f"  @{username}: failed to fetch context for {tweet_id}", flush=True)
+        return False
+    if not is_english_text(tweet_context.get("text")):
+        print(f"  @{username}: non-English tweet {tweet_id} — skipping", flush=True)
         return False
 
     # Enrich with author profile for LLM context

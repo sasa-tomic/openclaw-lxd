@@ -23,6 +23,7 @@ from pathlib import Path
 from email.utils import parsedate_to_datetime as _parse_twitter_date
 from urllib.parse import quote
 from cdp import CDPSession
+from langdetect import DetectorFactory, LangDetectException, detect
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +283,27 @@ SKIP_PATTERNS = [
     r"\$[A-Za-z]{2,10}\b",  # token tickers: $SOL $ETH $RNDR $GPU etc.
 ]
 
+
+DetectorFactory.seed = 0
+_lang_cache: dict[str, bool] = {}
+
+
+def is_english_text(text: str | None) -> bool:
+    """Return True when detected language is English (via langdetect)."""
+    s = (text or "").strip()
+    if not s:
+        return False
+    key = s[:500]
+    cached = _lang_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        is_en = detect(key) == "en"
+    except LangDetectException:
+        is_en = False
+    _lang_cache[key] = is_en
+    return is_en
+
 # ---------------------------------------------------------------------------
 # Search term building blocks — max 3-4 options per clause
 # ---------------------------------------------------------------------------
@@ -379,166 +401,6 @@ def lookup_our_thread(tweet_ids: list[str]) -> str | None:
     except Exception as e:
         logger.debug(f"lookup_our_thread kv lookup failed: {e}")
     return None
-
-
-ENCOUNTERED_THREADS_DIR = Path("/projects/Notes/Pickle/Twitter/encountered")
-
-
-def save_encountered_thread(
-    tweet_context: dict,
-    decision: dict | None,
-    tweet_id: str,
-    search_term: str = "",
-) -> Path | None:
-    """Save a thread we analyzed for later analysis.
-
-    Stores the full conversation context + LLM decision (engaged or not).
-    File: /projects/Notes/Pickle/Twitter/encountered/YYYY-MM-DD-{tweet_id}-@author.md
-    """
-    try:
-        ENCOUNTERED_THREADS_DIR.mkdir(parents=True, exist_ok=True)
-
-        now = datetime.now(timezone.utc)
-        date_str = now.date().isoformat()
-        author = tweet_context.get("author", "unknown")
-        filename = f"{date_str}-{tweet_id}-@{author}.md"
-        path = ENCOUNTERED_THREADS_DIR / filename
-
-        tweet_url = f"{TWITTER_BASE_URL}/{author}/status/{tweet_id}"
-        stats = tweet_context.get("stats", {})
-
-        should_engage = decision.get("shouldEngage", False) if decision else False
-        our_reply = decision.get("reply", "") if decision else ""
-        reasoning = decision.get("reasoning", "") if decision else "No LLM decision"
-
-        engagement_status = "ENGAGED" if should_engage else "SKIPPED"
-
-        profile = tweet_context.get("authorProfile")
-        profile_bio = profile.get("bio", "") if profile else ""
-        profile_followers = profile.get("followersCount", 0) if profile else 0
-
-        lines = [
-            "---",
-            f"date: {date_str}",
-            f"author: @{author}",
-            f'tweetId: "{tweet_id}"',
-            f'url: "{tweet_url}"',
-            f"likes: {stats.get('likes', 0)}",
-            f"retweets: {stats.get('retweets', 0)}",
-            f"replies: {stats.get('replies', 0)}",
-            f"engagement: {engagement_status}",
-            f'searchTerm: "{search_term}"',
-            f"authorFollowers: {profile_followers}",
-            "tags: [twitter, engagement, encountered]",
-            "---",
-            "",
-            f"# @{author}: {tweet_context.get('text', '')[:60]}...",
-            "",
-            f"*Encountered: {date_str} | Status: **{engagement_status}***",
-            "",
-            "---",
-            "",
-            "## Original Tweet",
-            "",
-            f"**@{author}** ({tweet_context.get('authorName', '')})",
-            "",
-            f"> {tweet_context.get('text', '')}",
-            "",
-            f"*Stats: {stats.get('likes', 0)} likes, {stats.get('retweets', 0)} RTs, {stats.get('replies', 0)} replies*",
-            "",
-        ]
-
-        if profile:
-            lines += [
-                "---",
-                "",
-                "## Author Profile",
-                "",
-            ]
-            if profile.get("bio"):
-                lines.append(f"**Bio:** {profile['bio']}")
-                lines.append("")
-            if profile.get("location"):
-                lines.append(f"**Location:** {profile['location']}")
-                lines.append("")
-            if profile.get("followersCount"):
-                lines.append(f"**Followers:** {profile['followersCount']:,}")
-                lines.append("")
-            if profile.get("recentTweets"):
-                lines.append("**Recent tweets:**")
-                lines.append("")
-                for i, t in enumerate(profile["recentTweets"][:5], 1):
-                    lines.append(f"{i}. {t[:150]}")
-                lines.append("")
-
-        if tweet_context.get("parentChain"):
-            lines += [
-                "---",
-                "",
-                "## Conversation Context (tweets above)",
-                "",
-            ]
-            for p in tweet_context["parentChain"]:
-                p_user = p.get("username", "?")
-                p_text = p.get("text", "")
-                lines.append(f"**@{p_user}:**")
-                lines.append(f"> {p_text}")
-                lines.append("")
-
-        if tweet_context.get("threadContinuation"):
-            lines += [
-                "---",
-                "",
-                "## Thread Continuation (author's follow-ups)",
-                "",
-            ]
-            for t in tweet_context["threadContinuation"]:
-                t_text = t.get("text", "") if isinstance(t, dict) else str(t)
-                lines.append(f"> {t_text}")
-                lines.append("")
-
-        if tweet_context.get("otherReplies"):
-            lines += [
-                "---",
-                "",
-                "## Other Replies",
-                "",
-            ]
-            for r in tweet_context["otherReplies"][:5]:
-                r_user = r.get("username", "?")
-                r_text = r.get("text", "")
-                lines.append(f"**@{r_user}:** {r_text}")
-                lines.append("")
-
-        if our_reply:
-            lines += [
-                "---",
-                "",
-                "## Our Reply",
-                "",
-                f"> {our_reply}",
-                "",
-            ]
-
-        lines += [
-            "---",
-            "",
-            "## LLM Decision",
-            "",
-            f"**Should engage:** {should_engage}",
-            "",
-            "### Reasoning",
-            "",
-            reasoning,
-            "",
-        ]
-
-        path.write_text("\n".join(lines))
-        return path
-
-    except Exception as e:
-        print(f"  WARNING: Failed to save encountered thread: {e}", flush=True)
-        return None
 
 
 def send_error_alert(message: str) -> None:

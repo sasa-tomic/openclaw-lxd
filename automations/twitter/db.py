@@ -1010,6 +1010,22 @@ def insert_account_stats_snapshot(
         )
 
 
+def get_account_stats_snapshot_handles(conn, limit: int = 10) -> list[str]:
+    """Return recent usernames present in account_stats_history."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT username
+            FROM account_stats_history
+            GROUP BY username
+            ORDER BY MAX(captured_at) DESC
+            LIMIT %s
+            """,
+            (max(1, int(limit)),),
+        )
+        return [str(r[0]) for r in cur.fetchall()]
+
+
 def increment_engagement_count(conn, username: str) -> None:
     """Increment engagement_count and set last_engaged_at for an account."""
     with conn.cursor() as cur:

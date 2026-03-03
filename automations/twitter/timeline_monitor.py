@@ -47,6 +47,7 @@ from twitter_utils import (
     cdp_tab,
     fetch_tweet_context,
     humanize,
+    is_english_text,
     jitter_sleep,
     load_project_context,
     post_reply,
@@ -526,12 +527,18 @@ def main() -> int:
 
                 print(f"\nProcessing tweet {tid} (@{author})...", flush=True)
                 print(f"  Text: {text[:100]}...", flush=True)
+                if not is_english_text(text):
+                    print(f"  Skipping non-English tweet {tid}", flush=True)
+                    continue
 
                 # Fetch full thread context
                 print("  Fetching tweet context...", flush=True)
                 tweet_context = fetch_tweet_context(tid)
                 if not tweet_context:
                     print(f"  Failed to fetch context for {tid}", flush=True)
+                    continue
+                if not is_english_text(tweet_context.get("text")):
+                    print(f"  Context confirms non-English tweet {tid} — skipping", flush=True)
                     continue
 
                 # Guard: skip our own tweets (scraping can misidentify)
