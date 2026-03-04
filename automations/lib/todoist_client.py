@@ -51,32 +51,52 @@ class TodoistClient:
 
     @classmethod
     def get_tasks(cls, **filters) -> list[dict]:
-        """Get tasks, optionally filtered. Returns list of task dicts."""
+        """Get tasks, optionally filtered. Returns list of task dicts.
+
+        Handles pagination to fetch ALL tasks.
+        """
         if cls.is_rate_limited():
             return []
 
+        all_tasks = []
+        cursor = None
+
         try:
-            resp = requests.get(
-                f"{API_BASE}/tasks",
-                headers=cls._headers(),
-                params=filters,
-                timeout=30,
-            )
+            while True:
+                params = dict(filters)
+                if cursor:
+                    params["cursor"] = cursor
 
-            if resp.status_code == 429:
-                retry = int(resp.headers.get("Retry-After", 60))
-                cls._set_rate_limit(retry)
-                return []
+                resp = requests.get(
+                    f"{API_BASE}/tasks",
+                    headers=cls._headers(),
+                    params=params,
+                    timeout=30,
+                )
 
-            resp.raise_for_status()
-            data = resp.json()
-            # API returns {"results": [...], "next_cursor": ...}
-            if isinstance(data, dict) and "results" in data:
-                return data["results"]
-            return data if isinstance(data, list) else []
+                if resp.status_code == 429:
+                    retry = int(resp.headers.get("Retry-After", 60))
+                    cls._set_rate_limit(retry)
+                    return all_tasks if all_tasks else []
+
+                resp.raise_for_status()
+                data = resp.json()
+
+                if isinstance(data, dict) and "results" in data:
+                    all_tasks.extend(data["results"])
+                    cursor = data.get("next_cursor")
+                    if not cursor:
+                        break
+                elif isinstance(data, list):
+                    all_tasks.extend(data)
+                    break
+                else:
+                    break
+
+            return all_tasks
         except Exception as e:
             logger.error(f"Failed to get tasks: {e}")
-            return []
+            return all_tasks if all_tasks else []
 
     @classmethod
     def create_task(
@@ -193,28 +213,165 @@ class TodoistClient:
         return None
 
     @classmethod
+    def check_duplicate_with_llm(
+        cls, new_task_content: str
+    ) -> tuple[bool, str, list[dict]]:
+        """Use LLM to check if new task is duplicate of existing tasks.
+
+        Returns:
+            (is_duplicate: bool, reasoning: str, duplicate_tasks: list[dict])
+        """
+        from lib.llm_utils import call_llm, extract_json
+        from difflib import SequenceMatcher
+        import json
+
+        tasks = cls.get_tasks()
+        if not tasks:
+            return False, "No existing tasks to compare", []
+
+        new_task_clean = new_task_content.split("[[")[0].strip()
+
+        candidate_tasks = []
+        for task in tasks:
+            task_content = task.get("content", "").split("[[")[0].strip()
+            if len(task_content) < 5:
+                continue
+
+            ratio = SequenceMatcher(
+                None, new_task_clean.lower(), task_content.lower()
+            ).ratio()
+            if ratio >= 0.3:
+                candidate_tasks.append((task, ratio))
+
+        if not candidate_tasks:
+            return False, "No similar tasks found", []
+
+        candidate_tasks.sort(key=lambda x: x[1], reverse=True)
+        top_candidates = candidate_tasks[:10]
+
+        candidates_summary = []
+        for task, score in top_candidates:
+            task_content = task.get("content", "").split("[[")[0].strip()
+            candidates_summary.append(
+                {
+                    "task_id": task.get("id"),
+                    "content": task_content,
+                    "similarity": round(score, 2),
+                }
+            )
+
+        prompt = f"""OBJECTIVE DUPLICATE DETECTION TASK
+
+You are evaluating whether a NEW task is a duplicate of EXISTING tasks.
+
+NEW TASK TO ADD:
+"{new_task_clean}"
+
+SIMILAR EXISTING TASKS (pre-filtered by text similarity):
+{json.dumps(candidates_summary, indent=2)}
+
+INSTRUCTIONS:
+1. Compare the NEW task against each EXISTING task
+2. Determine if they represent the SAME underlying action/commitment
+3. Be OBJECTIVE and STRICT in your evaluation
+
+DEFINITION OF DUPLICATE:
+- Same core action targeting the SAME entity/person (e.g., "Call John" vs "Phone John about project")
+- Same task with minor rewording (e.g., "Fix bug in login" vs "Repair login bug")
+
+NOT A DUPLICATE:
+- Actions involving DIFFERENT people/entities: "Call John" vs "Call Mary" = NOT DUPLICATE
+- Different actions to same person: "Call John" vs "Email John" = NOT DUPLICATE
+- Sequential or related tasks: "Draft report" vs "Review report" = NOT DUPLICATE
+- Same general area but different specifics: "Fix login bug" vs "Fix signup bug" = NOT DUPLICATE
+- Tasks mentioning different people/names = NEVER DUPLICATES
+
+CRITICAL: If tasks mention different names, people, or entities, they are NEVER duplicates!
+
+RESPONSE FORMAT (JSON):
+{{
+  "is_duplicate": true/false,
+  "reasoning": "Brief, objective explanation",
+  "duplicate_task_ids": [list of task_id values that are duplicates, or empty list]
+}}
+
+Be EXTREMELY CONSERVATIVE. When in doubt, return false.
+
+Output ONLY the JSON object."""
+
+        success, response = call_llm(prompt, timeout=60)
+
+        if not success:
+            logger.error(f"LLM duplicate check failed: {response}")
+            return False, f"LLM error: {response}", []
+
+        json_str = extract_json(response)
+        if not json_str:
+            logger.error(f"Failed to extract JSON from LLM response: {response}")
+            return False, "Invalid LLM response format", []
+
+        try:
+            result = json.loads(json_str)
+            is_duplicate = result.get("is_duplicate", False)
+            reasoning = result.get("reasoning", "No reasoning provided")
+            duplicate_ids = result.get("duplicate_task_ids", [])
+
+            duplicate_tasks = [
+                task for task in tasks if task.get("id") in duplicate_ids
+            ]
+
+            logger.info(
+                f"LLM duplicate check: is_duplicate={is_duplicate}, reasoning={reasoning[:100]}"
+            )
+
+            return is_duplicate, reasoning, duplicate_tasks
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse LLM response: {e}")
+            return False, "Failed to parse LLM response", []
+
+    @classmethod
     def get_projects(cls) -> list[dict]:
-        """Get all projects."""
+        """Get all projects. Handles pagination to fetch ALL projects."""
         if cls.is_rate_limited():
             return []
 
+        all_projects = []
+        cursor = None
+
         try:
-            resp = requests.get(
-                f"{API_BASE}/projects",
-                headers=cls._headers(),
-                timeout=30,
-            )
+            while True:
+                params = {}
+                if cursor:
+                    params["cursor"] = cursor
 
-            if resp.status_code == 429:
-                retry = int(resp.headers.get("Retry-After", 60))
-                cls._set_rate_limit(retry)
-                return []
+                resp = requests.get(
+                    f"{API_BASE}/projects",
+                    headers=cls._headers(),
+                    params=params,
+                    timeout=30,
+                )
 
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, dict) and "results" in data:
-                return data["results"]
-            return data if isinstance(data, list) else []
+                if resp.status_code == 429:
+                    retry = int(resp.headers.get("Retry-After", 60))
+                    cls._set_rate_limit(retry)
+                    return all_projects if all_projects else []
+
+                resp.raise_for_status()
+                data = resp.json()
+
+                if isinstance(data, dict) and "results" in data:
+                    all_projects.extend(data["results"])
+                    cursor = data.get("next_cursor")
+                    if not cursor:
+                        break
+                elif isinstance(data, list):
+                    all_projects.extend(data)
+                    break
+                else:
+                    break
+
+            return all_projects
         except Exception as e:
             logger.error(f"Failed to get projects: {e}")
-            return []
+            return all_projects if all_projects else []

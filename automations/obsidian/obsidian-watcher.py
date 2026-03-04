@@ -242,32 +242,27 @@ def add_todoist_task(
     due_date: str | None = None,
     source_file: str | None = None,
 ) -> tuple[bool, str, Optional[str]]:
-    """Add a task to Todoist via REST API. Returns (success, action_taken, task_id)."""
+    """Add a task to Todoist via REST API with LLM-based deduplication.
+
+    Returns (success, action_taken, task_id).
+    """
     global skip_dedup_this_run
 
     if TodoistClient.is_rate_limited():
         return False, "Rate limited", None
 
     try:
-        existing = None
         if not skip_dedup_this_run:
-            existing = TodoistClient.find_similar_task(content)
+            is_duplicate, reasoning, duplicate_tasks = (
+                TodoistClient.check_duplicate_with_llm(content)
+            )
 
-        if existing:
-            task_id = existing["id"]
-            current_priority = existing.get("priority", 4)
-
-            if current_priority <= 2:
-                logger.info(f"Task {task_id} already has priority {current_priority}")
-                return True, "Already prioritized", task_id
-
-            logger.info(f"Bumping task {task_id} priority from {current_priority} to 2")
-
-            if TodoistClient.update_task(task_id, priority=2):
-                logger.info(f"Bumped task {task_id} priority to 2")
-                return True, "Updated existing task", task_id
-            else:
-                return False, "Failed to update", None
+            if is_duplicate and duplicate_tasks:
+                logger.info(f"LLM identified duplicate task: {reasoning}")
+                logger.info(
+                    f"Skipping new task, keeping {len(duplicate_tasks)} existing duplicate(s)"
+                )
+                return True, "Skipped duplicate", duplicate_tasks[0].get("id")
 
         success, task = TodoistClient.create_task(
             content=content,

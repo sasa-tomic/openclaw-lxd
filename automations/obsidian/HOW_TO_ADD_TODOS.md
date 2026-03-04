@@ -43,11 +43,22 @@ Tasks are automatically assigned to projects based on keywords:
 
 ## Deduplication
 
-Before adding a task, the watcher checks existing Todoist tasks:
-- If a **similar task exists**: Updates its priority (bumps importance)
-- If **no similar task**: Adds as new task
+Before adding a task, the watcher uses **LLM-powered intelligent deduplication**:
 
-This prevents duplicate tasks from multiple chat messages or note edits.
+1. **LLM Analysis**: A single LLM call compares the new task against all existing tasks
+2. **Objective Evaluation**: The LLM provides objective reasoning about whether tasks are duplicates
+3. **Smart Handling**:
+   - If **duplicate found**: Skips adding the new task, keeps existing tasks
+   - If **unique**: Adds as new task
+
+This prevents duplicate tasks from:
+- Multiple chat messages about the same action
+- Repeated mentions across different notes
+- Task rewording that means the same thing
+
+The LLM evaluates task equivalence objectively, not just text similarity, so:
+- "Call John" and "Phone John" → **Duplicate** (same action)
+- "Call John" and "Email John" → **Not duplicate** (different actions)
 
 ## Priority Assignment
 
