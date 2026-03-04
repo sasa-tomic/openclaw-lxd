@@ -222,7 +222,6 @@ class TodoistClient:
             (is_duplicate: bool, reasoning: str, duplicate_tasks: list[dict])
         """
         from lib.llm_utils import call_llm, extract_json
-        from difflib import SequenceMatcher
         import json
 
         tasks = cls.get_tasks()
@@ -231,75 +230,26 @@ class TodoistClient:
 
         new_task_clean = new_task_content.split("[[")[0].strip()
 
-        candidate_tasks = []
-        for task in tasks:
+        tasks_summary = []
+        for i, task in enumerate(tasks):
             task_content = task.get("content", "").split("[[")[0].strip()
-            if len(task_content) < 5:
-                continue
+            if len(task_content) > 3:
+                tasks_summary.append(
+                    {"idx": i, "task_id": task.get("id"), "content": task_content}
+                )
 
-            ratio = SequenceMatcher(
-                None, new_task_clean.lower(), task_content.lower()
-            ).ratio()
-            if ratio >= 0.3:
-                candidate_tasks.append((task, ratio))
+        prompt = f"""Is the NEW task a duplicate of any EXISTING task? Tasks with DIFFERENT names/people are NEVER duplicates.
 
-        if not candidate_tasks:
-            return False, "No similar tasks found", []
+NEW TASK: "{new_task_clean}"
 
-        candidate_tasks.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = candidate_tasks[:10]
+EXISTING TASKS:
+{json.dumps(tasks_summary, indent=2)}
 
-        candidates_summary = []
-        for task, score in top_candidates:
-            task_content = task.get("content", "").split("[[")[0].strip()
-            candidates_summary.append(
-                {
-                    "task_id": task.get("id"),
-                    "content": task_content,
-                    "similarity": round(score, 2),
-                }
-            )
+Return JSON: {{"is_duplicate": true/false, "reasoning": "why", "duplicate_task_ids": ["id1", ...]}}
 
-        prompt = f"""OBJECTIVE DUPLICATE DETECTION TASK
+Be conservative - when in doubt, return false."""
 
-You are evaluating whether a NEW task is a duplicate of EXISTING tasks.
-
-NEW TASK TO ADD:
-"{new_task_clean}"
-
-SIMILAR EXISTING TASKS (pre-filtered by text similarity):
-{json.dumps(candidates_summary, indent=2)}
-
-INSTRUCTIONS:
-1. Compare the NEW task against each EXISTING task
-2. Determine if they represent the SAME underlying action/commitment
-3. Be OBJECTIVE and STRICT in your evaluation
-
-DEFINITION OF DUPLICATE:
-- Same core action targeting the SAME entity/person (e.g., "Call John" vs "Phone John about project")
-- Same task with minor rewording (e.g., "Fix bug in login" vs "Repair login bug")
-
-NOT A DUPLICATE:
-- Actions involving DIFFERENT people/entities: "Call John" vs "Call Mary" = NOT DUPLICATE
-- Different actions to same person: "Call John" vs "Email John" = NOT DUPLICATE
-- Sequential or related tasks: "Draft report" vs "Review report" = NOT DUPLICATE
-- Same general area but different specifics: "Fix login bug" vs "Fix signup bug" = NOT DUPLICATE
-- Tasks mentioning different people/names = NEVER DUPLICATES
-
-CRITICAL: If tasks mention different names, people, or entities, they are NEVER duplicates!
-
-RESPONSE FORMAT (JSON):
-{{
-  "is_duplicate": true/false,
-  "reasoning": "Brief, objective explanation",
-  "duplicate_task_ids": [list of task_id values that are duplicates, or empty list]
-}}
-
-Be EXTREMELY CONSERVATIVE. When in doubt, return false.
-
-Output ONLY the JSON object."""
-
-        success, response = call_llm(prompt, timeout=60)
+        success, response = call_llm(prompt, timeout=120, json_mode=True)
 
         if not success:
             logger.error(f"LLM duplicate check failed: {response}")
@@ -308,10 +258,15 @@ Output ONLY the JSON object."""
         json_str = extract_json(response)
         if not json_str:
             logger.error(f"Failed to extract JSON from LLM response: {response}")
-            return False, "Invalid LLM response format", []
+            return False, f"Invalid LLM response format: {response[:200]}", []
 
         try:
             result = json.loads(json_str)
+
+            if not isinstance(result, dict):
+                logger.error(f"LLM returned non-dict response: {type(result)}")
+                return False, f"Invalid response type: {type(result)}", []
+
             is_duplicate = result.get("is_duplicate", False)
             reasoning = result.get("reasoning", "No reasoning provided")
             duplicate_ids = result.get("duplicate_task_ids", [])

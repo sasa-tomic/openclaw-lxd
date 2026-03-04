@@ -3,7 +3,6 @@
 
 Provides a consistent interface for LLM calls across the codebase with:
 - Direct API support (OpenAI-compatible)
-- opencode CLI fallback
 - Retry logic with exponential backoff on rate limits
 """
 
@@ -12,14 +11,19 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 import requests
 
-from lib.config import OPENCODE_BIN
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path.home() / ".openclaw" / ".env")
+except ImportError:
+    pass
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
@@ -31,8 +35,17 @@ def validate_llm_config() -> None:
     """Validate LLM configuration. Call at startup if LLM is needed."""
     if not OPENAI_API_KEY:
         raise ValueError(
-            "OPENAI_API_KEY environment variable not set. "
-            "Set it with: export OPENAI_API_KEY='your-key'"
+            "OPENAI_API_KEY not set. Set it in ~/.openclaw/.env or environment variable"
+        )
+    if not OPENAI_BASE_URL:
+        raise ValueError(
+            "OPENAI_BASE_URL not set. "
+            "Set it in ~/.openclaw/.env or environment variable"
+        )
+    if not OPENAI_BASE_URL:
+        raise ValueError(
+            "OPENAI_BASE_URL not set. "
+            "Set it in ~/.openclaw/.env or environment variable"
         )
 
 
@@ -97,10 +110,11 @@ def call_llm(
 
     Args:
         prompt: The text prompt to send to the LLM
-        max_retries: Maximum retry attempts per model (default 3)
+        max_retries: Maximum retry attempts per model (default 4)
         timeout: Request timeout in seconds (default 120)
         model: Override primary model (uses OPENAI_MODEL env var if not set)
         fallback_model: Optional fallback model if primary fails
+        json_mode: Force JSON response format (default False)
 
     Returns:
         Tuple of (success: bool, response: str)
@@ -113,12 +127,10 @@ def call_llm(
     fb_model = fallback_model or os.environ.get("OPENAI_FALLBACK_MODEL", "")
 
     if not (api_key and base_url):
-        print(
-            "LLM: No direct API credentials; using opencode CLI fallback",
-            file=sys.stderr,
-            flush=True,
+        return (
+            False,
+            "OPENAI_API_KEY and OPENAI_BASE_URL must be set in ~/.openclaw/.env or environment",
         )
-        return _call_llm_via_opencode(prompt, timeout)
 
     models_to_try: list[tuple[str, str]] = [(primary_model, "primary")]
     if fb_model and fb_model != primary_model:
@@ -146,8 +158,11 @@ def call_llm(
                         "model": model_name,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.7,
-                        "max_tokens": 2000,
-                        **({"response_format": {"type": "json_object"}} if json_mode else {}),
+                        **(
+                            {"response_format": {"type": "json_object"}}
+                            if json_mode
+                            else {}
+                        ),
                     },
                     timeout=timeout,
                 )
@@ -228,43 +243,9 @@ def _extract_response_content(response: requests.Response) -> str | None:
         return None
 
 
-def _call_llm_via_opencode(prompt: str, timeout: int) -> tuple[bool, str]:
-    """Fallback LLM call via opencode CLI."""
-    if not os.path.exists(OPENCODE_BIN):
-        return (False, f"opencode not found at {OPENCODE_BIN}")
-
-    try:
-        env = os.environ.copy()
-        env["NO_COLOR"] = "1"
-        env["TERM"] = "dumb"
-
-        result = subprocess.run(
-            [OPENCODE_BIN, "run", prompt],
-            capture_output=True,
-            text=True,
-            timeout=timeout + 20,
-            env=env,
-        )
-
-        if result.returncode != 0:
-            error_msg = (
-                result.stderr.strip()[:300] if result.stderr else "Unknown error"
-            )
-            return (False, f"opencode failed (exit {result.returncode}): {error_msg}")
-
-        output = result.stdout.strip()
-        if not output:
-            return (False, "opencode returned empty response")
-
-        return (True, output)
-
-    except subprocess.TimeoutExpired:
-        return (False, f"opencode timed out after {timeout + 20}s")
-    except Exception as e:
-        return (False, f"opencode call failed: {e}")
-
-
-def call_llm_simple(prompt: str, timeout: int = 120, json_mode: bool = False) -> str | None:
+def call_llm_simple(
+    prompt: str, timeout: int = 120, json_mode: bool = False
+) -> str | None:
     """Simple LLM call returning just the response string (for backward compatibility).
 
     Deprecated: Use call_llm() instead for better error handling.
@@ -276,5 +257,7 @@ def call_llm_simple(prompt: str, timeout: int = 120, json_mode: bool = False) ->
     Returns:
         Response text on success, None on failure
     """
-    success, response = call_llm(prompt, max_retries=4, timeout=timeout, json_mode=json_mode)
+    success, response = call_llm(
+        prompt, max_retries=4, timeout=timeout, json_mode=json_mode
+    )
     return response if success else None

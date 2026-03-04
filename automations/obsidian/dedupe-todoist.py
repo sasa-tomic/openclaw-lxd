@@ -52,67 +52,8 @@ def score_task_for_keeping(task: dict, projects_by_id: dict) -> tuple:
     return (has_project, has_due, has_labels, has_description, priority, created)
 
 
-def find_candidate_duplicates(
-    tasks: list[dict], threshold: float = 0.4
-) -> list[list[int]]:
-    """Quick text-based pre-filter to find candidate duplicates.
-
-    Returns groups of task indices that have SOME similarity.
-    """
-    from difflib import SequenceMatcher
-
-    candidates = []
-
-    for i, task1 in enumerate(tasks):
-        for j, task2 in enumerate(tasks[i + 1 :], start=i + 1):
-            content1 = task1.get("content", "").split("[[")[0].strip().lower()
-            content2 = task2.get("content", "").split("[[")[0].strip().lower()
-
-            if len(content1) < 10 or len(content2) < 10:
-                continue
-
-            ratio = SequenceMatcher(None, content1, content2).ratio()
-
-            if ratio >= threshold:
-                candidates.append([i, j, ratio])
-
-    groups = []
-    used = set()
-
-    for i, j, ratio in sorted(candidates, key=lambda x: x[2], reverse=True):
-        if i in used or j in used:
-            continue
-
-        group = [i, j]
-        used.add(i)
-        used.add(j)
-
-        for k in range(len(tasks)):
-            if k in used:
-                continue
-            content_k = tasks[k].get("content", "").split("[[")[0].strip().lower()
-
-            is_similar = False
-            for idx in group:
-                content_idx = (
-                    tasks[idx].get("content", "").split("[[")[0].strip().lower()
-                )
-                if SequenceMatcher(None, content_k, content_idx).ratio() >= threshold:
-                    is_similar = True
-                    break
-
-            if is_similar:
-                group.append(k)
-                used.add(k)
-
-        if len(group) >= 2:
-            groups.append(group)
-
-    return groups
-
-
 def identify_duplicate_groups(tasks: list[dict]) -> list[list[dict]]:
-    """Use LLM to confirm which candidate groups are actual duplicates."""
+    """Use LLM to identify groups of duplicate tasks."""
 
     print(f"\n{'=' * 70}")
     print("ALL TASKS BEING ANALYZED:")
@@ -122,89 +63,61 @@ def identify_duplicate_groups(tasks: list[dict]) -> list[list[dict]]:
         print(f"{i:3d}: {content}")
     print("=" * 70)
 
-    print("\nFinding candidate duplicates (text similarity)...")
-    candidate_groups = find_candidate_duplicates(tasks)
+    tasks_summary = []
+    for i, task in enumerate(tasks):
+        content = task.get("content", "").split("[[")[0].strip()
+        if len(content) > 3:
+            tasks_summary.append({"idx": i, "content": content})
 
-    if not candidate_groups:
-        print("No candidate duplicates found")
+    if not tasks_summary:
         return []
 
-    print(f"Found {len(candidate_groups)} candidate groups to verify with LLM")
+    prompt = f"""Find duplicate tasks. Tasks with DIFFERENT names/people are NEVER duplicates.
 
-    confirmed_groups = []
-
-    for group_indices in candidate_groups:
-        group_tasks = [tasks[i] for i in group_indices]
-
-        tasks_summary = []
-        for i, idx in enumerate(group_indices):
-            content = tasks[idx].get("content", "").split("[[")[0].strip()
-            tasks_summary.append({"idx": i, "original_idx": idx, "content": content})
-
-        prompt = f"""DUPLICATE TASK VERIFICATION
-
-You are verifying if these tasks are TRUE DUPLICATES or just similar.
-
-CANDIDATE TASKS:
+TASKS:
 {json.dumps(tasks_summary, indent=2)}
 
-INSTRUCTIONS:
-1. Determine if these tasks represent the SAME underlying action/commitment
-2. Be EXTREMELY OBJECTIVE and STRICT
-3. Pay attention to ALL details: names, dates, specifics matter
+Return JSON: {{"groups": [[idx1, idx2], [idx3, idx4]]}}
 
-DEFINITION OF DUPLICATE:
-- Same core action targeting the SAME entity/person (e.g., "Call John" vs "Phone John about project")
-- Same task with minor rewording (e.g., "Fix login bug" vs "Repair login bug")
+Only include groups with 2+ tasks. Be conservative - when in doubt, don't group."""
 
-NOT DUPLICATES (BE VERY CAREFUL):
-- Actions involving DIFFERENT people/entities: "Call John" vs "Call Mary" = NOT DUPLICATE
-- Different actions to same person: "Call John" vs "Email John" = NOT DUPLICATE
-- Sequential or related tasks: "Draft report" vs "Review report" = NOT DUPLICATE
-- Same general area but different specifics: "Fix login bug" vs "Fix signup bug" = NOT DUPLICATE
-- Tasks mentioning different people/names = NEVER DUPLICATES
+    print("\nAnalyzing with LLM...")
+    success, response = call_llm(prompt, timeout=180, json_mode=True)
 
-CRITICAL: If tasks mention different names, people, or entities, they are NEVER duplicates!
+    if not success:
+        print(f"ERROR: LLM call failed: {response}")
+        return []
 
-RESPONSE FORMAT (JSON):
-{{
-  "are_duplicates": true/false,
-  "reasoning": "Brief explanation"
-}}
+    json_str = extract_json(response)
+    if not json_str:
+        print(f"ERROR: Failed to extract JSON from response")
+        print(f"Response was:\n{response}")
+        return []
 
-Be EXTREMELY CONSERVATIVE. When in doubt, return false.
+    try:
+        result = json.loads(json_str)
 
-Output ONLY the JSON object."""
+        # Handle both {"groups": [...]} and direct [...] formats
+        if isinstance(result, list):
+            groups = result
+        elif isinstance(result, dict):
+            groups = result.get("groups", [])
+        else:
+            print(f"ERROR: Unexpected JSON type: {type(result)}")
+            return []
 
-        success, response = call_llm(prompt, timeout=60)
+        duplicate_groups = []
+        for group_indices in groups:
+            if len(group_indices) >= 2:
+                group_tasks = [tasks[i] for i in group_indices if i < len(tasks)]
+                if len(group_tasks) >= 2:
+                    duplicate_groups.append(group_tasks)
 
-        if not success:
-            print(f"WARNING: LLM call failed for group, skipping: {response}")
-            continue
+        return duplicate_groups
 
-        json_str = extract_json(response)
-        if not json_str:
-            print(f"WARNING: Failed to extract JSON, skipping group")
-            continue
-
-        try:
-            result = json.loads(json_str)
-            are_duplicates = result.get("are_duplicates", False)
-            reasoning = result.get("reasoning", "")
-
-            if are_duplicates:
-                print(
-                    f"✓ Confirmed duplicate group: {len(group_tasks)} tasks - {reasoning[:50]}"
-                )
-                confirmed_groups.append(group_tasks)
-            else:
-                print(f"✗ Not duplicates: {reasoning[:50]}")
-
-        except json.JSONDecodeError as e:
-            print(f"WARNING: Failed to parse JSON, skipping group: {e}")
-            continue
-
-    return confirmed_groups
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Failed to parse JSON: {e}")
+        return []
 
 
 def merge_task_info(
@@ -251,80 +164,101 @@ def merge_task_info(
     return updates
 
 
-def preview_cleanup(duplicate_groups: list[list[dict]], projects_by_id: dict) -> bool:
-    """Show preview of what will be done. Returns True if user confirms."""
-
-    print("\n" + "=" * 70)
-    print("DUPLICATE CLEANUP PREVIEW")
-    print("=" * 70)
-
-    total_duplicates = 0
-
-    for i, group in enumerate(duplicate_groups, 1):
-        print(f"\n--- Group {i} ({len(group)} tasks) ---")
-
-        sorted_tasks = sorted(
-            group, key=lambda t: score_task_for_keeping(t, projects_by_id), reverse=True
-        )
-        keep_task = sorted_tasks[0]
-        mark_done = sorted_tasks[1:]
-
-        keep_project = get_project_name(keep_task, projects_by_id)
-        print(f"\n✅ KEEP: {keep_task['content'][:280]}")
-        print(f"   Project: {keep_project}")
-        print(f"   ID: {keep_task['id']}")
-
-        print(f"\n❌ MARK DONE ({len(mark_done)} tasks):")
-        for task in mark_done:
-            project = get_project_name(task, projects_by_id)
-            print(f"   • {task['content'][:280]} [{project}]")
-
-        total_duplicates += len(mark_done)
-
-    print("\n" + "=" * 70)
-    print(f"SUMMARY:")
-    print(f"  Duplicate groups: {len(duplicate_groups)}")
-    print(f"  Tasks to mark done: {total_duplicates}")
-    print(f"  Tasks to keep: {len(duplicate_groups)}")
-    print("=" * 70)
-
-    response = input("\nProceed with cleanup? [y/N]: ").strip().lower()
-    return response == "y"
-
-
-def run_cleanup(
+def interactive_cleanup(
     duplicate_groups: list[list[dict]], projects_by_id: dict, dry_run: bool = False
 ):
-    """Execute the cleanup."""
+    """Interactive cleanup - ask for each duplicate group."""
+
+    print("\n" + "=" * 70)
+    print("INTERACTIVE DUPLICATE CLEANUP")
+    print("=" * 70)
 
     total_marked_done = 0
     total_updated = 0
 
     for i, group in enumerate(duplicate_groups, 1):
+        print(f"\n{'=' * 70}")
+        print(f"GROUP {i}/{len(duplicate_groups)} - {len(group)} duplicate tasks")
+        print("=" * 70)
+
         sorted_tasks = sorted(
             group, key=lambda t: score_task_for_keeping(t, projects_by_id), reverse=True
         )
-        keep_task = sorted_tasks[0]
-        mark_done = sorted_tasks[1:]
 
-        updates = merge_task_info(keep_task, mark_done, projects_by_id)
+        for j, task in enumerate(sorted_tasks, 1):
+            project = get_project_name(task, projects_by_id)
+            print(f"\n[{j}] {task['content'][:280]}")
+            print(f"    Project: {project}")
+            print(f"    ID: {task['id']}")
 
-        if updates and not dry_run:
-            if TodoistClient.update_task(keep_task["id"], **updates):
-                print(f"✅ Updated kept task {keep_task['id']}")
-                total_updated += 1
+        print(f"\nOptions:")
+        print(f"  1-{len(sorted_tasks)}  - Keep only this task, mark others done")
+        print(f"  a     - Keep all (no changes) [default]")
+        print(f"  s     - Skip this group")
 
-        for task in mark_done:
-            if dry_run:
-                print(f"[DRY-RUN] Would mark done: {task['id']}")
-            else:
-                if TodoistClient.complete_task(task["id"]):
-                    print(f"❌ Marked done: {task['id']} - {task['content'][:40]}")
-                    total_marked_done += 1
+        while True:
+            try:
+                response = input(f"\nYour choice [a]: ").strip().lower()
 
-    print(f"\n{'[DRY-RUN] ' if dry_run else ''}Cleanup complete!")
-    print(f"  Marked done: {total_marked_done}")
-    print(f"  Updated: {total_updated}")
+                if not response or response == "a":
+                    print("Keeping all tasks in this group")
+                    break
+                elif response == "s":
+                    print("Skipping this group")
+                    break
+                elif response.isdigit():
+                    choice = int(response)
+                    if 1 <= choice <= len(sorted_tasks):
+                        keep_task = sorted_tasks[choice - 1]
+                        mark_done = [
+                            t for k, t in enumerate(sorted_tasks) if k != choice - 1
+                        ]
+
+                        print(
+                            f"\n✅ Will keep: [{choice}] {keep_task['content'][:60]}..."
+                        )
+                        print(f"❌ Will mark done: {len(mark_done)} task(s)")
+
+                        if not dry_run:
+                            updates = merge_task_info(
+                                keep_task, mark_done, projects_by_id
+                            )
+
+                            if updates:
+                                if TodoistClient.update_task(
+                                    keep_task["id"], **updates
+                                ):
+                                    print(f"   Updated kept task")
+                                    total_updated += 1
+
+                            for task in mark_done:
+                                if TodoistClient.complete_task(task["id"]):
+                                    print(f"   Marked done: {task['content'][:50]}...")
+                                    total_marked_done += 1
+                        else:
+                            print(
+                                f"   [DRY-RUN] Would mark done {len(mark_done)} task(s)"
+                            )
+
+                        break
+                    else:
+                        print(f"Please enter 1-{len(sorted_tasks)}, 'a', or 's'")
+                else:
+                    print(f"Please enter 1-{len(sorted_tasks)}, 'a', or 's'")
+            except (ValueError, KeyboardInterrupt):
+                print("\nKeeping all tasks in this group")
+                break
+
+    print("\n" + "=" * 70)
+    print("CLEANUP COMPLETE")
+    print("=" * 70)
+    print(f"Groups processed: {len(duplicate_groups)}")
+    if not dry_run:
+        print(f"Tasks marked done: {total_marked_done}")
+        print(f"Tasks updated: {total_updated}")
+    else:
+        print("[DRY-RUN MODE - No changes made]")
+    print("=" * 70)
 
 
 def main():
@@ -334,7 +268,6 @@ def main():
     parser.add_argument(
         "--dry-run", action="store_true", help="Preview only, don't make changes"
     )
-    parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
     args = parser.parse_args()
 
     print("Fetching tasks from Todoist...")
@@ -357,6 +290,15 @@ def main():
     if not duplicate_groups:
         print("\n✅ No duplicates found!")
         return 0
+
+    print(f"\nFound {len(duplicate_groups)} duplicate groups")
+
+    if args.dry_run:
+        print("\n[DRY-RUN MODE - No changes will be made]")
+
+    interactive_cleanup(duplicate_groups, projects_by_id, dry_run=args.dry_run)
+
+    return 0
 
     print(f"\nFound {len(duplicate_groups)} duplicate groups")
 
