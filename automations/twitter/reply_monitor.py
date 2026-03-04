@@ -795,7 +795,10 @@ def main() -> int:
 
                 # Auto-follow the author (skip for likes — save that for replies)
                 if engagement_type != "like":
-                    auto_follow_after_engagement(conn, author, tid)
+                    follow_source = "mention" if not is_direct_reply else "direct_reply"
+                    auto_follow_after_engagement(
+                        conn, author, tid, source=follow_source
+                    )
 
                 # Insert engagement record
                 source = "mention" if not is_direct_reply else "direct_reply"

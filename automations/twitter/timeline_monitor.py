@@ -599,7 +599,7 @@ def main() -> int:
                     print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
 
                 # Auto-follow the author
-                auto_follow_after_engagement(conn, author, tid)
+                auto_follow_after_engagement(conn, author, tid, source="timeline")
 
                 # Insert engagement record
                 insert_engagement(

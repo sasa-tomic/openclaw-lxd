@@ -734,7 +734,9 @@ def main() -> int:
 
                     # Auto-follow the author after confirmed engagement
                     if engagement_type != "like":
-                        auto_follow_after_engagement(conn, author, tweet_id)
+                        auto_follow_after_engagement(
+                            conn, author, tweet_id, source=engagement_source
+                        )
 
                     # Insert engagement into DB
                     stats = tweet_context.get("stats", {})

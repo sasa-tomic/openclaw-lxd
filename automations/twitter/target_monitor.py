@@ -673,7 +673,7 @@ def process_account(
         print(f"  Captured ourReplyId: {our_reply_id}", flush=True)
 
     # Auto-follow after engagement
-    auto_follow_after_engagement(conn, username, tweet_id)
+    auto_follow_after_engagement(conn, username, tweet_id, source="target_monitor")
 
     tweet_url = latest.get("href") or f"https://x.com/{username}/status/{tweet_id}"
 

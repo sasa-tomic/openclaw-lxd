@@ -21,8 +21,11 @@ import json
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import psycopg2
 
 sys.path.insert(0, str(Path(__file__).parent.parent))  # /projects/automations (for lib.*)
 sys.path.insert(0, str(Path(__file__).parent))          # /projects/automations/twitter (for db, twitter_utils)
@@ -74,6 +77,98 @@ def has_product_mention(text: str) -> bool:
         if re.search(pattern, text, re.IGNORECASE):
             return True
     return False
+
+
+def _try_parse_json_payload(raw: str) -> object | None:
+    """Parse JSON from raw model output, tolerating code fences and wrappers."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Extract first balanced JSON array
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "[":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "]":
+            if depth:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidate = text[start : i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except (json.JSONDecodeError, TypeError):
+                        start = None
+                        continue
+
+    # Extract first balanced JSON object
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidate = text[start : i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except (json.JSONDecodeError, TypeError):
+                        start = None
+                        continue
+    return None
+
+
+def _looks_like_meta_response(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return (
+        t.startswith("let me ")
+        or t.startswith("here are ")
+        or t.startswith("generate ")
+        or t.startswith("write ")
+        or t.startswith("draft ")
+        or t.startswith("output ")
+        or "analyze the requirements" in t
+        or "project & strategy context" in t
+        or "format a" in t
+        or "format b" in t
+        or "json array" in t
+        or "each must be a different topic and angle" in t
+        or "your task" in t
+        or "rules for all posts" in t
+        or "output only" in t
+        or "recent posts — avoid repeating these angles" in t
+        or "avoid repeating recent post angles" in t
+        or "follow the voice and style guidelines" in t
+        or "topics should align with the content mix" in t
+        or "recent posts to avoid" in t
+        or "guidelines" in t
+        or t.endswith(":")
+    )
+
+
+def _is_valid_candidate_text(text: str) -> bool:
+    t = (text or "").strip()
+    return 20 <= len(t) <= 280 and not _looks_like_meta_response(t)
 
 
 def load_queue(conn) -> list[dict]:
@@ -132,35 +227,68 @@ Score each candidate from 0 to 10:
 Judge on: specificity of the claim, strength of the tension or insight, how much it forces a reaction.
 Do NOT reward safe takes. Reward posts where a senior engineer has a genuine opinion either way.
 
-Output ONLY a JSON array — one object per candidate, in the same order:
-[{{"id": "C1", "score": 8, "reason": "one short sentence"}}, ...]"""
+Return ONLY valid JSON matching this exact schema:
+{{
+  "rankings": [
+    {{"id": "C1", "score": 8, "reason": "one short sentence"}}
+  ]
+}}
+
+Hard requirements:
+- `rankings` length must be exactly {len(candidates)}
+- Include each candidate id exactly once: C1..C{len(candidates)}
+- `score` must be a number in [0, 10]
+- No markdown, no prose, no extra keys at top level"""
 
     try:
-        raw = call_llm(prompt, timeout=60)
+        raw = call_llm(prompt, timeout=60, json_mode=True)
         if not raw:
             print("LLM ranking returned nothing, using original order", file=sys.stderr)
             return candidates
 
-        json_str = extract_json(raw)
-        if not json_str:
-            # Try finding a JSON array directly
-            import re as _re
-            m = _re.search(r'\[.*\]', raw, _re.DOTALL)
-            json_str = m.group(0) if m else None
-        if not json_str:
+        payload = _try_parse_json_payload(raw)
+        if payload is None:
+            json_str = extract_json(raw)
+            if json_str:
+                payload = _try_parse_json_payload(json_str)
+
+        rankings = None
+        if isinstance(payload, dict):
+            rankings = payload.get("rankings")
+        elif isinstance(payload, list):
+            rankings = payload
+        if not isinstance(rankings, list):
             print("Could not parse LLM ranking response, using original order", file=sys.stderr)
             return candidates
 
-        scores = json.loads(json_str)
-        score_map = {s["id"]: s["score"] for s in scores if "id" in s and "score" in s}
+        expected_ids = [f"C{i+1}" for i in range(len(candidates))]
+        by_id: dict[str, dict] = {}
+        for item in rankings:
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("id", "")).strip()
+            score_raw = item.get("score")
+            try:
+                score = float(score_raw)
+            except (TypeError, ValueError):
+                continue
+            if cid not in expected_ids:
+                continue
+            by_id[cid] = {
+                "score": max(0.0, min(10.0, score)),
+                "reason": str(item.get("reason", "")).strip(),
+            }
+
+        if len(by_id) != len(expected_ids):
+            print("Incomplete/invalid LLM ranking response, using original order", file=sys.stderr)
+            return candidates
 
         for i, c in enumerate(candidates):
             label = f"C{i+1}"
-            c["llm_score"] = score_map.get(label, 0)
-            if label in score_map:
-                reason = next((s.get("reason", "") for s in scores if s.get("id") == label), "")
-                if reason:
-                    print(f"  {label} (score={c['llm_score']}): {reason}", flush=True)
+            c["llm_score"] = by_id[label]["score"]
+            reason = by_id[label]["reason"]
+            if reason:
+                print(f"  {label} (score={c['llm_score']}): {reason}", flush=True)
 
         ranked = sorted(candidates, key=lambda c: c.get("llm_score", 0), reverse=True)
         return ranked
@@ -307,75 +435,16 @@ Output as JSON array of 4 strings: ["post1", "post2", "post3", "post4"]
 Output ONLY the JSON array. No explanation, no markdown wrapping."""
 
     try:
-        raw = call_llm(prompt, timeout=120)
+        raw = call_llm(prompt, timeout=120, json_mode=True)
         if not raw:
             print("LLM returned nothing for batch draft", file=sys.stderr)
             return []
 
-        # Try to extract JSON array from the response
-        raw = raw.strip()
-        # Strip markdown fences
-        if raw.startswith("```json"):
-            raw = raw[7:]
-        if raw.startswith("```"):
-            raw = raw[3:]
-        if raw.endswith("```"):
-            raw = raw[:-3]
-        raw = raw.strip()
-
-        # Try direct parse as array
-        tweets = None
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                tweets = parsed
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        # Fallback: try extract_json (finds objects), then look for array
-        if tweets is None:
-            # Try to find a JSON array in the text
-            bracket_depth = 0
-            start = None
-            for i, ch in enumerate(raw):
-                if ch == "[":
-                    if bracket_depth == 0:
-                        start = i
-                    bracket_depth += 1
-                elif ch == "]":
-                    bracket_depth -= 1
-                    if bracket_depth == 0 and start is not None:
-                        candidate = raw[start : i + 1]
-                        try:
-                            parsed = json.loads(candidate)
-                            if isinstance(parsed, list):
-                                tweets = parsed
-                                break
-                        except (json.JSONDecodeError, ValueError):
-                            start = None
-                            continue
-
-        # Fallback: parse as numbered/line-separated plain text
-        if not tweets or not isinstance(tweets, list):
-            lines = raw.split("\n")
-            text_tweets = []
-            for line in lines:
-                line = line.strip()
-                # Strip numbering like "1.", "1)", "1:", "- "
-                line = re.sub(r"^[\d]+[.):\-]\s*", "", line).strip()
-                line = re.sub(r"^[-•]\s*", "", line).strip()
-                # Strip surrounding quotes
-                line = line.strip('"').strip("'").strip("`")
-                if line and 20 <= len(line) <= 280:
-                    text_tweets.append(line)
-            if text_tweets:
-                tweets = text_tweets
-                print(
-                    f"Parsed {len(tweets)} tweets from plain text response", flush=True
-                )
-            else:
-                print(f"Failed to parse batch draft: {raw[:200]}", file=sys.stderr)
-                return []
+        payload = _try_parse_json_payload(raw)
+        tweets = payload if isinstance(payload, list) else None
+        if not tweets:
+            print(f"Failed to parse batch draft JSON: {raw[:200]}", file=sys.stderr)
+            return []
 
         now = datetime.now(timezone.utc).isoformat()
         entries = []
@@ -387,6 +456,9 @@ Output ONLY the JSON array. No explanation, no markdown wrapping."""
             text = re.sub(r"^\([^)]{3,30}\)\s*", "", text).strip()
             if not text or len(text) < 20:
                 print(f"Batch draft rejected: too short ({len(text)} chars)", file=sys.stderr)
+                continue
+            if _looks_like_meta_response(text):
+                print(f"Batch draft rejected: meta response: {text[:80]}", file=sys.stderr)
                 continue
             if has_product_mention(text):
                 print(
@@ -573,6 +645,14 @@ def main() -> int:
                 print(f"Pruned {pruned} old posted queue entries", flush=True)
             queue = load_queue(conn)
             unposted = [entry for entry in queue if not entry.get("posted")]
+            invalid = [e for e in unposted if not _is_valid_candidate_text(e.get("text", ""))]
+            if invalid:
+                print(f"Ignoring {len(invalid)} invalid queued draft(s)", flush=True)
+                now = datetime.now(timezone.utc)
+                for entry in invalid:
+                    if entry.get("id") is not None:
+                        mark_content_queue_posted(conn, int(entry["id"]), now)
+            unposted = [e for e in unposted if _is_valid_candidate_text(e.get("text", ""))]
             print(f"Queue: {len(queue)} total, {len(unposted)} unposted", flush=True)
 
             # If <3 unposted entries, draft a batch (keep buffer ahead of 5/day demand)
@@ -584,6 +664,7 @@ def main() -> int:
                     print(f"Inserted {inserted} drafted entries into queue", flush=True)
                     queue = load_queue(conn)
                     unposted = [entry for entry in queue if not entry.get("posted")]
+                    unposted = [e for e in unposted if _is_valid_candidate_text(e.get("text", ""))]
                     print(f"Queue after batch: {len(unposted)} unposted", flush=True)
                 else:
                     # Fallback: draft a single tweet (more reliable with GLM-5)
@@ -593,6 +674,7 @@ def main() -> int:
                         insert_content_queue_entries(conn, [single])
                         queue = load_queue(conn)
                         unposted = [entry for entry in queue if not entry.get("posted")]
+                        unposted = [e for e in unposted if _is_valid_candidate_text(e.get("text", ""))]
                         print(
                             f"Queue after single draft: {len(unposted)} unposted",
                             flush=True,
@@ -605,11 +687,15 @@ def main() -> int:
                 print("No tweets available in queue")
                 return 1
 
-            # Rank all unposted candidates with a single LLM call
+            # Rank a bounded candidate set to keep ranking prompt reliably parseable.
+            rank_pool = unposted[:20]
             top_posts = get_top_posts(conn, limit=20)
-            print(f"Ranking {len(unposted)} candidates against {len(top_posts)} top posts...", flush=True)
-            ranked = llm_rank_candidates(unposted, top_posts)
-            best = ranked[0]
+            print(f"Ranking {len(rank_pool)} candidates against {len(top_posts)} top posts...", flush=True)
+            ranked = llm_rank_candidates(rank_pool, top_posts)
+            best = next((c for c in ranked if _is_valid_candidate_text(c.get("text", ""))), None)
+            if best is None:
+                print("No valid candidate text after ranking", flush=True)
+                return 1
             draft = best["text"]
             print(
                 f"Selected (llm_score={best.get('llm_score', '?')}): {draft[:80]}...", flush=True
@@ -640,13 +726,22 @@ def main() -> int:
             jitter_sleep(6, 12)
             tweet_id = get_latest_own_tweet_id("DecentCloud_org")
 
-            # Insert into posts table
-            insert_post(
-                conn,
-                tweet_id=tweet_id or f"unknown-{utc_now()}",
-                type="post",
-                text=draft,
-            )
+            # Insert into posts table with deadlock retry.
+            for attempt in range(1, 4):
+                try:
+                    insert_post(
+                        conn,
+                        tweet_id=tweet_id or f"unknown-{utc_now()}",
+                        type="post",
+                        text=draft,
+                    )
+                    break
+                except psycopg2.errors.DeadlockDetected:
+                    if attempt == 3:
+                        raise
+                    wait = 0.8 * attempt
+                    print(f"insert_post deadlock; retrying in {wait:.1f}s (attempt {attempt}/3)", flush=True)
+                    time.sleep(wait)
             print(f"Logged post to DB (tweet_id={tweet_id})", flush=True)
 
         return 0

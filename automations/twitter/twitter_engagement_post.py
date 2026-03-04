@@ -217,7 +217,9 @@ def main() -> int:
                     continue
 
                 if engagement_type != "like":
-                    auto_follow_after_engagement(None, author, tweet_id)
+                    auto_follow_after_engagement(
+                        None, author, tweet_id, source=engagement_source
+                    )
 
                 stats = tweet_context.get("stats", {})
                 with get_conn() as conn:

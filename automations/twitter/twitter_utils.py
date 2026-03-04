@@ -30,9 +30,14 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.config import TWITTER_BASE_URL  # noqa: E402
 from db import (  # noqa: E402
+    TWITTER_ACCOUNT_USERNAME,
+    get_account,
     get_conn,
     get_cached_search_results,
     get_profile_cache,
+    is_followed,
+    set_followed,
+    upsert_account,
     get_thread_index_map,
     get_thread_note_path,
     store_search_cache_results,
@@ -722,46 +727,78 @@ def post_tweet(text: str) -> bool:
 
     Flow: navigate to compose → find textbox → type → click Post.
     """
-    try:
-        with cdp_tab() as cdp:
-            compose_url = f"{TWITTER_BASE_URL}/compose/post"
-            print("  CDP: navigating to compose...", flush=True)
-            if not cdp.navigate(compose_url, wait_sec=2):
-                return False
-            TEXTAREA = '[data-testid="tweetTextarea_0"]'
-            POST_BTN = '[data-testid="tweetButton"]'
-            if not cdp.wait_for(TEXTAREA, timeout=10):
-                print("  CDP: compose textbox not found", flush=True)
-                return False
-            # Verify the compose modal loaded (not the home-page sidebar widget,
-            # which also has tweetTextarea_0 but uses tweetButtonInline, not tweetButton).
-            if not cdp.wait_for(POST_BTN, timeout=8):
-                print("  CDP: compose Post button not found — modal may not have loaded", flush=True)
-                return False
-            print(f"  CDP: typing tweet...", flush=True)
-            if not cdp.type_text(TEXTAREA, text):
-                print("  CDP: typing failed", flush=True)
-                return False
-            time.sleep(0.5)
-            print(f"  CDP: clicking Post...", flush=True)
-            if not cdp.click(POST_BTN):
-                print("  CDP: Post button click failed", flush=True)
-                return False
-            # Poll up to 8s for compose to close (textarea gone or empty)
-            deadline = time.time() + 8
-            while time.time() < deadline:
-                still_text = cdp.evaluate(
-                    f"document.querySelector({json.dumps(TEXTAREA)})?.textContent?.trim()"
+    compose_urls = [
+        f"{TWITTER_BASE_URL}/compose/post",
+        f"{TWITTER_BASE_URL}/home",
+        f"{TWITTER_BASE_URL}/compose/tweet",
+    ]
+    textarea_selectors = [
+        '[data-testid="tweetTextarea_0"]',
+        'div[role="textbox"][data-testid="tweetTextarea_0"]',
+        'div[role="textbox"][contenteditable="true"]',
+    ]
+    post_button_selectors = [
+        '[data-testid="tweetButton"]',
+        '[data-testid="tweetButtonInline"]',
+        '[data-testid="tweetButton"] button',
+    ]
+
+    # Use a fresh CDP tab per attempt; stale tabs are a common reason for missing composer DOM.
+    for attempt_no, compose_url in enumerate(compose_urls, 1):
+        try:
+            with cdp_tab() as cdp:
+                print(f"  CDP: navigating to compose (attempt {attempt_no})...", flush=True)
+                if not cdp.navigate(compose_url, wait_sec=2):
+                    continue
+
+                # Fast check for auth/session page; avoids wasting the full selector waits.
+                login_gate = cdp.evaluate(
+                    "document.querySelector('a[href*=\"/login\"], [data-testid=\"loginButton\"]') !== null"
                 )
-                if not still_text:
-                    print("  CDP: tweet posted successfully", flush=True)
-                    return True
-                time.sleep(1)
-            print("  CDP: post may have failed (compose still open)", flush=True)
-            return False
-    except Exception as e:
-        logger.warning(f"post_tweet CDP failed: {e}")
-        return False
+                if login_gate:
+                    print("  CDP: login gate detected; cannot post", flush=True)
+                    continue
+
+                textarea = next(
+                    (s for s in textarea_selectors if cdp.wait_for(s, timeout=8)),
+                    None,
+                )
+                post_btn = next(
+                    (s for s in post_button_selectors if cdp.wait_for(s, timeout=6)),
+                    None,
+                )
+                if not textarea:
+                    print("  CDP: compose textbox not found", flush=True)
+                    continue
+                if not post_btn:
+                    print("  CDP: compose Post button not found — trying recovery", flush=True)
+                    continue
+
+                cdp.click(textarea)
+                print("  CDP: typing tweet...", flush=True)
+                if not cdp.type_text(textarea, text):
+                    print("  CDP: typing failed", flush=True)
+                    continue
+                time.sleep(0.5)
+                print("  CDP: clicking Post...", flush=True)
+                if not cdp.click(post_btn):
+                    print("  CDP: Post button click failed", flush=True)
+                    continue
+
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    still_text = cdp.evaluate(
+                        f"document.querySelector({json.dumps(textarea)})?.textContent?.trim()"
+                    )
+                    if not still_text:
+                        print("  CDP: tweet posted successfully", flush=True)
+                        return True
+                    time.sleep(1)
+                print("  CDP: post may have failed (compose still open)", flush=True)
+        except Exception as e:
+            logger.warning(f"post_tweet CDP attempt {attempt_no} failed: {e}")
+
+    return False
 
 
 def _extract_graphql_tweet_node(node: dict) -> dict | None:
@@ -1990,17 +2027,38 @@ def get_tweet_stats(tweet_id: str) -> dict | None:
         return None
 
 
-def auto_follow_after_engagement(conn, username: str, tweet_id: str) -> bool:
+def auto_follow_after_engagement(
+    conn,
+    username: str,
+    tweet_id: str,
+    *,
+    source: str | None = None,
+) -> bool:
     """Follow a user after engaging with their tweet. Returns True if followed.
 
     The function intentionally uses short-lived DB connections so callers do not
     hold transactions open during slow browser follow actions.
     """
-    from db import get_conn, is_followed, set_followed, upsert_account
-
     # Skip our own account
-    if username.lower() == "decentcloud_org":
+    if username.lower() == TWITTER_ACCOUNT_USERNAME.lower():
         return False
+
+    # Root-cause fix: only follow for high-intent contexts, not every non-like
+    # engagement. This keeps following growth tied to relationship quality.
+    with get_conn() as db_conn:
+        acct = get_account(db_conn, username) or {}
+        stage = (acct.get("stage") or "").lower()
+        follows_us_back = bool(acct.get("follows_us_back"))
+        reply_back_count = int(acct.get("reply_back_count") or 0)
+
+        high_intent_sources = {"target_monitor", "direct_reply"}
+        warm_relationship = stage in {"warm", "follower"} or follows_us_back or reply_back_count > 0
+        if (source or "").lower() not in high_intent_sources and not warm_relationship:
+            print(
+                f"  Auto-follow skipped for @{username}: low-intent source={source or 'unknown'}",
+                flush=True,
+            )
+            return False
 
     # Check DB: already followed?
     with get_conn() as db_conn:
