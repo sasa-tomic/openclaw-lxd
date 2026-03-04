@@ -27,8 +27,12 @@ from pathlib import Path
 
 import psycopg2
 
-sys.path.insert(0, str(Path(__file__).parent.parent))  # /projects/automations (for lib.*)
-sys.path.insert(0, str(Path(__file__).parent))          # /projects/automations/twitter (for db, twitter_utils)
+sys.path.insert(
+    0, str(Path(__file__).parent.parent)
+)  # /projects/automations (for lib.*)
+sys.path.insert(
+    0, str(Path(__file__).parent)
+)  # /projects/automations/twitter (for db, twitter_utils)
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from twitter_utils import (
     ensure_browser_ready,
@@ -199,7 +203,7 @@ def llm_rank_candidates(candidates: list[dict], top_posts: list[dict]) -> list[d
     # Format candidates with IDs
     candidate_lines = []
     for i, c in enumerate(candidates):
-        label = f"C{i+1}"
+        label = f"C{i + 1}"
         text = (c.get("text") or "").replace("\n", " ")
         candidate_lines.append(f"[{label}] {text}")
     candidates_text = "\n\n".join(candidate_lines)
@@ -258,10 +262,13 @@ Hard requirements:
         elif isinstance(payload, list):
             rankings = payload
         if not isinstance(rankings, list):
-            print("Could not parse LLM ranking response, using original order", file=sys.stderr)
+            print(
+                "Could not parse LLM ranking response, using original order",
+                file=sys.stderr,
+            )
             return candidates
 
-        expected_ids = [f"C{i+1}" for i in range(len(candidates))]
+        expected_ids = [f"C{i + 1}" for i in range(len(candidates))]
         by_id: dict[str, dict] = {}
         for item in rankings:
             if not isinstance(item, dict):
@@ -280,11 +287,14 @@ Hard requirements:
             }
 
         if len(by_id) != len(expected_ids):
-            print("Incomplete/invalid LLM ranking response, using original order", file=sys.stderr)
+            print(
+                "Incomplete/invalid LLM ranking response, using original order",
+                file=sys.stderr,
+            )
             return candidates
 
         for i, c in enumerate(candidates):
-            label = f"C{i+1}"
+            label = f"C{i + 1}"
             c["llm_score"] = by_id[label]["score"]
             reason = by_id[label]["reason"]
             if reason:
@@ -341,7 +351,9 @@ def draft_batch(conn) -> list[dict]:
     engagement_themes = _get_engagement_themes(recent_engagements_db, n=15)
 
     # Build top-posts style anchor (only include entries with real engagement data)
-    top_posts_with_stats = [p for p in top_posts_db if (p.get("likes") or 0) + (p.get("rts") or 0) > 0]
+    top_posts_with_stats = [
+        p for p in top_posts_db if (p.get("likes") or 0) + (p.get("rts") or 0) > 0
+    ]
     top_posts_section = ""
     if top_posts_with_stats:
         lines = []
@@ -350,7 +362,10 @@ def draft_batch(conn) -> list[dict]:
             rts = p.get("rts") or 0
             text = (p.get("text") or "").replace("\n", " ")
             lines.append(f"  [{likes}L {rts}RT] {text}")
-        top_posts_section = "\n## Posts that got the most engagement — write in this style and voice:\n" + "\n".join(lines)
+        top_posts_section = (
+            "\n## Posts that got the most engagement — write in this style and voice:\n"
+            + "\n".join(lines)
+        )
 
     # Build popular candidate tweets section (trending topics in our target space)
     popular_candidates_section = ""
@@ -455,10 +470,15 @@ Output ONLY the JSON array. No explanation, no markdown wrapping."""
             # Strip LLM categorization prefixes like "(Observation/DR)", "(Technical insight)", etc.
             text = re.sub(r"^\([^)]{3,30}\)\s*", "", text).strip()
             if not text or len(text) < 20:
-                print(f"Batch draft rejected: too short ({len(text)} chars)", file=sys.stderr)
+                print(
+                    f"Batch draft rejected: too short ({len(text)} chars)",
+                    file=sys.stderr,
+                )
                 continue
             if _looks_like_meta_response(text):
-                print(f"Batch draft rejected: meta response: {text[:80]}", file=sys.stderr)
+                print(
+                    f"Batch draft rejected: meta response: {text[:80]}", file=sys.stderr
+                )
                 continue
             if has_product_mention(text):
                 print(
@@ -497,7 +517,9 @@ def draft_single(conn) -> dict | None:
     engagement_themes = _get_engagement_themes(recent_engagements_db, n=10)
     research = load_morning_research(conn)
 
-    top_posts_with_stats = [p for p in top_posts_db if (p.get("likes") or 0) + (p.get("rts") or 0) > 0]
+    top_posts_with_stats = [
+        p for p in top_posts_db if (p.get("likes") or 0) + (p.get("rts") or 0) > 0
+    ]
     top_posts_section = ""
     if top_posts_with_stats:
         lines = []
@@ -506,7 +528,11 @@ def draft_single(conn) -> dict | None:
             rts = p.get("rts") or 0
             text = (p.get("text") or "").replace("\n", " ")
             lines.append(f"  [{likes}L {rts}RT] {text}")
-        top_posts_section = "\n## Posts that got the most engagement — write in this style and voice:\n" + "\n".join(lines) + "\n"
+        top_posts_section = (
+            "\n## Posts that got the most engagement — write in this style and voice:\n"
+            + "\n".join(lines)
+            + "\n"
+        )
 
     popular_candidates_section = ""
     if popular_candidates_db:
@@ -569,36 +595,27 @@ A realistic scenario with no obvious correct answer. Forces the reader to pick a
 - ALWAYS capitalize the first word. Standard sentence capitalization: proper nouns (AWS, GCP, Stripe, etc.) capitalized, everything else normal case. BAD: "everyone claims..." GOOD: "Everyone claims..."
 - No hashtags, no links, no product mentions, no "Decent Cloud" references
 
-Output ONLY the post text. No quotes, no JSON, no markdown."""
+Output as JSON object: {{"post": "your tweet text here"}}
+Output ONLY the JSON object. No markdown, no explanation."""
 
     try:
-        text = call_llm(prompt, timeout=120)
+        raw = call_llm(prompt, timeout=120, json_mode=True)
+        if not raw:
+            return None
+
+        payload = _try_parse_json_payload(raw)
+        if isinstance(payload, dict):
+            text = payload.get("post", "")
+        elif isinstance(payload, str):
+            text = payload
+        else:
+            text = ""
+
         if not text:
             return None
 
-        text = text.strip().strip('"').strip("'").strip("`")
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-        # Strip categorization prefixes
+        text = text.strip().strip('"').strip("'")
         text = re.sub(r"^\([^)]{3,30}\)\s*", "", text).strip()
-        # If multi-line, take the best substantive line (LLM thinking before answer)
-        if "\n" in text:
-            lines = [l.strip() for l in text.split("\n") if l.strip()]
-            # Find the best candidate line (longest line that looks like a tweet)
-            candidates = [
-                l
-                for l in lines
-                if len(l) >= 20
-                and not l.startswith("*")
-                and not l.startswith("#")
-            ]
-            if candidates:
-                text = max(candidates, key=len)
-            elif lines:
-                text = lines[-1]
 
         if not text or len(text) < 20:
             return None
@@ -608,7 +625,7 @@ Output ONLY the post text. No quotes, no JSON, no markdown."""
         return {
             "text": text,
             "draftedAt": datetime.now(timezone.utc).isoformat(),
-            "llm_score": 0,  # set at selection time by llm_rank_candidates()
+            "llm_score": 0,
             "posted": False,
         }
     except Exception as e:
@@ -645,14 +662,18 @@ def main() -> int:
                 print(f"Pruned {pruned} old posted queue entries", flush=True)
             queue = load_queue(conn)
             unposted = [entry for entry in queue if not entry.get("posted")]
-            invalid = [e for e in unposted if not _is_valid_candidate_text(e.get("text", ""))]
+            invalid = [
+                e for e in unposted if not _is_valid_candidate_text(e.get("text", ""))
+            ]
             if invalid:
                 print(f"Ignoring {len(invalid)} invalid queued draft(s)", flush=True)
                 now = datetime.now(timezone.utc)
                 for entry in invalid:
                     if entry.get("id") is not None:
                         mark_content_queue_posted(conn, int(entry["id"]), now)
-            unposted = [e for e in unposted if _is_valid_candidate_text(e.get("text", ""))]
+            unposted = [
+                e for e in unposted if _is_valid_candidate_text(e.get("text", ""))
+            ]
             print(f"Queue: {len(queue)} total, {len(unposted)} unposted", flush=True)
 
             # If <3 unposted entries, draft a batch (keep buffer ahead of 5/day demand)
@@ -664,7 +685,11 @@ def main() -> int:
                     print(f"Inserted {inserted} drafted entries into queue", flush=True)
                     queue = load_queue(conn)
                     unposted = [entry for entry in queue if not entry.get("posted")]
-                    unposted = [e for e in unposted if _is_valid_candidate_text(e.get("text", ""))]
+                    unposted = [
+                        e
+                        for e in unposted
+                        if _is_valid_candidate_text(e.get("text", ""))
+                    ]
                     print(f"Queue after batch: {len(unposted)} unposted", flush=True)
                 else:
                     # Fallback: draft a single tweet (more reliable with GLM-5)
@@ -674,7 +699,11 @@ def main() -> int:
                         insert_content_queue_entries(conn, [single])
                         queue = load_queue(conn)
                         unposted = [entry for entry in queue if not entry.get("posted")]
-                        unposted = [e for e in unposted if _is_valid_candidate_text(e.get("text", ""))]
+                        unposted = [
+                            e
+                            for e in unposted
+                            if _is_valid_candidate_text(e.get("text", ""))
+                        ]
                         print(
                             f"Queue after single draft: {len(unposted)} unposted",
                             flush=True,
@@ -690,15 +719,21 @@ def main() -> int:
             # Rank a bounded candidate set to keep ranking prompt reliably parseable.
             rank_pool = unposted[:20]
             top_posts = get_top_posts(conn, limit=20)
-            print(f"Ranking {len(rank_pool)} candidates against {len(top_posts)} top posts...", flush=True)
+            print(
+                f"Ranking {len(rank_pool)} candidates against {len(top_posts)} top posts...",
+                flush=True,
+            )
             ranked = llm_rank_candidates(rank_pool, top_posts)
-            best = next((c for c in ranked if _is_valid_candidate_text(c.get("text", ""))), None)
+            best = next(
+                (c for c in ranked if _is_valid_candidate_text(c.get("text", ""))), None
+            )
             if best is None:
                 print("No valid candidate text after ranking", flush=True)
                 return 1
             draft = best["text"]
             print(
-                f"Selected (llm_score={best.get('llm_score', '?')}): {draft[:80]}...", flush=True
+                f"Selected (llm_score={best.get('llm_score', '?')}): {draft[:80]}...",
+                flush=True,
             )
 
             # Humanize (mandatory per strategy doc)
@@ -706,7 +741,9 @@ def main() -> int:
                 draft = humanize(draft)
                 print(f"Humanized: {draft[:80]}...", flush=True)
             except Exception as e:
-                print(f"Humanize error: {e}, proceeding with original draft", flush=True)
+                print(
+                    f"Humanize error: {e}, proceeding with original draft", flush=True
+                )
 
             # Post
             print("Posting via browser CDP...", flush=True)
@@ -719,10 +756,13 @@ def main() -> int:
 
             # Mark as posted in queue
             if best.get("id") is not None:
-                mark_content_queue_posted(conn, int(best["id"]), datetime.now(timezone.utc))
+                mark_content_queue_posted(
+                    conn, int(best["id"]), datetime.now(timezone.utc)
+                )
 
             # Get the tweet ID from our profile for tracking
             from twitter_utils import jitter_sleep
+
             jitter_sleep(6, 12)
             tweet_id = get_latest_own_tweet_id("DecentCloud_org")
 
@@ -740,7 +780,10 @@ def main() -> int:
                     if attempt == 3:
                         raise
                     wait = 0.8 * attempt
-                    print(f"insert_post deadlock; retrying in {wait:.1f}s (attempt {attempt}/3)", flush=True)
+                    print(
+                        f"insert_post deadlock; retrying in {wait:.1f}s (attempt {attempt}/3)",
+                        flush=True,
+                    )
                     time.sleep(wait)
             print(f"Logged post to DB (tweet_id={tweet_id})", flush=True)
 
