@@ -51,6 +51,7 @@ from db import (
 )
 from twitter_utils import (
     auto_follow_after_engagement,
+    capture_failure_artifact,
     cdp_tab,
     fetch_tweet_context,
     get_user_profile,
@@ -663,8 +664,17 @@ def process_account(
         tweet_id, reply_text, attempts=1, retry_delay_sec=5, our_username=TWITTER_ACCOUNT_USERNAME
     )
     if not posted:
-        send_error_alert(
-            f"Target monitor: failed to post reply to {tweet_id} (@{username})"
+        print(
+            f"  @{username}: reply failed for {tweet_id}",
+            flush=True,
+        )
+        capture_failure_artifact(
+            flow="target_monitor",
+            tweet_id=str(tweet_id),
+            author=username,
+            source="target_monitor",
+            reason="reply_post_failed",
+            extra={"reply_text": reply_text},
         )
         return False
 

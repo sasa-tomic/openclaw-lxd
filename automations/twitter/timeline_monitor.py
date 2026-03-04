@@ -45,6 +45,7 @@ from db import (
 from twitter_utils import (
     BLOCKED_AUTHORS,
     auto_follow_after_engagement,
+    capture_failure_artifact,
     cdp_tab,
     fetch_tweet_context,
     humanize,
@@ -589,8 +590,17 @@ def main() -> int:
                     tid, reply_text, attempts=1, retry_delay_sec=5, our_username=OUR_HANDLE
                 )
                 if not posted:
-                    send_error_alert(
-                        f"Timeline monitor: failed to post reply to {tid} (@{author})"
+                    print(
+                        f"  Reply failed for {tid} (@{author})",
+                        flush=True,
+                    )
+                    capture_failure_artifact(
+                        flow="timeline_monitor",
+                        tweet_id=str(tid),
+                        author=author,
+                        source="timeline",
+                        reason="reply_post_failed",
+                        extra={"reply_text": reply_text},
                     )
                     continue
 

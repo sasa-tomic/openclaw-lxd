@@ -58,6 +58,7 @@ from db import (
 from twitter_utils import (
     BLOCKED_AUTHORS,
     auto_follow_after_engagement,
+    capture_failure_artifact,
     cdp_tab,
     check_follows_back,
     fetch_tweet_context,
@@ -772,11 +773,23 @@ def main() -> int:
                     if not posted:
                         post_failure_streak += 1
                         save_post_failure_streak(conn, post_failure_streak)
-                        send_error_alert(
-                            "Reply monitor: failed to post reply to "
+                        print(
+                            "  Reply failed for "
                             f"{tid} (@{author}) "
                             f"[streak {post_failure_streak}/"
-                            f"{MAX_POST_FAILURE_STREAK_BEFORE_FAIL}]"
+                            f"{MAX_POST_FAILURE_STREAK_BEFORE_FAIL}]",
+                            flush=True,
+                        )
+                        capture_failure_artifact(
+                            flow="reply_monitor",
+                            tweet_id=str(tid),
+                            author=author,
+                            source="direct_reply" if is_direct_reply else "mention",
+                            reason="reply_post_failed",
+                            extra={
+                                "failure_streak": post_failure_streak,
+                                "reply_text": reply_text,
+                            },
                         )
                         if post_failure_streak >= MAX_POST_FAILURE_STREAK_BEFORE_FAIL:
                             raise RuntimeError(

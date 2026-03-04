@@ -8,6 +8,7 @@ All Twitter interactions go through Chrome CDP via CDPSession (direct WebSocket)
 from __future__ import annotations
 
 import contextlib
+import base64
 import fcntl
 import json
 import logging
@@ -51,6 +52,7 @@ HUMANIZE_SCRIPT = Path("/projects/automations/text/humanize.py")
 
 CDP_LOCK_PATH = Path("/tmp/twitter-cdp.lock")
 CDP_LOCK_TIMEOUT = 300  # seconds
+DEBUG_ARTIFACTS_DIR = Path(__file__).resolve().parent / "debug_artifacts"
 
 
 
@@ -430,6 +432,59 @@ def send_error_alert(message: str) -> None:
             )
     except Exception as e:
         print(f"  WARNING: Telegram alert failed: {e}", flush=True)
+
+
+def capture_failure_artifact(
+    *,
+    flow: str,
+    tweet_id: str | None = None,
+    author: str | None = None,
+    source: str | None = None,
+    reason: str | None = None,
+    extra: dict | None = None,
+) -> Path | None:
+    """Write a local debug artifact (JSON + best-effort screenshot)."""
+    try:
+        DEBUG_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+        safe_flow = re.sub(r"[^a-zA-Z0-9_.-]+", "_", (flow or "unknown").strip())
+        flow_dir = DEBUG_ARTIFACTS_DIR / safe_flow
+        flow_dir.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y%m%dT%H%M%SZ")
+        safe_tid = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(tweet_id or "no_tweet"))
+        base = flow_dir / f"{ts}_{safe_tid}"
+
+        payload: dict[str, object] = {
+            "created_at": now.isoformat(),
+            "flow": flow,
+            "tweet_id": tweet_id,
+            "author": author,
+            "source": source,
+            "reason": reason,
+            "extra": extra or {},
+        }
+
+        try:
+            with cdp_tab(timeout=20) as cdp:
+                payload["page_url"] = cdp.evaluate("location.href")
+                payload["page_title"] = cdp.evaluate("document.title")
+                shot = cdp.send("Page.captureScreenshot", {"format": "png"}, timeout=15)
+                b64 = ((shot or {}).get("result") or {}).get("data")
+                if b64:
+                    png_path = base.with_suffix(".png")
+                    png_path.write_bytes(base64.b64decode(b64))
+                    payload["screenshot_path"] = str(png_path)
+        except Exception as e:
+            payload["screenshot_error"] = str(e)
+
+        json_path = base.with_suffix(".json")
+        json_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2))
+        print(f"  Wrote debug artifact: {json_path}", flush=True)
+        return json_path
+    except Exception as e:
+        print(f"  Failed to write debug artifact: {e}", flush=True)
+        return None
 
 
 def is_junk(text: str) -> bool:

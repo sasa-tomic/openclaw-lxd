@@ -53,6 +53,7 @@ from db import (
 from twitter_utils import (
     BLOCKED_AUTHORS,
     auto_follow_after_engagement,
+    capture_failure_artifact,
     fetch_tweet_context,
     get_user_profile,
     humanize,
@@ -701,7 +702,19 @@ def main() -> int:
                             our_username=TWITTER_ACCOUNT_USERNAME,
                         )
                         if not posted:
-                            send_error_alert(f"Failed to quote-tweet {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
+                            print(
+                                f"  Quote failed after {MAX_REPLY_ATTEMPTS} attempts: "
+                                f"{tweet_id} (@{author})",
+                                flush=True,
+                            )
+                            capture_failure_artifact(
+                                flow="twitter_engagement",
+                                tweet_id=str(tweet_id),
+                                author=author,
+                                source="quote",
+                                reason=f"quote_post_failed_after_{MAX_REPLY_ATTEMPTS}_attempts",
+                                extra={"reply_text": reply_text},
+                            )
                             continue
                         engagement_source = "quote"
                     else:  # "reply"
@@ -722,7 +735,19 @@ def main() -> int:
                             our_username=TWITTER_ACCOUNT_USERNAME,
                         )
                         if not posted:
-                            send_error_alert(f"Failed to post reply to {tweet_id} (@{author}) after {MAX_REPLY_ATTEMPTS} attempts")
+                            print(
+                                f"  Reply failed after {MAX_REPLY_ATTEMPTS} attempts: "
+                                f"{tweet_id} (@{author})",
+                                flush=True,
+                            )
+                            capture_failure_artifact(
+                                flow="twitter_engagement",
+                                tweet_id=str(tweet_id),
+                                author=author,
+                                source="reply",
+                                reason=f"reply_post_failed_after_{MAX_REPLY_ATTEMPTS}_attempts",
+                                extra={"reply_text": reply_text},
+                            )
                             continue
 
                     if not posted:

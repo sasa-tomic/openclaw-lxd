@@ -9,3 +9,5 @@ chrome-openclaw/
 **/_debug/
 **/__pycache__/
 worktrees/
+twitter/debug_artifacts/
+twitter/debug_artifacts/**

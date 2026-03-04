@@ -25,6 +25,7 @@ from db import (
 )
 from twitter_utils import (
     auto_follow_after_engagement,
+    capture_failure_artifact,
     humanize,
     jitter_sleep,
     like_tweet,
@@ -183,7 +184,15 @@ def main() -> int:
                                 _time.sleep(5)
                         if not posted:
                             msg = f"Failed to quote-tweet {tweet_id} (@{author}) after 3 attempts"
-                            send_error_alert(msg)
+                            print(f"  {msg}", flush=True)
+                            capture_failure_artifact(
+                                flow="twitter_engagement_post",
+                                tweet_id=str(tweet_id),
+                                author=author,
+                                source="quote",
+                                reason="quote_post_failed_after_3_attempts",
+                                extra={"reply_text": reply_text},
+                            )
                             with get_conn() as conn:
                                 mark_pipeline_post_failed(conn, tweet_id, msg)
                             continue
@@ -202,11 +211,27 @@ def main() -> int:
                                 _time.sleep(5)
                         if not posted:
                             msg = f"Failed to post reply to {tweet_id} (@{author}) after 3 attempts"
-                            send_error_alert(msg)
+                            print(f"  {msg}", flush=True)
+                            capture_failure_artifact(
+                                flow="twitter_engagement_post",
+                                tweet_id=str(tweet_id),
+                                author=author,
+                                source="reply",
+                                reason="reply_post_failed_after_3_attempts",
+                                extra={"reply_text": reply_text},
+                            )
                             with get_conn() as conn:
                                 mark_pipeline_post_failed(conn, tweet_id, msg)
                             continue
                 except Exception as e:
+                    capture_failure_artifact(
+                        flow="twitter_engagement_post",
+                        tweet_id=str(tweet_id),
+                        author=author,
+                        source=engagement_type,
+                        reason="engagement_post_exception",
+                        extra={"error": str(e)},
+                    )
                     with get_conn() as conn:
                         mark_pipeline_post_failed(conn, tweet_id, str(e))
                     continue
