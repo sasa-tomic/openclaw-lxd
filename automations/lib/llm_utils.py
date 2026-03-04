@@ -25,24 +25,48 @@ try:
 except ImportError:
     pass
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
+_OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+_OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
+
+_LLM_LOGS_DIR = (
+    Path(__file__).resolve().parent.parent / "twitter" / "debug_artifacts" / "llm"
+)
 
 _RETRY_DELAYS = [30, 60, 120]
+
+OPENAI_API_KEY = _OPENAI_API_KEY
+OPENAI_BASE_URL = _OPENAI_BASE_URL
+
+
+def _log_llm_call(
+    prompt: str, response: str, success: bool, model: str, context: str = ""
+) -> None:
+    try:
+        _LLM_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%dT%H%M%SZ")
+        safe_ctx = re.sub(r"[^a-zA-Z0-9_-]+", "_", (context or "unknown")[:40])
+        filename = f"{ts}_{safe_ctx}.json"
+        path = _LLM_LOGS_DIR / filename
+        data = {
+            "timestamp": ts,
+            "model": model,
+            "success": success,
+            "context": context,
+            "prompt": prompt,
+            "response": response,
+        }
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    except Exception:
+        pass
 
 
 def validate_llm_config() -> None:
     """Validate LLM configuration. Call at startup if LLM is needed."""
-    if not OPENAI_API_KEY:
+    if not _OPENAI_API_KEY:
         raise ValueError(
             "OPENAI_API_KEY not set. Set it in ~/.openclaw/.env or environment variable"
         )
-    if not OPENAI_BASE_URL:
-        raise ValueError(
-            "OPENAI_BASE_URL not set. "
-            "Set it in ~/.openclaw/.env or environment variable"
-        )
-    if not OPENAI_BASE_URL:
+    if not _OPENAI_BASE_URL:
         raise ValueError(
             "OPENAI_BASE_URL not set. "
             "Set it in ~/.openclaw/.env or environment variable"
@@ -187,6 +211,8 @@ def call_llm(
                         f"LLM: success with {model_label} model '{model_name}'",
                         flush=True,
                     )
+                    ctx = prompt[:50].replace("\n", " ")
+                    _log_llm_call(prompt, content, True, model_name, ctx)
                     return (True, content)
                 else:
                     last_error = (
@@ -222,6 +248,8 @@ def call_llm(
                 print(f"LLM: {last_error}", file=sys.stderr)
                 break
 
+    ctx = prompt[:50].replace("\n", " ")
+    _log_llm_call(prompt, last_error, False, primary_model, ctx)
     return (False, last_error)
 
 
