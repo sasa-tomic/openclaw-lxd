@@ -1268,17 +1268,57 @@ def search_candidates(
     return candidates
 
 
+_TOP_TWEETS_CACHE_PATH = DEBUG_ARTIFACTS_DIR / "top_tweets_cache.json"
+_TOP_TWEETS_CACHE_TTL_HOURS = 6
+
+
+def _load_top_tweets_cache(ttl_hours: int = _TOP_TWEETS_CACHE_TTL_HOURS) -> list[dict] | None:
+    """Return cached top tweets if the cache file exists and is fresh, else None."""
+    try:
+        if not _TOP_TWEETS_CACHE_PATH.exists():
+            return None
+        data = json.loads(_TOP_TWEETS_CACHE_PATH.read_text())
+        cached_at = datetime.fromisoformat(data["cached_at"])
+        if datetime.now(timezone.utc) - cached_at > timedelta(hours=ttl_hours):
+            return None
+        tweets = data.get("tweets")
+        if isinstance(tweets, list) and tweets:
+            print(f"Using cached top tweets ({len(tweets)} tweets, cached {cached_at.strftime('%H:%M UTC')})", flush=True)
+            return tweets
+    except Exception:
+        pass
+    return None
+
+
+def _save_top_tweets_cache(tweets: list[dict]) -> None:
+    """Write top tweets to the cache file."""
+    try:
+        _TOP_TWEETS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _TOP_TWEETS_CACHE_PATH.write_text(json.dumps({
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+            "tweets": tweets,
+        }, ensure_ascii=False))
+    except Exception:
+        pass
+
+
 def fetch_top_tweets(
     terms: list[str] | None = None,
     n_terms: int = 4,
     limit_per_term: int = 10,
     since_hours: int = 168,
+    cache_ttl_hours: int = _TOP_TWEETS_CACHE_TTL_HOURS,
 ) -> list[dict]:
     """Fetch popular tweets (f=top) as structural/compositional examples.
 
-    Returns an in-memory list sorted by engagement (likes + retweets) descending.
-    No caching — intended for the once-daily original-content drafting run.
+    Returns a list sorted by engagement (likes + retweets) descending.
+    Results are cached to disk for cache_ttl_hours (default 6) to avoid
+    redundant CDP searches across multiple runs in the same day.
     """
+    cached = _load_top_tweets_cache(ttl_hours=cache_ttl_hours)
+    if cached is not None:
+        return cached
+
     pool = terms if terms is not None else SEARCH_TERMS
     sample_size = min(n_terms, len(pool))
     sampled = random.sample(pool, sample_size)
@@ -1313,6 +1353,10 @@ def fetch_top_tweets(
         reverse=True,
     )
     print(f"Fetched {len(result)} unique top tweets", flush=True)
+
+    if result:
+        _save_top_tweets_cache(result)
+
     return result
 
 
