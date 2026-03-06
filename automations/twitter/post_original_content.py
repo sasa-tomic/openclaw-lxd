@@ -7,10 +7,10 @@ Runs daily to ensure consistent original content posting (1-2 tweets/day).
 
 Phase 1 mode: founder voice takes only — no links, no product mentions, no hashtags.
 
-Sources:
-1. Morning research results (HN stories, curated links)
-2. Dev updates (repo activity)
-3. Insights/learnings (from memory, notes)
+Content is generated as engagement-optimized THREADS:
+- Hook tweet (stops the scroll) + reveal reply (delivers the payoff)
+- Six engagement formats: cliffhanger, deliberately_wrong, reply_with_number,
+  confession, math_nobody_did, impossible_quiz
 
 This complements engagement replies with original value-adding content.
 """
@@ -19,28 +19,28 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg2
 
-sys.path.insert(
-    0, str(Path(__file__).parent.parent)
-)  # /projects/automations (for lib.*)
-sys.path.insert(
-    0, str(Path(__file__).parent)
-)  # /projects/automations/twitter (for db, twitter_utils)
+sys.path.insert(0, str(Path(__file__).parent.parent))   # lib.*
+sys.path.insert(0, str(Path(__file__).parent))           # db, twitter_utils
+
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from twitter_utils import (
     ensure_browser_ready,
     fetch_top_tweets,
     humanize,
+    jitter_sleep,
     load_project_context,
     post_tweet,
+    post_reply_with_retries,
     send_error_alert,
     utc_now,
     get_latest_own_tweet_id,
@@ -55,13 +55,15 @@ from db import (
     mark_content_queue_posted,
     prune_content_queue,
     get_recent_posts,
-    get_recent_engagements,
     get_top_posts,
-    get_popular_candidate_tweets,
     insert_post,
 )
 
-# Phase 1 hard rules: zero product mentions in original posts
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 PRODUCT_MENTION_PATTERNS = [
     r"\bwe\s+(just|recently|today|now)?\s*(shipped|launched|built|released|deployed|published)\b",
     r"\bwe\s+just\b",
@@ -71,234 +73,457 @@ PRODUCT_MENTION_PATTERNS = [
     r"\bsign\s+up\b",
     r"\bwaitlist\b",
     r"\bearly\s+access\b",
-    r"\bwe\s+shipped\b",
-    r"\bwe\s+launched\b",
     r"\bfull\s+visibility\s+into\b",
     r"\bdeployment\s+recipe\b",
 ]
 
+STANDALONE_FORMATS = {"reply_with_number", "impossible_quiz"}
 
-def has_product_mention(text: str) -> bool:
-    for pattern in PRODUCT_MENTION_PATTERNS:
-        if re.search(pattern, text, re.IGNORECASE):
-            return True
-    return False
+ENGAGEMENT_FORMATS = """
+## The 6 engagement formats — you MUST use a DIFFERENT format for each tweet
+
+### 1. CLIFFHANGER THREAD (format: "cliffhanger")
+Hook: Tell a real story — a specific company, a specific dollar amount, a specific disaster.
+Build tension. End mid-story: "And then we opened the bill."
+Reveal (self-reply): The punchline — what actually happened, the real number, the consequence nobody expected.
+Example hook: "Our team mass-migrated from AWS to GCP for the 'savings.' Three months in we got the first real bill."
+Example reveal: "Egress fees alone were $14K/mo. They weren't on any pricing calculator. We migrated back within 6 weeks."
+
+### 2. DELIBERATELY WRONG (format: "deliberately_wrong")
+Hook: State something that SOUNDS true but is provably wrong. Make it specific enough that experts will rage-reply.
+The wronger it sounds, the more replies you get. People cannot resist correcting strangers on the internet.
+Reveal (self-reply): The actual correction + proof. Show the receipt.
+Example hook: "Kubernetes saves money. That's just a fact at this point."
+Example reveal: "Average K8s cluster runs at 13% utilization. The orchestrator itself eats 15-30% overhead. You're paying for a scheduler to waste your money efficiently."
+
+### 3. REPLY WITH YOUR NUMBER (format: "reply_with_number") [STANDALONE — no reveal needed]
+One tweet that forces participation. Ask for a SPECIFIC number from their experience.
+People love comparing themselves. Make it about money, time, or pain.
+Example: "How many mass-subscriptions are you paying for that you haven't opened in 6+ months? Reply with your number. Mine is 11."
+
+### 4. CONFESSION (format: "confession")
+Hook: Admit something most people would hide. Make it specific and slightly reckless.
+Must be relatable — the reader should think "oh no, I do that too."
+Reveal (self-reply): What happened next — the consequence, the lesson, or the even worse thing you discovered.
+Example hook: "I've been running a production database without backups for 8 months. On purpose."
+Example reveal: "It's a 200MB SQLite file that rebuilds from an event log in 4 minutes. The 'backup solution' my company quoted was $1,200/mo. Sometimes the right answer is no answer."
+
+### 5. MATH NOBODY DID (format: "math_nobody_did")
+Hook: Tease a calculation that reveals a hidden truth. Use real company names and real (or realistic) numbers.
+Make the reader NEED to see the math.
+Reveal (self-reply): The actual breakdown with numbers. Show your work.
+Example hook: "I calculated the real hourly cost of an AWS support engineer. The number doesn't make sense."
+Example reveal: "Enterprise Support: $15K/mo minimum. Average response for Sev-2: 12 hours. Median resolution: 'have you tried restarting the instance.' That's $1,250/ticket for the privilege of waiting."
+
+### 6. IMPOSSIBLE QUIZ (format: "impossible_quiz") [STANDALONE — no reveal needed]
+One question with an answer that sounds impossible but is true. People will guess wrong and share it.
+Example: "What percentage of S3 buckets in production right now have public read access? Wrong answers only."
+"""
+
+# Prompt rules shared by batch and single drafting
+_PROMPT_RULES = """# Rules
+- No hashtags, no links, no "Decent Cloud", no product mentions.
+- No AI words: "Furthermore", "Additionally", "crucial", "landscape", "It's worth noting."
+- Standard capitalization. Complete sentences only.
+- Hook: max 280 chars. Reveal: max 280 chars.
+- Use REAL company names (AWS, GCP, Azure, Cloudflare, Vercel, etc.) and realistic numbers.
+- Each thread must be about a DIFFERENT topic. No two threads about the same company or issue."""
 
 
-def _try_parse_json_payload(raw: str) -> object | None:
-    """Parse JSON from raw model output, tolerating code fences and wrappers."""
-    text = (raw or "").strip()
-    if not text:
-        return None
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
 
-    if text.startswith("```json"):
-        text = text[7:]
-    if text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
-
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    # Extract first balanced JSON array
-    depth = 0
-    start = None
-    for i, ch in enumerate(text):
-        if ch == "[":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "]":
-            if depth:
-                depth -= 1
-                if depth == 0 and start is not None:
-                    candidate = text[start : i + 1]
-                    try:
-                        return json.loads(candidate)
-                    except (json.JSONDecodeError, TypeError):
-                        start = None
-                        continue
-
-    # Extract first balanced JSON object
-    depth = 0
-    start = None
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            if depth:
-                depth -= 1
-                if depth == 0 and start is not None:
-                    candidate = text[start : i + 1]
-                    try:
-                        return json.loads(candidate)
-                    except (json.JSONDecodeError, TypeError):
-                        start = None
-                        continue
-    return None
+_META_PREFIXES = (
+    "let me ", "here are ", "generate ", "write ", "draft ",
+    "output ", "consider ", "thinking about ",
+)
+_META_SUBSTRINGS = (
+    "analyze the requirements", "project & strategy context", "json array",
+    "your task", "rules for all posts", "output only", "guidelines",
+    "something about ", "let me think", "that's good", "this needs to be",
+)
+_META_SUFFIXES = ("angle", "strategy")
 
 
 def _looks_like_meta_response(text: str) -> bool:
+    """Detect LLM meta-commentary / thinking-out-loud instead of actual content."""
     t = (text or "").strip().lower()
-    # Strip markdown bold for detection purposes
     t_plain = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)
-    return (
-        t.startswith("let me ")
-        or t.startswith("here are ")
-        or t.startswith("generate ")
-        or t.startswith("write ")
-        or t.startswith("draft ")
-        or t.startswith("output ")
-        or t.startswith("consider ")
-        or t.startswith("thinking about ")
-        or "analyze the requirements" in t
-        or "project & strategy context" in t
-        or "format a" in t
-        or "format b" in t
-        or "json array" in t
-        or "each must be a different topic and angle" in t
-        or "your task" in t
-        or "rules for all posts" in t
-        or "output only" in t
-        or "recent posts — avoid repeating these angles" in t
-        or "avoid repeating recent post angles" in t
-        or "follow the voice and style guidelines" in t
-        or "topics should align with the content mix" in t
-        or "recent posts to avoid" in t
-        or "guidelines" in t
-        or t.endswith(":")
-        # Markdown bold angle/topic labels: "**Cloud angle**: ..."
-        or bool(re.match(r"\*\*[^*]+\*\*\s*:", t))
-        # Hedging / planning language instead of actual content
-        or "something about " in t
-        or "let me think" in t
-        or "that's good" in t
-        or "this needs to be" in t
-        or t_plain.endswith("angle")
-        or t_plain.endswith("strategy")
-    )
+    if any(t.startswith(p) for p in _META_PREFIXES):
+        return True
+    if any(s in t for s in _META_SUBSTRINGS):
+        return True
+    if t.endswith(":") or bool(re.match(r"\*\*[^*]+\*\*\s*:", t)):
+        return True
+    if any(t_plain.endswith(s) for s in _META_SUFFIXES):
+        return True
+    return False
 
 
-def _is_complete_sentence(text: str) -> bool:
-    """Check that text contains at least one complete sentence."""
-    t = (text or "").strip()
-    # Must end with sentence-ending punctuation (or quote after it)
-    if not re.search(r'[.!?""]\s*$', t):
-        return False
-    # Must contain at least one verb-like word (rough heuristic: >5 words)
-    words = t.split()
-    if len(words) < 6:
-        return False
-    return True
+def has_product_mention(text: str) -> bool:
+    return any(re.search(p, text, re.IGNORECASE) for p in PRODUCT_MENTION_PATTERNS)
 
 
-def _build_top_tweets_section(top_tweets: list[dict] | None) -> str:
-    """Build prompt section presenting popular tweets as structural examples."""
-    if not top_tweets:
-        return ""
-    lines = []
-    for t in top_tweets[:20]:
-        likes = t.get("likes", 0)
-        rts = t.get("retweets", 0)
-        text = (t.get("text") or "").replace("\n", " ")
-        lines.append(f"  [{likes}L {rts}RT] @{t.get('author', '?')}: {text}")
-    return (
-        "\n## High-performing tweets in this space — study STRUCTURE, not topic:\n"
-        + "\n".join(lines)
-        + "\n\nWhat to extract from these examples:\n"
-        "- Hook pattern: specific number/name/counterintuitive claim in the first 10 words?\n"
-        "- Tension architecture: names an assumption then dismantles it?\n"
-        "- Specificity texture: dollar amounts, percentages, named companies, timeframes?\n"
-        "- Sentence rhythm: short punchy vs. earned long setup with short payoff?\n"
-        "Apply structural DNA to your own original angles. Never copy content.\n"
-    )
-
-
-def _is_valid_candidate_text(text: str) -> bool:
+def _is_valid_tweet_text(text: str) -> bool:
+    """Validate a single tweet text (hook or reveal)."""
     t = (text or "").strip()
     if not (20 <= len(t) <= 600):
         return False
     if _looks_like_meta_response(t):
         return False
-    if not _is_complete_sentence(t):
+    if not re.search(r'[.!?""]\s*$', t):
+        return False
+    if len(t.split()) < 6:
         return False
     return True
 
 
-def load_queue(conn) -> list[dict]:
-    """Load the content queue from typed DB table."""
-    return get_content_queue(conn)
+def _is_valid_thread_entry(entry: dict) -> bool:
+    """Validate a thread entry (hook + optional reveal)."""
+    hook = (entry.get("hook") or entry.get("text") or "").strip()
+    reveal = (entry.get("reveal") or "").strip()
+
+    if not hook or not _is_valid_tweet_text(hook) or has_product_mention(hook):
+        return False
+
+    if entry.get("format") in STANDALONE_FORMATS:
+        return True
+
+    if not reveal or not _is_valid_tweet_text(reveal) or has_product_mention(reveal):
+        return False
+    return True
 
 
-def llm_rank_candidates(candidates: list[dict], top_posts: list[dict]) -> list[dict]:
-    """Rank unposted candidates by predicted engagement using a single LLM call.
+# ---------------------------------------------------------------------------
+# Text cleaning
+# ---------------------------------------------------------------------------
 
-    Returns candidates sorted best-first, each with an 'llm_score' (0-10) added.
+def _clean_llm_text(text: str) -> str:
+    """Strip quotes and LLM categorization prefixes like '(Observation/DR)'."""
+    t = (text or "").strip().strip('"').strip("'")
+    return re.sub(r"^\([^)]{3,30}\)\s*", "", t).strip()
+
+
+def _parse_llm_json(raw: str) -> object | None:
+    """Parse JSON from raw LLM output, tolerating code fences and wrapper text."""
+    text = extract_json(raw)
+    if text:
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# LLM prompt context builders
+# ---------------------------------------------------------------------------
+
+def _extract_anchors_from_tweets(tweets: list[dict]) -> list[str]:
+    """Extract real talking points from fetched top tweets."""
+    snippets: list[str] = []
+    for t in (tweets or [])[:25]:
+        text = t.get("text") or ""
+        engagement = t.get("likes", 0) + t.get("retweets", 0)
+        if engagement < 3 or len(text) < 30:
+            continue
+        sentences = re.split(r'(?<=[.!?])\s+', text.replace("\n", " "))
+        snippet = " ".join(sentences[:2]).strip()[:200]
+        snippets.append(f"[{engagement} engagements] {snippet}")
+    return snippets
+
+
+def _build_creative_seed(top_tweets: list[dict] | None) -> str:
+    """Build a creative seed block from real signals."""
+    anchors = _extract_anchors_from_tweets(top_tweets or [])
+    parts = []
+    if anchors:
+        sample = random.sample(anchors, min(4, len(anchors)))
+        parts.append("## What's getting engagement RIGHT NOW (riff on these, don't copy):")
+        parts.extend(f"  - {a}" for a in sample)
+    parts.append(f"\nDiversity seed: {random.randint(1000, 9999)}")
+    return "\n".join(parts) + "\n"
+
+
+def _format_top_tweets(top_tweets: list[dict] | None) -> str:
+    """Format top tweets as structural examples for the prompt."""
+    if not top_tweets:
+        return ""
+    lines = []
+    for t in top_tweets[:20]:
+        text = (t.get("text") or "").replace("\n", " ")
+        lines.append(f"  [{t.get('likes', 0)}L {t.get('retweets', 0)}RT] @{t.get('author', '?')}: {text}")
+    return "\n## High-performing tweets — study structure:\n" + "\n".join(lines) + "\n"
+
+
+def get_recent_commits(n: int = 25) -> list[str]:
+    """Fetch recent commits from decent-cloud repo."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", "/projects/decent-cloud", "log", "--oneline", f"-{n}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip().split("\n")
+    except Exception:
+        pass
+    return []
+
+
+def _build_context_sections(conn, top_tweets: list[dict] | None = None) -> str:
+    """Build the shared context sections used by both batch and single draft prompts."""
+    recent_posts = [p.get("text", "")[:200] for p in get_recent_posts(conn, days=14, limit=12)]
+    research = get_latest_morning_research(conn)
+    project_context = load_project_context()
+
+    research_text = ""
+    if research:
+        parts = []
+        if research.get("hnStories"):
+            for s in research["hnStories"][:3]:
+                parts.append(f'- HN trending: "{s["title"]}" ({s["points"]} pts)')
+        if research.get("devActivity"):
+            parts.append(f"- Dev activity: {research['devActivity']}")
+        research_text = "\n".join(parts) if parts else ""
+
+    commits_text = ""
+    if not research_text:
+        commits = get_recent_commits(6)
+        if commits:
+            commits_text = "\n".join(f"- {c}" for c in commits[:4])
+
+    return f"""# Context
+{project_context}
+
+{_build_creative_seed(top_tweets)}
+
+{_format_top_tweets(top_tweets)}
+
+# Do NOT repeat these recent posts:
+{json.dumps(recent_posts, indent=2)}
+
+{f"Trending today (NO links):{chr(10)}{research_text}" if research_text else ""}
+{f"Dev activity:{chr(10)}{commits_text}" if commits_text else ""}"""
+
+
+# ---------------------------------------------------------------------------
+# Queue helpers
+# ---------------------------------------------------------------------------
+
+def _filter_valid_unposted(queue: list[dict], conn=None) -> list[dict]:
+    """Filter queue to valid unposted entries, marking invalid ones as posted.
+
+    Handles both new thread-format entries and legacy plain-text entries.
+    """
+    valid = []
+    for e in queue:
+        if e.get("posted"):
+            continue
+        td = e.get("thread_data")
+        if td and isinstance(td, dict):
+            if _is_valid_thread_entry(td):
+                valid.append(e)
+            elif conn and e.get("id") is not None:
+                mark_content_queue_posted(conn, int(e["id"]), datetime.now(timezone.utc))
+        else:
+            # Legacy entries without thread_data
+            if _is_valid_tweet_text(e.get("text", "")):
+                valid.append(e)
+            elif conn and e.get("id") is not None:
+                mark_content_queue_posted(conn, int(e["id"]), datetime.now(timezone.utc))
+    return valid
+
+
+def _to_rank_candidate(entry: dict) -> dict:
+    """Convert a queue entry into a ranking candidate dict."""
+    td = entry.get("thread_data")
+    if td and isinstance(td, dict):
+        return {
+            "id": entry.get("id"),
+            "format": td.get("format", ""),
+            "hook": td.get("hook", ""),
+            "reveal": td.get("reveal", ""),
+        }
+    return {
+        "id": entry.get("id"),
+        "format": "legacy",
+        "hook": entry.get("text", ""),
+        "reveal": "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Drafting
+# ---------------------------------------------------------------------------
+
+def _build_thread_entry(item: dict) -> dict | None:
+    """Parse and validate a single thread item from LLM output."""
+    if not isinstance(item, dict):
+        return None
+
+    fmt = (item.get("format") or "").strip()
+    hook = _clean_llm_text(item.get("hook") or "")
+    reveal = _clean_llm_text(item.get("reveal") or "")
+    thread_data = {"format": fmt, "hook": hook, "reveal": reveal}
+
+    if not _is_valid_thread_entry(thread_data):
+        print(f"Draft rejected ({fmt}): {hook[:80]}", file=sys.stderr)
+        return None
+
+    return {
+        "text": hook,
+        "draftedAt": datetime.now(timezone.utc).isoformat(),
+        "llm_score": 0,
+        "posted": False,
+        "thread_data": thread_data,
+    }
+
+
+def draft_batch(conn, top_tweets: list[dict] | None = None) -> list[dict]:
+    """Draft a batch of 6 engagement-optimized thread entries."""
+    context = _build_context_sections(conn, top_tweets)
+
+    prompt = f"""Write 6 tweet threads. Each MUST use a DIFFERENT engagement format.
+Each thread consists of a HOOK tweet and (for most formats) a REVEAL self-reply.
+
+The reader sees 200 tweets per session. Your hook must be the one that makes them STOP and click.
+The reveal must DELIVER — specific numbers, real consequences, receipts.
+
+{ENGAGEMENT_FORMATS}
+
+{context}
+
+{_PROMPT_RULES}
+
+Output ONLY a JSON array. Each element:
+{{"format": "cliffhanger|deliberately_wrong|reply_with_number|confession|math_nobody_did|impossible_quiz", "hook": "the main tweet", "reveal": "the self-reply (empty string if standalone format)"}}
+
+No markdown, no explanation. Just the JSON array of 6 objects."""
+
+    try:
+        raw = call_llm(prompt, timeout=180, json_mode=True, temperature=0.9)
+        if not raw:
+            print("LLM returned nothing for batch draft", file=sys.stderr)
+            return []
+
+        items = _parse_llm_json(raw)
+        if not isinstance(items, list):
+            print(f"Failed to parse batch draft JSON: {raw[:200]}", file=sys.stderr)
+            return []
+
+        entries = [e for item in items if (e := _build_thread_entry(item)) is not None]
+        print(f"Batch drafted {len(entries)} valid threads from {len(items)} candidates", flush=True)
+        return entries
+
+    except Exception as e:
+        print(f"LLM batch draft failed: {e}", file=sys.stderr)
+        return []
+
+
+def draft_single(conn, top_tweets: list[dict] | None = None) -> dict | None:
+    """Draft a single engagement thread. Fallback for batch failures."""
+    context = _build_context_sections(conn, top_tweets)
+
+    fmt_choice = random.choice([
+        "cliffhanger", "deliberately_wrong", "reply_with_number",
+        "confession", "math_nobody_did", "impossible_quiz",
+    ])
+
+    prompt = f"""Write ONE tweet thread using the "{fmt_choice}" format.
+
+{ENGAGEMENT_FORMATS}
+
+{context}
+
+{_PROMPT_RULES}
+
+Output ONLY: {{"format": "{fmt_choice}", "hook": "the main tweet", "reveal": "the self-reply (empty string if standalone)"}}"""
+
+    try:
+        raw = call_llm(prompt, timeout=180, json_mode=True, temperature=0.9)
+        if not raw:
+            return None
+
+        payload = _parse_llm_json(raw)
+        if not isinstance(payload, dict):
+            return None
+
+        # Override format in case LLM changed it
+        payload.setdefault("format", fmt_choice)
+        return _build_thread_entry(payload)
+
+    except Exception as e:
+        print(f"Single draft failed: {e}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Ranking
+# ---------------------------------------------------------------------------
+
+def llm_rank_candidates(candidates: list[dict]) -> list[dict]:
+    """Rank thread candidates by engagement potential using a single LLM call.
+
+    Returns candidates sorted best-first, each with an 'llm_score' added.
     Falls back to original order if the LLM call fails.
     """
     if not candidates:
         return candidates
 
-    # Format top posts as engagement reference
-    top_posts_text = ""
-    if top_posts:
-        lines = []
-        for p in top_posts:
-            likes = p.get("likes") or 0
-            rts = p.get("rts") or 0
-            text = (p.get("text") or "").replace("\n", " ")
-            lines.append(f"  [{likes}L {rts}RT] {text}")
-        top_posts_text = "\n".join(lines)
-
-    # Format candidates with IDs
-    candidate_lines = []
+    # Format candidates for the prompt
+    lines = []
     for i, c in enumerate(candidates):
         label = f"C{i + 1}"
-        text = (c.get("text") or "").replace("\n", " ")
-        candidate_lines.append(f"[{label}] {text}")
-    candidates_text = "\n\n".join(candidate_lines)
+        fmt = c.get("format", "unknown")
+        hook = (c.get("hook") or "").replace("\n", " ")
+        reveal = (c.get("reveal") or "").replace("\n", " ")
+        if reveal:
+            lines.append(f"[{label}] ({fmt})\n  HOOK: {hook}\n  REVEAL: {reveal}")
+        else:
+            lines.append(f"[{label}] ({fmt})\n  TWEET: {hook}")
 
-    prompt = f"""You are scoring tweet drafts for @DecentCloud_org by predicted engagement.
+    prompt = f"""You are scrolling Twitter. You see 200 posts per session. Most are forgettable.
 
-## What high-engagement looks like for this account
-These are the best-performing posts by likes+retweets. Learn the patterns:
+Below are tweet thread drafts. Each has a HOOK (the main tweet) and optionally a REVEAL (self-reply).
 
-{top_posts_text if top_posts_text else "  (no historical data yet)"}
+## The candidates
 
-## Candidates to score
+{chr(10).join(lines)}
 
-{candidates_text}
+## How to judge
 
-## Scoring task
+For each thread, evaluate:
+1. HOOK POWER: Would you stop scrolling? Does it create unbearable curiosity?
+   - "And then we opened the bill" → you MUST click to see the reveal
+   - "Kubernetes saves money" → you MUST correct this person
+   - Generic observation with no tension → skip, score 0-3
 
-Score each candidate from 0 to 10:
-- 10 = will almost certainly spark real discussion, strong opinions, or go viral in the infra/cloud space
-- 7-9 = solid, likely to get genuine replies or retweets from practitioners
-- 4-6 = decent but forgettable, might get a few likes
-- 1-3 = generic, obvious, preaching to the choir, or no hook
-- 0 = actively bad (wrong tone, product shill, AI-sounding fluff)
+2. REVEAL PAYOFF (if present): Does the reveal DELIVER?
+   - Specific numbers, real consequences, receipts → score 8-10
+   - Vague "it was bad" → score 0-4
 
-Judge on: specificity of the claim, strength of the tension or insight, how much it forces a reaction.
-Do NOT reward safe takes. Reward posts where a senior engineer has a genuine opinion either way.
+3. PARTICIPATION PULL: Would you reply, quote-tweet, or share?
+   - "Reply with your number" + relatable question → high
+   - Closed statement nobody needs to add to → low
 
-Return ONLY valid JSON matching this exact schema:
+REJECT:
+- Common knowledge hooks ("cloud is expensive" — yeah, we know)
+- AI-sounding language (hedge-y, generic, no voice)
+- Missing payoff (tension with no resolution)
+- Incomplete thoughts or meta-commentary
+
+Return ONLY valid JSON:
 {{
   "rankings": [
-    {{"id": "C1", "score": 8, "reason": "one short sentence"}}
+    {{"id": "C1", "score": 9, "reason": "one sentence: why this stops the scroll"}}
   ]
 }}
 
-Hard requirements:
-- `rankings` length must be exactly {len(candidates)}
-- Include each candidate id exactly once: C1..C{len(candidates)}
-- `score` must be a number in [0, 10]
-- No markdown, no prose, no extra keys at top level"""
+Requirements:
+- Rank ALL {len(candidates)} candidates: C1..C{len(candidates)}
+- score: integer 0-10
+- Be HARSH. Most tweets are forgettable. Only 1-2 should score above 7."""
 
     try:
         raw = call_llm(prompt, timeout=600, json_mode=True)
@@ -306,33 +531,24 @@ Hard requirements:
             print("LLM ranking returned nothing, using original order", file=sys.stderr)
             return candidates
 
-        payload = _try_parse_json_payload(raw)
-        if payload is None:
-            json_str = extract_json(raw)
-            if json_str:
-                payload = _try_parse_json_payload(json_str)
-
+        payload = _parse_llm_json(raw)
         rankings = None
         if isinstance(payload, dict):
             rankings = payload.get("rankings")
         elif isinstance(payload, list):
             rankings = payload
         if not isinstance(rankings, list):
-            print(
-                "Could not parse LLM ranking response, using original order",
-                file=sys.stderr,
-            )
+            print("Could not parse LLM ranking response, using original order", file=sys.stderr)
             return candidates
 
-        expected_ids = [f"C{i + 1}" for i in range(len(candidates))]
+        expected_ids = {f"C{i + 1}" for i in range(len(candidates))}
         by_id: dict[str, dict] = {}
         for item in rankings:
             if not isinstance(item, dict):
                 continue
             cid = str(item.get("id", "")).strip()
-            score_raw = item.get("score")
             try:
-                score = float(score_raw)
+                score = float(item.get("score"))
             except (TypeError, ValueError):
                 continue
             if cid not in expected_ids:
@@ -343,10 +559,7 @@ Hard requirements:
             }
 
         if len(by_id) != len(expected_ids):
-            print(
-                "Incomplete/invalid LLM ranking response, using original order",
-                file=sys.stderr,
-            )
+            print("Incomplete LLM ranking response, using original order", file=sys.stderr)
             return candidates
 
         for i, c in enumerate(candidates):
@@ -356,370 +569,46 @@ Hard requirements:
             if reason:
                 print(f"  {label} (score={c['llm_score']}): {reason}", flush=True)
 
-        ranked = sorted(candidates, key=lambda c: c.get("llm_score", 0), reverse=True)
-        return ranked
+        return sorted(candidates, key=lambda c: c.get("llm_score", 0), reverse=True)
 
     except Exception as e:
         print(f"LLM ranking failed: {e}, using original order", file=sys.stderr)
         return candidates
 
 
-def load_morning_research(conn) -> dict | None:
-    """Load latest morning research results from typed DB tables."""
-    return get_latest_morning_research(conn)
-
-
-def get_recent_commits(n: int = 5) -> list[str]:
-    """Fetch recent commits from decent-cloud repo."""
-    try:
-        r = subprocess.run(
-            ["git", "-C", "/projects/decent-cloud", "log", f"--oneline", f"-{n}"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if r.returncode == 0:
-            return r.stdout.strip().split("\n")
-    except Exception:
-        pass
-    return []
-
-
-def _get_engagement_themes(recent_engagements: list[dict], n: int = 10) -> list[str]:
-    """Extract recurring themes from recent engagements to inform content direction."""
-    recent = recent_engagements[-n:]
-    terms = [e.get("search_term", "") for e in recent if e.get("search_term")]
-    return list(dict.fromkeys(terms))  # deduplicated, order-preserving
-
-
-def draft_batch(conn, top_tweets: list[dict] | None = None) -> list[dict]:
-    """Use LLM to draft a batch of 3-5 tweets. Returns list of queue entries."""
-
-    research = load_morning_research(conn)
-    recent_posts_db = get_recent_posts(conn, days=14, limit=12)
-    recent_engagements_db = get_recent_engagements(conn, hours=168, limit=15)
-    top_posts_db = get_top_posts(conn, limit=40)
-    popular_candidates_db = get_popular_candidate_tweets(conn, days=30, limit=45)
-
-    # Extended history: last 12 posts for better dedup and thematic continuity
-    recent_posts = [p.get("text", "")[:200] for p in recent_posts_db]
-    recent_commits = get_recent_commits(6)
-    engagement_themes = _get_engagement_themes(recent_engagements_db, n=15)
-
-    # Build top-posts style anchor (only include entries with real engagement data)
-    top_posts_with_stats = [
-        p for p in top_posts_db if (p.get("likes") or 0) + (p.get("rts") or 0) > 0
-    ]
-    top_posts_section = ""
-    if top_posts_with_stats:
-        lines = []
-        for p in top_posts_with_stats:
-            likes = p.get("likes") or 0
-            rts = p.get("rts") or 0
-            text = (p.get("text") or "").replace("\n", " ")
-            lines.append(f"  [{likes}L {rts}RT] {text}")
-        top_posts_section = (
-            "\n## Posts that got the most engagement — write in this style and voice:\n"
-            + "\n".join(lines)
-        )
-
-    # Build popular candidate tweets section (trending topics in our target space)
-    popular_candidates_section = ""
-    if popular_candidates_db:
-        lines = []
-        for c in popular_candidates_db:
-            likes = c.get("likes") or 0
-            rts = c.get("retweets") or 0
-            text = (c.get("text") or "").replace("\n", " ")
-            lines.append(f"  [{likes}L {rts}RT] {text}")
-        popular_candidates_section = (
-            "\n## What's getting traction in the space right now"
-            " — use as angle/topic inspiration only, don't copy verbatim:\n"
-            + "\n".join(lines)
-        )
-
-    top_tweets_section = _build_top_tweets_section(top_tweets)
-
-    project_context = load_project_context()
-
-    # Build morning research context (HN trending topics + dev activity)
-    research_text = ""
-    if research:
-        parts = []
-        if research.get("hnStories"):
-            for s in research["hnStories"][:3]:
-                parts.append(f'- HN trending: "{s["title"]}" ({s["points"]} pts)')
-        if research.get("devActivity"):
-            parts.append(f"- Dev activity: {research['devActivity']}")
-        if parts:
-            research_text = "\n".join(parts)
-
-    # Build dev commits context (fallback if morning research didn't run)
-    commits_text = ""
-    if not research_text and recent_commits:
-        commits_text = "\n".join(f"- {c}" for c in recent_commits[:4])
-
-    prompt = f"""Generate 4 original posts for a technical Twitter account. Each post must be a COMPLETE, READY-TO-POST tweet — not a topic stub, not an angle label, not a planning note.
-
-# Project & Strategy Context
-{project_context}
-
-# Your Task
-Draft 4 posts. Each must be a DIFFERENT topic and angle. Mix formats A and B (at least 1 of each).
-
-## Format A — Counterintuitive observation (1–4 sentences, ends with a punch)
-Open with a specific number, dollar amount, or named company in the FIRST 10 words.
-Structure: counterintuitive claim with evidence → why it matters.
-The last sentence must either: pose a question, drop a specific stat, or name a consequence.
-NEVER end on a vague setup. The post must land — reader should think "wait, really?" or "that's messed up."
-NOT imperative. Never "make sure you", "you should". Describe; don't instruct.
-Good: "AWS egress fees cost the average startup $14K/year — more than most junior engineer benefits packages. The cloud isn't expensive because of compute. It's expensive because leaving is."
-Bad: "Cloud migrations are hard." (vague, no number, no named entity, no punch)
-Bad: "Your startup needs SOC2 compliance within 90 days." (pure setup, goes nowhere)
-
-## Format B — Engineering dilemma (ends with a forced-choice question)
-A realistic scenario where a senior engineer could argue EITHER side. Forces the reader to pick.
-Requirements:
-- Open with concrete specifics: team size, traffic numbers, deploy cadence, or dollar amounts
-- Include one constraint that makes the obvious answer wrong (deadline, hiring freeze, budget cap)
-- MUST end with 1–2 direct decision questions. The question IS the hook.
-Good: "3-person team, 200 RPS, P99 at 400ms. Your biggest customer wants multi-region in 6 weeks or they churn. Do you bolt on a CDN and pray, or tell them 3 months and risk the contract?"
-Bad: "Should you migrate to microservices?" (obvious answer depends on context — no tension)
-
-## Recent posts — AVOID repeating these angles (last 12):
-{json.dumps(recent_posts, indent=2)}
-{top_posts_section}
-{popular_candidates_section}
-{top_tweets_section}
-## Audience engagement signal — active topics recently:
-{json.dumps(engagement_themes, indent=2) if engagement_themes else "  (no data yet)"}
-Use as inspiration for fresh angles only — don't repeat same framing.
-
-{f"## Trending today (inspiration only — NO links in posts):{chr(10)}{research_text}" if research_text else ""}
-{f"## Recent dev activity (for inspiration):{chr(10)}{commits_text}" if commits_text else ""}
-
-## Hard rules for every post
-- Every post must contain at least ONE of: a specific number/dollar amount, a named company/platform (AWS, GCP, Stripe, Vercel, etc.), or a direct question.
-- Every post must end with proper punctuation (period, question mark, or exclamation). No trailing setups.
-- Standard sentence capitalization. Proper nouns capitalized, everything else normal case.
-- No hashtags, no links, no product mentions, no "Decent Cloud" references.
-- No AI vocabulary: "Furthermore", "Additionally", "It's important to note that", "It's worth noting".
-- Output COMPLETE tweets only. Do NOT output topic labels, angle descriptions, or planning notes.
-
-Output as JSON array of 4 strings: ["post1", "post2", "post3", "post4"]
-Output ONLY the JSON array. No explanation, no markdown wrapping."""
-
-    try:
-        raw = call_llm(prompt, timeout=120, json_mode=True)
-        if not raw:
-            print("LLM returned nothing for batch draft", file=sys.stderr)
-            return []
-
-        payload = _try_parse_json_payload(raw)
-        tweets = payload if isinstance(payload, list) else None
-        if not tweets:
-            print(f"Failed to parse batch draft JSON: {raw[:200]}", file=sys.stderr)
-            return []
-
-        now = datetime.now(timezone.utc).isoformat()
-        entries = []
-        for text in tweets:
-            if not isinstance(text, str):
-                continue
-            text = text.strip().strip('"').strip("'")
-            # Strip LLM categorization prefixes like "(Observation/DR)", "(Technical insight)", etc.
-            text = re.sub(r"^\([^)]{3,30}\)\s*", "", text).strip()
-            if not text or len(text) < 20:
-                print(
-                    f"Batch draft rejected: too short ({len(text)} chars)",
-                    file=sys.stderr,
-                )
-                continue
-            if _looks_like_meta_response(text):
-                print(
-                    f"Batch draft rejected: meta response: {text[:80]}", file=sys.stderr
-                )
-                continue
-            if has_product_mention(text):
-                print(
-                    f"Batch draft rejected: Phase 1 violation: {text[:80]}",
-                    file=sys.stderr,
-                )
-                continue
-            entries.append(
-                {
-                    "text": text,
-                    "draftedAt": now,
-                    "llm_score": 0,  # set at selection time by llm_rank_candidates()
-                    "posted": False,
-                }
-            )
-
-        print(
-            f"Batch drafted {len(entries)} valid tweets from {len(tweets)} candidates",
-            flush=True,
-        )
-        return entries
-
-    except Exception as e:
-        print(f"LLM batch draft failed: {e}", file=sys.stderr)
-        return []
-
-
-def draft_single(conn, top_tweets: list[dict] | None = None) -> dict | None:
-    """Draft a single tweet using the proven single-tweet prompt. Fallback for batch failures."""
-    recent_posts_db = get_recent_posts(conn, days=14, limit=12)
-    recent_engagements_db = get_recent_engagements(conn, hours=168, limit=10)
-    top_posts_db = get_top_posts(conn, limit=20)
-    popular_candidates_db = get_popular_candidate_tweets(conn, days=30, limit=25)
-
-    recent_posts = [p.get("text", "")[:200] for p in recent_posts_db]
-    engagement_themes = _get_engagement_themes(recent_engagements_db, n=10)
-    research = load_morning_research(conn)
-
-    top_posts_with_stats = [
-        p for p in top_posts_db if (p.get("likes") or 0) + (p.get("rts") or 0) > 0
-    ]
-    top_posts_section = ""
-    if top_posts_with_stats:
-        lines = []
-        for p in top_posts_with_stats:
-            likes = p.get("likes") or 0
-            rts = p.get("rts") or 0
-            text = (p.get("text") or "").replace("\n", " ")
-            lines.append(f"  [{likes}L {rts}RT] {text}")
-        top_posts_section = (
-            "\n## Posts that got the most engagement — write in this style and voice:\n"
-            + "\n".join(lines)
-            + "\n"
-        )
-
-    popular_candidates_section = ""
-    if popular_candidates_db:
-        lines = []
-        for c in popular_candidates_db:
-            likes = c.get("likes") or 0
-            rts = c.get("retweets") or 0
-            text = (c.get("text") or "").replace("\n", " ")
-            lines.append(f"  [{likes}L {rts}RT] {text}")
-        popular_candidates_section = (
-            "\n## What's getting traction in the space right now"
-            " — use as angle/topic inspiration only, don't copy verbatim:\n"
-            + "\n".join(lines)
-            + "\n"
-        )
-
-    top_tweets_section = _build_top_tweets_section(top_tweets)
-
-    project_context = load_project_context()
-
-    research_text = ""
-    if research:
-        parts = []
-        if research.get("hnStories"):
-            for s in research["hnStories"][:2]:
-                parts.append(f'- HN trending: "{s["title"]}" ({s["points"]} pts)')
-        if research.get("devActivity"):
-            parts.append(f"- Dev activity: {research['devActivity']}")
-        if parts:
-            research_text = "\n".join(parts)
-
-    prompt = f"""Draft ONE original, ready-to-post tweet for a technical Twitter account. Output a COMPLETE tweet, not a topic stub or planning note.
-
-# Project & Strategy Context
-{project_context}
-
-# Your Task
-Draft ONE post. Choose whichever format produces the strongest, most engagement-worthy result.
-
-## Format A — Counterintuitive observation (1–4 sentences, ends with a punch)
-Open with a specific number, dollar amount, or named company in the FIRST 10 words.
-Structure: counterintuitive claim with evidence → why it matters.
-The last sentence must either: pose a question, drop a specific stat, or name a consequence.
-NEVER end on a vague setup. NOT imperative. Never "make sure you", "you should".
-Good: "AWS egress fees cost the average startup $14K/year — more than most junior engineer benefits packages. The cloud isn't expensive because of compute. It's expensive because leaving is."
-
-## Format B — Engineering dilemma (ends with a forced-choice question)
-A realistic scenario where a senior engineer could argue EITHER side.
-- Open with concrete specifics: team size, traffic numbers, dollar amounts
-- Include one constraint that makes the obvious answer wrong
-- MUST end with 1–2 direct decision questions. The question IS the hook.
-Good: "3-person team, 200 RPS, P99 at 400ms. Your biggest customer wants multi-region in 6 weeks or they churn. Do you bolt on a CDN and pray, or tell them 3 months and risk the contract?"
-
-## Recent posts — avoid repeating these angles (last 12):
-{json.dumps(recent_posts, indent=2)}
-{top_posts_section}
-{popular_candidates_section}
-{top_tweets_section}
-## Audience engagement signal:
-{json.dumps(engagement_themes, indent=2) if engagement_themes else "  (no data yet)"}
-
-{f"## Trending today (inspiration only — NO links):{chr(10)}{research_text}" if research_text else ""}
-
-## Hard rules
-- Must contain at least ONE of: a specific number/dollar amount, a named platform (AWS, GCP, Stripe, etc.), or a direct question.
-- Must end with proper punctuation. No trailing setups.
-- Standard sentence capitalization. No hashtags, no links, no product mentions, no "Decent Cloud" references.
-- No AI vocabulary: "Furthermore", "Additionally", "It's important to note that".
-
-Output as JSON object: {{"post": "your tweet text here"}}
-Output ONLY the JSON object. No markdown, no explanation."""
-
-    try:
-        raw = call_llm(prompt, timeout=120, json_mode=True)
-        if not raw:
-            return None
-
-        payload = _try_parse_json_payload(raw)
-        if isinstance(payload, dict):
-            text = payload.get("post", "")
-        elif isinstance(payload, str):
-            text = payload
-        else:
-            text = ""
-
-        if not text:
-            return None
-
-        text = text.strip().strip('"').strip("'")
-        text = re.sub(r"^\([^)]{3,30}\)\s*", "", text).strip()
-
-        if not text or len(text) < 20:
-            return None
-        if has_product_mention(text):
-            return None
-
-        return {
-            "text": text,
-            "draftedAt": datetime.now(timezone.utc).isoformat(),
-            "llm_score": 0,
-            "posted": False,
-        }
-    except Exception as e:
-        print(f"Single draft failed: {e}", file=sys.stderr)
-        return None
-
+# ---------------------------------------------------------------------------
+# CLI + main
+# ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Post original Twitter content")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview generated posts without posting",
-    )
-    parser.add_argument(
-        "--top-tweets-hours",
-        type=int,
-        default=168,
-        help="How far back to look for top tweets (default: 168 = 7 days)",
-    )
-    parser.add_argument(
-        "--top-tweets-terms",
-        type=int,
-        default=4,
-        help="Number of search terms to sample for top tweets (default: 4)",
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Preview generated posts without posting")
+    parser.add_argument("--top-tweets-hours", type=int, default=168, help="How far back to look for top tweets (default: 168 = 7 days)")
+    parser.add_argument("--top-tweets-terms", type=int, default=4, help="Number of search terms to sample for top tweets (default: 4)")
     return parser
+
+
+def _print_dry_run(top_tweets, ranked, hook_text, reveal_text, fmt):
+    """Display dry-run results."""
+    print("\n=== DRY-RUN RESULTS ===", flush=True)
+    if top_tweets:
+        print(f"\n--- Top tweets used ({len(top_tweets)}) ---", flush=True)
+        for t in top_tweets[:10]:
+            text = (t.get("text") or "").replace("\n", " ")
+            print(f"  [{t.get('likes', 0)}L {t.get('retweets', 0)}RT] @{t.get('author', '?')}: {text}", flush=True)
+    print(f"\n--- All ranked candidates ({len(ranked)}) ---", flush=True)
+    for i, c in enumerate(ranked):
+        hook = (c.get("hook") or "").replace("\n", " ")
+        reveal = (c.get("reveal") or "").replace("\n", " ")
+        print(f"  #{i+1} (score={c.get('llm_score', '?')}, {c.get('format', '?')}):", flush=True)
+        print(f"    HOOK: {hook}", flush=True)
+        if reveal:
+            print(f"    REVEAL: {reveal}", flush=True)
+    print(f"\n--- Would post ---", flush=True)
+    print(f"  Format: {fmt}", flush=True)
+    print(f"  HOOK: {hook_text}", flush=True)
+    if reveal_text:
+        print(f"  REVEAL: {reveal_text}", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -731,7 +620,6 @@ def main(argv: list[str] | None = None) -> int:
         print("*** DRY-RUN MODE — will NOT post ***", flush=True)
     print(f"Time: {utc_now()}", flush=True)
 
-    # Pre-flight: ensure Chrome CDP is reachable and clear any blocking dialogs.
     try:
         ensure_browser_ready()
     except RuntimeError as e:
@@ -739,7 +627,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Browser not ready: {e}", file=sys.stderr)
         return 1
 
-    # Fetch top tweets before DB context (avoid holding connections during CDP)
+    # Fetch top tweets before DB work (avoid holding connections during CDP)
     top_tweets: list[dict] = []
     try:
         top_tweets = fetch_top_tweets(
@@ -752,161 +640,116 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with get_conn() as conn:
             ensure_schema(conn)
-            # Check if we've already posted enough today
-            count = count_posts_today(conn)
-            print(f"Posts today: {count}/5", flush=True)
 
-            if count >= 5 and not dry_run:
-                print("Already posted 5 original tweets today, skipping")
+            count = count_posts_today(conn)
+            print(f"Posts today: {count}/6", flush=True)
+            if count >= 6 and not dry_run:
+                print("Already posted 6 original tweets today, skipping")
                 return 0
 
-            # Load queue and clean up old posted entries (>7 days)
+            # Load and clean queue
             pruned = prune_content_queue(conn, posted_older_than_days=7)
             if pruned:
                 print(f"Pruned {pruned} old posted queue entries", flush=True)
-            queue = load_queue(conn)
-            unposted = [entry for entry in queue if not entry.get("posted")]
-            invalid = [
-                e for e in unposted if not _is_valid_candidate_text(e.get("text", ""))
-            ]
-            if invalid:
-                print(f"Ignoring {len(invalid)} invalid queued draft(s)", flush=True)
-                now = datetime.now(timezone.utc)
-                for entry in invalid:
-                    if entry.get("id") is not None:
-                        mark_content_queue_posted(conn, int(entry["id"]), now)
-            unposted = [
-                e for e in unposted if _is_valid_candidate_text(e.get("text", ""))
-            ]
-            print(f"Queue: {len(queue)} total, {len(unposted)} unposted", flush=True)
 
-            # If <3 unposted entries, draft a batch (keep buffer ahead of 5/day demand)
+            unposted = _filter_valid_unposted(get_content_queue(conn), conn)
+            print(f"Queue: {len(unposted)} unposted valid", flush=True)
+
+            # Draft if queue is low
             if len(unposted) < 3:
                 print("Queue low, drafting batch...", flush=True)
                 new_entries = draft_batch(conn, top_tweets=top_tweets)
                 if new_entries:
                     inserted = insert_content_queue_entries(conn, new_entries)
                     print(f"Inserted {inserted} drafted entries into queue", flush=True)
-                    queue = load_queue(conn)
-                    unposted = [entry for entry in queue if not entry.get("posted")]
-                    unposted = [
-                        e
-                        for e in unposted
-                        if _is_valid_candidate_text(e.get("text", ""))
-                    ]
-                    print(f"Queue after batch: {len(unposted)} unposted", flush=True)
                 else:
-                    # Fallback: draft a single tweet (more reliable with GLM-5)
                     print("Batch failed, falling back to single draft...", flush=True)
                     single = draft_single(conn, top_tweets=top_tweets)
                     if single:
                         insert_content_queue_entries(conn, [single])
-                        queue = load_queue(conn)
-                        unposted = [entry for entry in queue if not entry.get("posted")]
-                        unposted = [
-                            e
-                            for e in unposted
-                            if _is_valid_candidate_text(e.get("text", ""))
-                        ]
-                        print(
-                            f"Queue after single draft: {len(unposted)} unposted",
-                            flush=True,
-                        )
                     else:
                         print("Single draft also failed", flush=True)
+                unposted = _filter_valid_unposted(get_content_queue(conn))
+                print(f"Queue after drafting: {len(unposted)} unposted", flush=True)
 
             if not unposted:
                 send_error_alert("Content queue empty and all drafting failed")
                 print("No tweets available in queue")
                 return 1
 
-            # Rank a bounded candidate set to keep ranking prompt reliably parseable.
-            rank_pool = unposted[:20]
-            top_posts = get_top_posts(conn, limit=20)
-            print(
-                f"Ranking {len(rank_pool)} candidates against {len(top_posts)} top posts...",
-                flush=True,
-            )
-            ranked = llm_rank_candidates(rank_pool, top_posts)
-            best = next(
-                (c for c in ranked if _is_valid_candidate_text(c.get("text", ""))), None
-            )
+            # Rank candidates
+            rank_candidates = [_to_rank_candidate(e) for e in unposted[:20]]
+            print(f"Ranking {len(rank_candidates)} candidates...", flush=True)
+            ranked = llm_rank_candidates(rank_candidates)
+            best = ranked[0] if ranked else None
             if best is None:
-                print("No valid candidate text after ranking", flush=True)
+                print("No valid candidate after ranking", flush=True)
                 return 1
-            draft = best["text"]
-            print(
-                f"Selected (llm_score={best.get('llm_score', '?')}): {draft[:80]}...",
-                flush=True,
-            )
 
+            hook_text = best.get("hook", "")
+            reveal_text = best.get("reveal", "")
+            fmt = best.get("format", "unknown")
+            print(f"Selected ({fmt}, score={best.get('llm_score', '?')}): {hook_text[:100]}...", flush=True)
+
+            # Dry run: display and exit
             if dry_run:
-                print("\n=== DRY-RUN RESULTS ===", flush=True)
-                if top_tweets:
-                    print(f"\n--- Top tweets used ({len(top_tweets)}) ---", flush=True)
-                    for t in top_tweets[:10]:
-                        likes = t.get("likes", 0)
-                        rts = t.get("retweets", 0)
-                        text = (t.get("text") or "").replace("\n", " ")
-                        print(f"  [{likes}L {rts}RT] @{t.get('author', '?')}: {text}", flush=True)
-                print(f"\n--- All ranked candidates ({len(ranked)}) ---", flush=True)
-                for i, c in enumerate(ranked):
-                    score = c.get("llm_score", "?")
-                    text = (c.get("text") or "").replace("\n", " ")
-                    print(f"  #{i+1} (score={score}): {text}", flush=True)
-                print(f"\n--- Would post ---\n{draft}", flush=True)
+                _print_dry_run(top_tweets, ranked, hook_text, reveal_text, fmt)
                 return 0
 
-            # Humanize (mandatory per strategy doc)
+            # Humanize
             try:
-                draft = humanize(draft)
-                print(f"Humanized: {draft[:80]}...", flush=True)
+                hook_text = humanize(hook_text)
+                if reveal_text:
+                    reveal_text = humanize(reveal_text)
+                print(f"Humanized hook: {hook_text[:80]}...", flush=True)
             except Exception as e:
-                print(
-                    f"Humanize error: {e}, proceeding with original draft", flush=True
-                )
+                print(f"Humanize error: {e}, proceeding with original draft", flush=True)
 
-            # Post
-            print("Posting via browser CDP...", flush=True)
-            if not post_tweet(draft):
-                send_error_alert(f"Failed to post via CDP\n\nDraft was:\n{draft}")
-                print("Failed to post")
+            # Post hook
+            print("Posting hook via browser CDP...", flush=True)
+            if not post_tweet(hook_text):
+                send_error_alert(f"Failed to post hook via CDP\n\nHook was:\n{hook_text}")
+                print("Failed to post hook")
                 return 1
+            print("Hook posted successfully", flush=True)
 
-            print("Posted successfully", flush=True)
-
-            # Mark as posted in queue
-            if best.get("id") is not None:
-                mark_content_queue_posted(
-                    conn, int(best["id"]), datetime.now(timezone.utc)
-                )
-
-            # Get the tweet ID from our profile for tracking
-            from twitter_utils import jitter_sleep
-
+            # Post reveal as self-reply (thread formats only)
             jitter_sleep(6, 12)
-            tweet_id = get_latest_own_tweet_id("DecentCloud_org")
+            hook_tweet_id = get_latest_own_tweet_id("DecentCloud_org")
 
-            # Insert into posts table with deadlock retry.
+            if reveal_text and hook_tweet_id:
+                print(f"Posting reveal as reply to {hook_tweet_id}...", flush=True)
+                jitter_sleep(3, 6)
+                posted_reply, reply_id = post_reply_with_retries(
+                    hook_tweet_id, reveal_text, attempts=2
+                )
+                if posted_reply:
+                    print(f"Reveal posted successfully (reply_id={reply_id})", flush=True)
+                else:
+                    print("Failed to post reveal (hook is still live)", flush=True)
+            elif reveal_text:
+                print("Could not get hook tweet ID — reveal not posted", flush=True)
+
+            # Record in DB
+            if best.get("id") is not None:
+                mark_content_queue_posted(conn, int(best["id"]), datetime.now(timezone.utc))
+
             for attempt in range(1, 4):
                 try:
                     insert_post(
                         conn,
-                        tweet_id=tweet_id or f"unknown-{utc_now()}",
+                        tweet_id=hook_tweet_id or f"unknown-{utc_now()}",
                         type="post",
-                        text=draft,
+                        text=hook_text,
                     )
                     break
                 except psycopg2.errors.DeadlockDetected:
                     if attempt == 3:
                         raise
                     wait = 0.8 * attempt
-                    print(
-                        f"insert_post deadlock; retrying in {wait:.1f}s (attempt {attempt}/3)",
-                        flush=True,
-                    )
+                    print(f"insert_post deadlock; retrying in {wait:.1f}s (attempt {attempt}/3)", flush=True)
                     time.sleep(wait)
-            print(f"Logged post to DB (tweet_id={tweet_id})", flush=True)
+            print(f"Logged post to DB (tweet_id={hook_tweet_id})", flush=True)
 
         return 0
 

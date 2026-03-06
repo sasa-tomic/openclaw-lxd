@@ -129,6 +129,7 @@ def call_llm(
     model: Optional[str] = None,
     fallback_model: Optional[str] = None,
     json_mode: bool = False,
+    temperature: float = 0.7,
 ) -> tuple[bool, str]:
     """Call LLM with prompt, return (success, response).
 
@@ -139,6 +140,7 @@ def call_llm(
         model: Override primary model (uses OPENAI_MODEL env var if not set)
         fallback_model: Optional fallback model if primary fails
         json_mode: Force JSON response format (default False)
+        temperature: Sampling temperature (default 0.7)
 
     Returns:
         Tuple of (success: bool, response: str)
@@ -181,7 +183,7 @@ def call_llm(
                     json={
                         "model": model_name,
                         "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.7,
+                        "temperature": temperature,
                         **(
                             {"response_format": {"type": "json_object"}}
                             if json_mode
@@ -272,7 +274,8 @@ def _extract_response_content(response: requests.Response) -> str | None:
 
 
 def call_llm_simple(
-    prompt: str, timeout: int = 120, json_mode: bool = False
+    prompt: str, timeout: int = 120, json_mode: bool = False,
+    temperature: float = 0.7,
 ) -> str | None:
     """Simple LLM call returning just the response string (for backward compatibility).
 
@@ -281,11 +284,13 @@ def call_llm_simple(
     Args:
         prompt: The text prompt to send to the LLM
         timeout: Request timeout in seconds (default 120)
+        temperature: Sampling temperature (default 0.7)
 
     Returns:
         Response text on success, None on failure
     """
     success, response = call_llm(
-        prompt, max_retries=4, timeout=timeout, json_mode=json_mode
+        prompt, max_retries=4, timeout=timeout, json_mode=json_mode,
+        temperature=temperature,
     )
     return response if success else None

@@ -311,7 +311,7 @@ def get_content_queue(conn) -> list[dict]:
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT id, text, drafted_at, llm_score, posted, posted_at
+            SELECT id, text, drafted_at, llm_score, posted, posted_at, thread_data
             FROM content_queue
             ORDER BY drafted_at ASC, id ASC
             """
@@ -336,6 +336,7 @@ def get_content_queue(conn) -> list[dict]:
                     if isinstance(d.get("posted_at"), datetime)
                     else None
                 ),
+                "thread_data": d.get("thread_data"),
             }
         )
     return out
@@ -347,8 +348,8 @@ def insert_content_queue_entries(conn, entries: list[dict]) -> int:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO content_queue (text, drafted_at, llm_score, posted, posted_at)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO content_queue (text, drafted_at, llm_score, posted, posted_at, thread_data)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     (e.get("text") or "")[:500],
@@ -360,6 +361,7 @@ def insert_content_queue_entries(conn, entries: list[dict]) -> int:
                     datetime.fromisoformat(str(e.get("postedAt")).replace("Z", "+00:00"))
                     if e.get("postedAt")
                     else None,
+                    json.dumps(e["thread_data"]) if e.get("thread_data") else None,
                 ),
             )
             inserted += 1
@@ -2843,6 +2845,12 @@ def ensure_schema(conn) -> None:
     """
     with conn.cursor() as cur:
         cur.execute(_SCHEMA_SQL)
+
+    # Add thread_data column if missing (migration for thread-based posts)
+    with conn.cursor() as cur:
+        cur.execute("""
+            ALTER TABLE content_queue ADD COLUMN IF NOT EXISTS thread_data JSONB
+        """)
 
     # Normalize historical case-variant duplicates once schema exists.
     merged = _dedupe_accounts_case(conn)
