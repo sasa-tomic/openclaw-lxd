@@ -129,7 +129,16 @@ GOOD: "I fat-fingered a deploy config and took down prod for 47 minutes. My Slac
 
 ## HOOK → REVEAL CONNECTION (applies to all thread formats)
 The hook must end on something UNRESOLVED — a reaction, disbelief, a question the reader needs answered.
-The reveal must OPEN by directly answering that unresolved moment, then CLOSE the story (what you did, what you learned).
+The reveal must OPEN by directly answering that unresolved moment, then CLOSE the story.
+The reveal must MATCH THE ENERGY of the hook. If the hook is reckless and funny, the reveal
+can't be a dry process-improvement summary. If the hook made the reader laugh, the reveal
+should too. Don't bait with chaos and deliver a postmortem.
+BAD reveal: "We were getting 200+ alerts per week. 97% were noise. I deleted 90% of the rules.
+Now we get 3-4 per week." (flat report — every sentence same structure, no feeling)
+GOOD reveal: "First week: silence. Bliss. Second week: actual production outage, nobody noticed
+for 47 minutes. Turns out 97% of our alerts were noise and we'd trained the whole team to
+ignore all of them. I turned alerts back on but nuked every rule that had auto-resolved
+more than twice. Down from 200/week to 4. Every one actually matters now."
 BAD hook ending: "The costs were higher than expected." (flat, no tension)
 BAD reveal opening: "Data transfer fees apply between availability zones." (disconnected lecture)
 GOOD hook ending: "I checked the bill expecting $200. It said $1,100."
@@ -467,10 +476,13 @@ def _build_thread_entry(item: dict) -> dict | None:
     }
 
 
-def draft_batch(conn, top_tweets: list[dict] | None = None) -> list[dict]:
-    """Draft a batch of 6 engagement-optimized thread entries."""
-    context = _build_context_sections(conn, top_tweets)
+def draft_batch(context: str, temperature: float = 0.9) -> list[dict]:
+    """Draft a batch of 6 engagement-optimized thread entries.
 
+    Args:
+        context: Pre-built context string (from _build_context_sections).
+        temperature: LLM sampling temperature.
+    """
     prompt = f"""Write 6 tweet threads. Each MUST use a DIFFERENT engagement format.
 Each thread consists of a HOOK tweet and (for most formats) a REVEAL self-reply.
 
@@ -489,7 +501,7 @@ Output ONLY a JSON array. Each element:
 No markdown, no explanation. Just the JSON array of 6 objects."""
 
     try:
-        raw = call_llm(prompt, timeout=180, json_mode=True, temperature=0.9)
+        raw = call_llm(prompt, timeout=180, json_mode=True, temperature=temperature)
         if not raw:
             print("LLM returned nothing for batch draft", file=sys.stderr)
             return []
@@ -508,9 +520,8 @@ No markdown, no explanation. Just the JSON array of 6 objects."""
         return []
 
 
-def draft_single(conn, top_tweets: list[dict] | None = None) -> dict | None:
+def draft_single(context: str) -> dict | None:
     """Draft a single engagement thread. Fallback for batch failures."""
-    context = _build_context_sections(conn, top_tweets)
 
     fmt_choice = random.choice([
         "cliffhanger", "deliberately_wrong", "reply_with_number",
@@ -788,12 +799,29 @@ def main(argv: list[str] | None = None) -> int:
                 print("Already posted 6 original tweets today, skipping")
                 return 0
 
-            # Generate fresh candidates every run
-            print("Drafting batch...", flush=True)
-            new_entries = draft_batch(conn, top_tweets=top_tweets)
+            # Generate two independent batches for diversity
+            # Build context once (requires DB), then fan out LLM calls in parallel
+            context = _build_context_sections(conn, top_tweets)
+            temps = [0.7, 0.9, 1.1]
+            print(f"Drafting {len(temps)} batches in parallel (T={temps})...", flush=True)
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            new_entries: list[dict] = []
+            with ThreadPoolExecutor(max_workers=len(temps)) as pool:
+                futures = {
+                    pool.submit(draft_batch, context, t): t
+                    for t in temps
+                }
+                for fut in as_completed(futures):
+                    t = futures[fut]
+                    try:
+                        batch = fut.result()
+                        print(f"  T={t}: {len(batch)} drafts", flush=True)
+                        new_entries.extend(batch)
+                    except Exception as e:
+                        print(f"  T={t}: failed ({e})", flush=True)
             if not new_entries:
-                print("Batch failed, falling back to single draft...", flush=True)
-                single = draft_single(conn, top_tweets=top_tweets)
+                print("All batches failed, falling back to single draft...", flush=True)
+                single = draft_single(context)
                 new_entries = [single] if single else []
 
             unposted = _filter_valid_unposted(
