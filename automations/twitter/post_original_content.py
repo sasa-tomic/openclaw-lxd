@@ -4,15 +4,50 @@
 Strategy: /projects/Notes/Pickle/Twitter/decent-cloud-twitter-plan.md
 
 Runs daily to ensure consistent original content posting (1-2 tweets/day).
-
-Phase 1 mode: founder voice takes only — no links, no product mentions, no hashtags.
-
-Content is generated as engagement-optimized THREADS:
-- Hook tweet (stops the scroll) + reveal reply (delivers the payoff)
-- Six engagement formats: cliffhanger, deliberately_wrong, reply_with_number,
-  confession, math_nobody_did, impossible_quiz
-
+Phase 1 mode: founder voice — no links, no product mentions, no hashtags.
 This complements engagement replies with original value-adding content.
+
+Requirements (keep these in sync when changing generation logic):
+
+1. THREAD STRUCTURE — every post is a hook tweet + self-reply reveal.
+   The hook stops the scroll (curiosity gap, shock, forced participation).
+   The reveal delivers the payoff (specific numbers, receipts, consequences).
+   Standalone formats (reply_with_number, impossible_quiz) skip the reveal.
+
+2. NARRATIVE — each thread must follow good narration principles:
+   setup → reader identification ("oh no, I do that too") → cliffhanger → answer.
+   Do NOT provide dry facts. Start with a situation the reader already encountered,
+   then make a twist. Big surprise. The reader must think "wait, WHAT?"
+
+3. SIX ENGAGEMENT FORMATS (see ENGAGEMENT_FORMATS constant):
+   cliffhanger, deliberately_wrong, reply_with_number,
+   confession, math_nobody_did, impossible_quiz.
+   Each batch must use a DIFFERENT format per thread.
+
+4. SPECIFICITY — every thread must contain real company names (AWS, GCP, Azure,
+   Cloudflare, Vercel, etc.) and realistic numbers (dollar amounts, percentages,
+   timeframes). No generic "cloud is expensive" takes.
+
+5. PARTICIPATION — at least some formats must force replies:
+   open-ended questions ("What would you do?", "What do you cut first?"),
+   "reply with your number", deliberately wrong claims people must correct.
+
+6. ANTI-AI VOICE — no hedge words, no "Furthermore/Additionally/crucial/landscape",
+   no "It's worth noting." Standard capitalization, complete sentences.
+   No hashtags, no links, no "Decent Cloud", no product mentions.
+
+7. REAL SIGNALS — creative seeds are extracted from actually-trending top tweets
+   (fetched via f=top search). The LLM riffs on these, never copies.
+
+8. FACTUAL ACCURACY — nothing we post should be technically wrong or obvious
+   to anyone with basic tech knowledge. Every number must be plausible and
+   defensible. Every claim must survive a reply from a senior engineer.
+   "deliberately_wrong" hooks are the ONE exception — and even those MUST
+   have a reveal that corrects them with real proof. If someone screenshots
+   only the hook, the reveal must be clearly a self-reply correction thread.
+
+9. DRY-RUN CLI — `--dry-run` previews all ranked candidates with scores,
+   formats, hooks, and reveals without posting anything.
 """
 
 from __future__ import annotations
@@ -86,6 +121,8 @@ ENGAGEMENT_FORMATS = """
 Hook: Tell a real story — a specific company, a specific dollar amount, a specific disaster.
 Build tension. End mid-story: "And then we opened the bill."
 Reveal (self-reply): The punchline — what actually happened, the real number, the consequence nobody expected.
+ACCURACY: The story must be plausible. Every number must be realistic for that service/company.
+A senior engineer reading this must think "yeah, that tracks" — not "that's made up."
 Example hook: "Our team mass-migrated from AWS to GCP for the 'savings.' Three months in we got the first real bill."
 Example reveal: "Egress fees alone were $14K/mo. They weren't on any pricing calculator. We migrated back within 6 weeks."
 
@@ -93,18 +130,25 @@ Example reveal: "Egress fees alone were $14K/mo. They weren't on any pricing cal
 Hook: State something that SOUNDS true but is provably wrong. Make it specific enough that experts will rage-reply.
 The wronger it sounds, the more replies you get. People cannot resist correcting strangers on the internet.
 Reveal (self-reply): The actual correction + proof. Show the receipt.
+CRITICAL: The hook is SATIRE — it must be obviously a setup, not something that makes us look ignorant.
+The reveal MUST follow immediately as a self-reply so readers see it's a thread. The correction must
+contain real, verifiable facts. Do NOT make claims that are just slightly off — make them boldly,
+confidently wrong in a way that's clearly bait. Think "hot take that triggers the reply guys."
 Example hook: "Kubernetes saves money. That's just a fact at this point."
 Example reveal: "Average K8s cluster runs at 13% utilization. The orchestrator itself eats 15-30% overhead. You're paying for a scheduler to waste your money efficiently."
 
 ### 3. REPLY WITH YOUR NUMBER (format: "reply_with_number") [STANDALONE — no reveal needed]
 One tweet that forces participation. Ask for a SPECIFIC number from their experience.
 People love comparing themselves. Make it about money, time, or pain.
+ACCURACY: The "mine is X" number you include must be realistic and relatable.
 Example: "How many mass-subscriptions are you paying for that you haven't opened in 6+ months? Reply with your number. Mine is 11."
 
 ### 4. CONFESSION (format: "confession")
 Hook: Admit something most people would hide. Make it specific and slightly reckless.
 Must be relatable — the reader should think "oh no, I do that too."
 Reveal (self-reply): What happened next — the consequence, the lesson, or the even worse thing you discovered.
+ACCURACY: The confession must be something a competent engineer might actually do for pragmatic reasons —
+not something genuinely negligent. The reveal must show the reasoning was sound or the lesson was learned.
 Example hook: "I've been running a production database without backups for 8 months. On purpose."
 Example reveal: "It's a 200MB SQLite file that rebuilds from an event log in 4 minutes. The 'backup solution' my company quoted was $1,200/mo. Sometimes the right answer is no answer."
 
@@ -112,11 +156,16 @@ Example reveal: "It's a 200MB SQLite file that rebuilds from an event log in 4 m
 Hook: Tease a calculation that reveals a hidden truth. Use real company names and real (or realistic) numbers.
 Make the reader NEED to see the math.
 Reveal (self-reply): The actual breakdown with numbers. Show your work.
+ACCURACY: Every number in the reveal must be realistic and internally consistent. If someone checks
+your math, it must hold up. Use real pricing pages, real typical usage patterns, real industry averages.
+Do NOT invent percentages or dollar amounts that a practitioner would immediately call out as fake.
 Example hook: "I calculated the real hourly cost of an AWS support engineer. The number doesn't make sense."
 Example reveal: "Enterprise Support: $15K/mo minimum. Average response for Sev-2: 12 hours. Median resolution: 'have you tried restarting the instance.' That's $1,250/ticket for the privilege of waiting."
 
 ### 6. IMPOSSIBLE QUIZ (format: "impossible_quiz") [STANDALONE — no reveal needed]
 One question with an answer that sounds impossible but is true. People will guess wrong and share it.
+ACCURACY: The surprising answer MUST be actually true or at least widely reported. If someone
+Googles it, the answer should check out. Do NOT make up fake statistics.
 Example: "What percentage of S3 buckets in production right now have public read access? Wrong answers only."
 """
 
@@ -127,7 +176,16 @@ _PROMPT_RULES = """# Rules
 - Standard capitalization. Complete sentences only.
 - Hook: max 280 chars. Reveal: max 280 chars.
 - Use REAL company names (AWS, GCP, Azure, Cloudflare, Vercel, etc.) and realistic numbers.
-- Each thread must be about a DIFFERENT topic. No two threads about the same company or issue."""
+- Each thread must be about a DIFFERENT topic. No two threads about the same company or issue.
+
+# Accuracy — non-negotiable
+- Every number (dollar amounts, percentages, timeframes) must be REALISTIC for that company/service.
+  A senior engineer must read it and think "yeah, that tracks" — never "that's made up."
+- Do NOT invent statistics. Use numbers that match real pricing pages and industry reports.
+- Do NOT state something obviously wrong or dumb unless it's a "deliberately_wrong" format hook
+  (and even then, the reveal must correct it with real facts).
+- The bar: if a Hacker News commenter would reply "this is wrong because..." with a factual
+  correction, the tweet fails. Every claim must survive scrutiny."""
 
 
 # ---------------------------------------------------------------------------
@@ -507,11 +565,14 @@ For each thread, evaluate:
    - "Reply with your number" + relatable question → high
    - Closed statement nobody needs to add to → low
 
-REJECT:
+REJECT (score 0):
 - Common knowledge hooks ("cloud is expensive" — yeah, we know)
 - AI-sounding language (hedge-y, generic, no voice)
 - Missing payoff (tension with no resolution)
 - Incomplete thoughts or meta-commentary
+- FACTUALLY WRONG claims (numbers that don't add up, stats a practitioner would call fake)
+- OBVIOUS statements that anyone with basic tech knowledge already knows
+- Hooks that make the author look ignorant rather than provocative
 
 Return ONLY valid JSON:
 {{
@@ -606,7 +667,8 @@ def _print_dry_run(top_tweets, ranked, hook_text, reveal_text, fmt):
             print(f"    REVEAL: {reveal}", flush=True)
     print(f"\n--- Would post ---", flush=True)
     print(f"  Format: {fmt}", flush=True)
-    print(f"  HOOK: {hook_text}", flush=True)
+    display_hook = hook_text.rstrip() + " 👇" if reveal_text else hook_text
+    print(f"  HOOK: {display_hook}", flush=True)
     if reveal_text:
         print(f"  REVEAL: {reveal_text}", flush=True)
 
@@ -704,6 +766,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Humanized hook: {hook_text[:80]}...", flush=True)
             except Exception as e:
                 print(f"Humanize error: {e}, proceeding with original draft", flush=True)
+
+            # Append thread indicator when there's a reveal coming
+            if reveal_text and not hook_text.rstrip().endswith("👇"):
+                hook_text = hook_text.rstrip() + " 👇"
 
             # Post hook
             print("Posting hook via browser CDP...", flush=True)
