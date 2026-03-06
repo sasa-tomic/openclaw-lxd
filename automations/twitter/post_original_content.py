@@ -501,7 +501,7 @@ Output ONLY a JSON array. Each element:
 No markdown, no explanation. Just the JSON array of 6 objects."""
 
     try:
-        raw = call_llm(prompt, timeout=180, json_mode=True, temperature=temperature)
+        raw = call_llm(prompt, timeout=300, json_mode=True, temperature=temperature)
         if not raw:
             print("LLM returned nothing for batch draft", file=sys.stderr)
             return []
@@ -805,11 +805,17 @@ def main(argv: list[str] | None = None) -> int:
             temps = [0.7, 0.9, 1.1]
             print(f"Drafting {len(temps)} batches in parallel (T={temps})...", flush=True)
             from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def _draft_with_delay(ctx: str, temp: float, delay: float) -> list[dict]:
+                if delay > 0:
+                    time.sleep(delay)
+                return draft_batch(ctx, temp)
+
             new_entries: list[dict] = []
             with ThreadPoolExecutor(max_workers=len(temps)) as pool:
                 futures = {
-                    pool.submit(draft_batch, context, t): t
-                    for t in temps
+                    pool.submit(_draft_with_delay, context, t, i * 5): t
+                    for i, t in enumerate(temps)
                 }
                 for fut in as_completed(futures):
                     t = futures[fut]
