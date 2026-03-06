@@ -17,6 +17,7 @@ This complements engagement replies with original value-adding content.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import subprocess
@@ -36,6 +37,7 @@ sys.path.insert(
 from lib.llm_utils import call_llm_simple as call_llm, extract_json
 from twitter_utils import (
     ensure_browser_ready,
+    fetch_top_tweets,
     humanize,
     load_project_context,
     post_tweet,
@@ -144,6 +146,8 @@ def _try_parse_json_payload(raw: str) -> object | None:
 
 def _looks_like_meta_response(text: str) -> bool:
     t = (text or "").strip().lower()
+    # Strip markdown bold for detection purposes
+    t_plain = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)
     return (
         t.startswith("let me ")
         or t.startswith("here are ")
@@ -151,6 +155,8 @@ def _looks_like_meta_response(text: str) -> bool:
         or t.startswith("write ")
         or t.startswith("draft ")
         or t.startswith("output ")
+        or t.startswith("consider ")
+        or t.startswith("thinking about ")
         or "analyze the requirements" in t
         or "project & strategy context" in t
         or "format a" in t
@@ -167,12 +173,62 @@ def _looks_like_meta_response(text: str) -> bool:
         or "recent posts to avoid" in t
         or "guidelines" in t
         or t.endswith(":")
+        # Markdown bold angle/topic labels: "**Cloud angle**: ..."
+        or bool(re.match(r"\*\*[^*]+\*\*\s*:", t))
+        # Hedging / planning language instead of actual content
+        or "something about " in t
+        or "let me think" in t
+        or "that's good" in t
+        or "this needs to be" in t
+        or t_plain.endswith("angle")
+        or t_plain.endswith("strategy")
+    )
+
+
+def _is_complete_sentence(text: str) -> bool:
+    """Check that text contains at least one complete sentence."""
+    t = (text or "").strip()
+    # Must end with sentence-ending punctuation (or quote after it)
+    if not re.search(r'[.!?""]\s*$', t):
+        return False
+    # Must contain at least one verb-like word (rough heuristic: >5 words)
+    words = t.split()
+    if len(words) < 6:
+        return False
+    return True
+
+
+def _build_top_tweets_section(top_tweets: list[dict] | None) -> str:
+    """Build prompt section presenting popular tweets as structural examples."""
+    if not top_tweets:
+        return ""
+    lines = []
+    for t in top_tweets[:20]:
+        likes = t.get("likes", 0)
+        rts = t.get("retweets", 0)
+        text = (t.get("text") or "").replace("\n", " ")
+        lines.append(f"  [{likes}L {rts}RT] @{t.get('author', '?')}: {text}")
+    return (
+        "\n## High-performing tweets in this space — study STRUCTURE, not topic:\n"
+        + "\n".join(lines)
+        + "\n\nWhat to extract from these examples:\n"
+        "- Hook pattern: specific number/name/counterintuitive claim in the first 10 words?\n"
+        "- Tension architecture: names an assumption then dismantles it?\n"
+        "- Specificity texture: dollar amounts, percentages, named companies, timeframes?\n"
+        "- Sentence rhythm: short punchy vs. earned long setup with short payoff?\n"
+        "Apply structural DNA to your own original angles. Never copy content.\n"
     )
 
 
 def _is_valid_candidate_text(text: str) -> bool:
     t = (text or "").strip()
-    return 20 <= len(t) <= 280 and not _looks_like_meta_response(t)
+    if not (20 <= len(t) <= 600):
+        return False
+    if _looks_like_meta_response(t):
+        return False
+    if not _is_complete_sentence(t):
+        return False
+    return True
 
 
 def load_queue(conn) -> list[dict]:
@@ -245,7 +301,7 @@ Hard requirements:
 - No markdown, no prose, no extra keys at top level"""
 
     try:
-        raw = call_llm(prompt, timeout=60, json_mode=True)
+        raw = call_llm(prompt, timeout=600, json_mode=True)
         if not raw:
             print("LLM ranking returned nothing, using original order", file=sys.stderr)
             return candidates
@@ -336,14 +392,14 @@ def _get_engagement_themes(recent_engagements: list[dict], n: int = 10) -> list[
     return list(dict.fromkeys(terms))  # deduplicated, order-preserving
 
 
-def draft_batch(conn) -> list[dict]:
+def draft_batch(conn, top_tweets: list[dict] | None = None) -> list[dict]:
     """Use LLM to draft a batch of 3-5 tweets. Returns list of queue entries."""
 
     research = load_morning_research(conn)
     recent_posts_db = get_recent_posts(conn, days=14, limit=12)
     recent_engagements_db = get_recent_engagements(conn, hours=168, limit=15)
-    top_posts_db = get_top_posts(conn, limit=20)
-    popular_candidates_db = get_popular_candidate_tweets(conn, days=30, limit=25)
+    top_posts_db = get_top_posts(conn, limit=40)
+    popular_candidates_db = get_popular_candidate_tweets(conn, days=30, limit=45)
 
     # Extended history: last 12 posts for better dedup and thematic continuity
     recent_posts = [p.get("text", "")[:200] for p in recent_posts_db]
@@ -382,6 +438,8 @@ def draft_batch(conn) -> list[dict]:
             + "\n".join(lines)
         )
 
+    top_tweets_section = _build_top_tweets_section(top_tweets)
+
     project_context = load_project_context()
 
     # Build morning research context (HN trending topics + dev activity)
@@ -401,38 +459,38 @@ def draft_batch(conn) -> list[dict]:
     if not research_text and recent_commits:
         commits_text = "\n".join(f"- {c}" for c in recent_commits[:4])
 
-    prompt = f"""Generate 4 original posts for a technical Twitter account. Mix two formats.
+    prompt = f"""Generate 4 original posts for a technical Twitter account. Each post must be a COMPLETE, READY-TO-POST tweet — not a topic stub, not an angle label, not a planning note.
 
 # Project & Strategy Context
 {project_context}
 
 # Your Task
-Draft 4 posts. Use a mix of Format A and Format B (at least 1 of each). Each must be a DIFFERENT topic and angle.
+Draft 4 posts. Each must be a DIFFERENT topic and angle. Mix formats A and B (at least 1 of each).
 
-## Format A — Observational take (short, 1–4 sentences)
-Describe something real that most people haven't noticed or named.
-Structure: setup (what people assume) → reality (what actually happens, with numbers) → implication (let it land).
+## Format A — Counterintuitive observation (1–4 sentences, ends with a punch)
+Open with a specific number, dollar amount, or named company in the FIRST 10 words.
+Structure: counterintuitive claim with evidence → why it matters.
+The last sentence must either: pose a question, drop a specific stat, or name a consequence.
+NEVER end on a vague setup. The post must land — reader should think "wait, really?" or "that's messed up."
 NOT imperative. Never "make sure you", "you should". Describe; don't instruct.
-Example: "Stripe can quietly hold back 10% of your revenue for up to 6 months if their system flags your account — rapid growth is often enough to trigger it."
-Go for the uncomfortable truth over the comfortable observation.
-"Everyone knows X" posts don't land — find the contradiction.
-Safe: "Cloud migrations are hard." Spicy: "Most cloud migrations cost 3x because enterprises are trading human problems for API problems."
+Good: "AWS egress fees cost the average startup $14K/year — more than most junior engineer benefits packages. The cloud isn't expensive because of compute. It's expensive because leaving is."
+Bad: "Cloud migrations are hard." (vague, no number, no named entity, no punch)
+Bad: "Your startup needs SOC2 compliance within 90 days." (pure setup, goes nowhere)
 
-## Format B — Engineering dilemma (longer, structured, ends with a question)
-A realistic scenario with no obvious correct answer. Forces the reader to pick a side.
+## Format B — Engineering dilemma (ends with a forced-choice question)
+A realistic scenario where a senior engineer could argue EITHER side. Forces the reader to pick.
 Requirements:
-- Concrete system snapshot: team size, traffic/RPS, deploy time, incidents/month, DB shape
-- At least one time or org constraint (deadline, hiring freeze, audit requirement)
-- At least one contradictory signal ("it works fine, but…")
-- Both options clearly defensible — no cartoon villain choice
-- Ends with 1–2 direct decision questions
-The question must NOT have an obvious right answer. A senior engineer must be able to argue either side confidently.
-Bad: "Should you rewrite a clearly broken system?" Good: "300ms P99, 2 engineers, Series A in 3 months — do you start the migration or wait?"
+- Open with concrete specifics: team size, traffic numbers, deploy cadence, or dollar amounts
+- Include one constraint that makes the obvious answer wrong (deadline, hiring freeze, budget cap)
+- MUST end with 1–2 direct decision questions. The question IS the hook.
+Good: "3-person team, 200 RPS, P99 at 400ms. Your biggest customer wants multi-region in 6 weeks or they churn. Do you bolt on a CDN and pray, or tell them 3 months and risk the contract?"
+Bad: "Should you migrate to microservices?" (obvious answer depends on context — no tension)
 
 ## Recent posts — AVOID repeating these angles (last 12):
 {json.dumps(recent_posts, indent=2)}
 {top_posts_section}
 {popular_candidates_section}
+{top_tweets_section}
 ## Audience engagement signal — active topics recently:
 {json.dumps(engagement_themes, indent=2) if engagement_themes else "  (no data yet)"}
 Use as inspiration for fresh angles only — don't repeat same framing.
@@ -440,11 +498,13 @@ Use as inspiration for fresh angles only — don't repeat same framing.
 {f"## Trending today (inspiration only — NO links in posts):{chr(10)}{research_text}" if research_text else ""}
 {f"## Recent dev activity (for inspiration):{chr(10)}{commits_text}" if commits_text else ""}
 
-## Rules for all posts
-- ALWAYS capitalize the first word of every post. Standard sentence capitalization throughout: proper nouns (AWS, GCP, Stripe, etc.) capitalized, everything else normal case. BAD: "everyone claims..." GOOD: "Everyone claims..."
-- No hashtags, no links, no product mentions, no "Decent Cloud" references
-- No AI vocabulary: "Furthermore", "Additionally", "It's important to note that"
-- Name specific platforms (AWS, GCP, Azure, Stripe) when discussing their gotchas. "The cloud" is vague; "AWS egress fees" is interesting.
+## Hard rules for every post
+- Every post must contain at least ONE of: a specific number/dollar amount, a named company/platform (AWS, GCP, Stripe, Vercel, etc.), or a direct question.
+- Every post must end with proper punctuation (period, question mark, or exclamation). No trailing setups.
+- Standard sentence capitalization. Proper nouns capitalized, everything else normal case.
+- No hashtags, no links, no product mentions, no "Decent Cloud" references.
+- No AI vocabulary: "Furthermore", "Additionally", "It's important to note that", "It's worth noting".
+- Output COMPLETE tweets only. Do NOT output topic labels, angle descriptions, or planning notes.
 
 Output as JSON array of 4 strings: ["post1", "post2", "post3", "post4"]
 Output ONLY the JSON array. No explanation, no markdown wrapping."""
@@ -506,7 +566,7 @@ Output ONLY the JSON array. No explanation, no markdown wrapping."""
         return []
 
 
-def draft_single(conn) -> dict | None:
+def draft_single(conn, top_tweets: list[dict] | None = None) -> dict | None:
     """Draft a single tweet using the proven single-tweet prompt. Fallback for batch failures."""
     recent_posts_db = get_recent_posts(conn, days=14, limit=12)
     recent_engagements_db = get_recent_engagements(conn, hours=168, limit=10)
@@ -549,6 +609,8 @@ def draft_single(conn) -> dict | None:
             + "\n"
         )
 
+    top_tweets_section = _build_top_tweets_section(top_tweets)
+
     project_context = load_project_context()
 
     research_text = ""
@@ -562,38 +624,43 @@ def draft_single(conn) -> dict | None:
         if parts:
             research_text = "\n".join(parts)
 
-    prompt = f"""You are drafting one original post for a technical Twitter account.
+    prompt = f"""Draft ONE original, ready-to-post tweet for a technical Twitter account. Output a COMPLETE tweet, not a topic stub or planning note.
 
 # Project & Strategy Context
 {project_context}
 
 # Your Task
-Draft ONE post. Choose whichever format below produces the strongest result.
+Draft ONE post. Choose whichever format produces the strongest, most engagement-worthy result.
 
-## Format A — Observational take (short, 1–4 sentences)
-Describe something real that most people haven't noticed or named.
-Structure: setup (what people assume) → reality (with numbers/specifics) → implication (let it land, don't prescribe a fix).
-NOT imperative. Never "make sure you", "you should". Describe; don't instruct.
+## Format A — Counterintuitive observation (1–4 sentences, ends with a punch)
+Open with a specific number, dollar amount, or named company in the FIRST 10 words.
+Structure: counterintuitive claim with evidence → why it matters.
+The last sentence must either: pose a question, drop a specific stat, or name a consequence.
+NEVER end on a vague setup. NOT imperative. Never "make sure you", "you should".
+Good: "AWS egress fees cost the average startup $14K/year — more than most junior engineer benefits packages. The cloud isn't expensive because of compute. It's expensive because leaving is."
 
-## Format B — Engineering dilemma (longer, structured, ends with a question)
-A realistic scenario with no obvious correct answer. Forces the reader to pick a side.
-- Concrete system snapshot (team size, traffic, deploy time, incidents, DB shape)
-- At least one time or org constraint and one contradictory signal
-- Both options defensible — no cartoon villain choice
-- Ends with 1–2 direct decision questions with no obvious right answer
+## Format B — Engineering dilemma (ends with a forced-choice question)
+A realistic scenario where a senior engineer could argue EITHER side.
+- Open with concrete specifics: team size, traffic numbers, dollar amounts
+- Include one constraint that makes the obvious answer wrong
+- MUST end with 1–2 direct decision questions. The question IS the hook.
+Good: "3-person team, 200 RPS, P99 at 400ms. Your biggest customer wants multi-region in 6 weeks or they churn. Do you bolt on a CDN and pray, or tell them 3 months and risk the contract?"
 
 ## Recent posts — avoid repeating these angles (last 12):
 {json.dumps(recent_posts, indent=2)}
 {top_posts_section}
 {popular_candidates_section}
+{top_tweets_section}
 ## Audience engagement signal:
 {json.dumps(engagement_themes, indent=2) if engagement_themes else "  (no data yet)"}
 
 {f"## Trending today (inspiration only — NO links):{chr(10)}{research_text}" if research_text else ""}
 
-## Rules
-- ALWAYS capitalize the first word. Standard sentence capitalization: proper nouns (AWS, GCP, Stripe, etc.) capitalized, everything else normal case. BAD: "everyone claims..." GOOD: "Everyone claims..."
-- No hashtags, no links, no product mentions, no "Decent Cloud" references
+## Hard rules
+- Must contain at least ONE of: a specific number/dollar amount, a named platform (AWS, GCP, Stripe, etc.), or a direct question.
+- Must end with proper punctuation. No trailing setups.
+- Standard sentence capitalization. No hashtags, no links, no product mentions, no "Decent Cloud" references.
+- No AI vocabulary: "Furthermore", "Additionally", "It's important to note that".
 
 Output as JSON object: {{"post": "your tweet text here"}}
 Output ONLY the JSON object. No markdown, no explanation."""
@@ -633,8 +700,35 @@ Output ONLY the JSON object. No markdown, no explanation."""
         return None
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Post original Twitter content")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview generated posts without posting",
+    )
+    parser.add_argument(
+        "--top-tweets-hours",
+        type=int,
+        default=168,
+        help="How far back to look for top tweets (default: 168 = 7 days)",
+    )
+    parser.add_argument(
+        "--top-tweets-terms",
+        type=int,
+        default=4,
+        help="Number of search terms to sample for top tweets (default: 4)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    dry_run: bool = args.dry_run
+
     print("=== TWITTER ORIGINAL CONTENT POSTER ===", flush=True)
+    if dry_run:
+        print("*** DRY-RUN MODE — will NOT post ***", flush=True)
     print(f"Time: {utc_now()}", flush=True)
 
     # Pre-flight: ensure Chrome CDP is reachable and clear any blocking dialogs.
@@ -645,6 +739,16 @@ def main() -> int:
         print(f"Browser not ready: {e}", file=sys.stderr)
         return 1
 
+    # Fetch top tweets before DB context (avoid holding connections during CDP)
+    top_tweets: list[dict] = []
+    try:
+        top_tweets = fetch_top_tweets(
+            n_terms=args.top_tweets_terms,
+            since_hours=args.top_tweets_hours,
+        )
+    except Exception as e:
+        print(f"Top tweets fetch failed (non-fatal): {e}", flush=True)
+
     try:
         with get_conn() as conn:
             ensure_schema(conn)
@@ -652,7 +756,7 @@ def main() -> int:
             count = count_posts_today(conn)
             print(f"Posts today: {count}/5", flush=True)
 
-            if count >= 5:
+            if count >= 5 and not dry_run:
                 print("Already posted 5 original tweets today, skipping")
                 return 0
 
@@ -679,7 +783,7 @@ def main() -> int:
             # If <3 unposted entries, draft a batch (keep buffer ahead of 5/day demand)
             if len(unposted) < 3:
                 print("Queue low, drafting batch...", flush=True)
-                new_entries = draft_batch(conn)
+                new_entries = draft_batch(conn, top_tweets=top_tweets)
                 if new_entries:
                     inserted = insert_content_queue_entries(conn, new_entries)
                     print(f"Inserted {inserted} drafted entries into queue", flush=True)
@@ -694,7 +798,7 @@ def main() -> int:
                 else:
                     # Fallback: draft a single tweet (more reliable with GLM-5)
                     print("Batch failed, falling back to single draft...", flush=True)
-                    single = draft_single(conn)
+                    single = draft_single(conn, top_tweets=top_tweets)
                     if single:
                         insert_content_queue_entries(conn, [single])
                         queue = load_queue(conn)
@@ -735,6 +839,23 @@ def main() -> int:
                 f"Selected (llm_score={best.get('llm_score', '?')}): {draft[:80]}...",
                 flush=True,
             )
+
+            if dry_run:
+                print("\n=== DRY-RUN RESULTS ===", flush=True)
+                if top_tweets:
+                    print(f"\n--- Top tweets used ({len(top_tweets)}) ---", flush=True)
+                    for t in top_tweets[:10]:
+                        likes = t.get("likes", 0)
+                        rts = t.get("retweets", 0)
+                        text = (t.get("text") or "").replace("\n", " ")
+                        print(f"  [{likes}L {rts}RT] @{t.get('author', '?')}: {text}", flush=True)
+                print(f"\n--- All ranked candidates ({len(ranked)}) ---", flush=True)
+                for i, c in enumerate(ranked):
+                    score = c.get("llm_score", "?")
+                    text = (c.get("text") or "").replace("\n", " ")
+                    print(f"  #{i+1} (score={score}): {text}", flush=True)
+                print(f"\n--- Would post ---\n{draft}", flush=True)
+                return 0
 
             # Humanize (mandatory per strategy doc)
             try:

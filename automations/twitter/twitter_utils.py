@@ -931,7 +931,8 @@ def _parse_graphql_search_body(body: str) -> list[dict]:
 
 
 def _cdp_search(
-    cdp: "CDPSession", term: str, limit: int = 15, since_dt: datetime | None = None
+    cdp: "CDPSession", term: str, limit: int = 15, since_dt: datetime | None = None,
+    sort: str = "live",
 ) -> list[dict]:
     """Search Twitter for a term by intercepting its SearchTimeline GraphQL responses.
 
@@ -946,7 +947,7 @@ def _cdp_search(
         since_dt = datetime.now(timezone.utc) - timedelta(hours=SEARCH_CACHE_TTL_HOURS)
     since_ts = int(since_dt.timestamp())
     encoded = quote(f"{term} since_time:{since_ts}")
-    url = f"{TWITTER_BASE_URL}/search?q={encoded}&f=live"
+    url = f"{TWITTER_BASE_URL}/search?q={encoded}&f={sort}"
 
     bodies: list[str] = []
     pending_ids: dict[
@@ -1265,6 +1266,54 @@ def search_candidates(
 
     print(f"  CDP: {len(candidates)} fresh candidates across all terms", flush=True)
     return candidates
+
+
+def fetch_top_tweets(
+    terms: list[str] | None = None,
+    n_terms: int = 4,
+    limit_per_term: int = 10,
+    since_hours: int = 168,
+) -> list[dict]:
+    """Fetch popular tweets (f=top) as structural/compositional examples.
+
+    Returns an in-memory list sorted by engagement (likes + retweets) descending.
+    No caching — intended for the once-daily original-content drafting run.
+    """
+    pool = terms if terms is not None else SEARCH_TERMS
+    sample_size = min(n_terms, len(pool))
+    sampled = random.sample(pool, sample_size)
+    since_dt = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+
+    all_tweets: dict[str, dict] = {}  # tweetId -> tweet dict
+
+    print(f"Fetching top tweets for {len(sampled)} terms (since {since_hours}h)...", flush=True)
+    with cdp_tab() as cdp:
+        for term in sampled:
+            try:
+                raw = _cdp_search(cdp, term, limit=limit_per_term, since_dt=since_dt, sort="top")
+                for t in raw:
+                    tid = t.get("tweetId")
+                    if not tid or tid in all_tweets:
+                        continue
+                    all_tweets[tid] = {
+                        "tweetId": tid,
+                        "author": t.get("username") or "unknown",
+                        "text": t.get("text") or "",
+                        "likes": t.get("likes", 0),
+                        "retweets": t.get("retweets", 0),
+                        "replies": t.get("replies", 0),
+                    }
+                print(f"  top: '{term}' => {len(raw)} tweets", flush=True)
+            except Exception as e:
+                print(f"  top: '{term}' error: {e}", flush=True)
+
+    result = sorted(
+        all_tweets.values(),
+        key=lambda t: (t.get("likes", 0) + t.get("retweets", 0)),
+        reverse=True,
+    )
+    print(f"Fetched {len(result)} unique top tweets", flush=True)
+    return result
 
 
 TWEET_CONTEXT_CACHE_TTL_HOURS = 1
