@@ -14,10 +14,15 @@ Requirements (keep these in sync when changing generation logic):
    The reveal delivers the payoff (specific numbers, receipts, consequences).
    Standalone formats (reply_with_number, impossible_quiz) skip the reveal.
 
-2. NARRATIVE — each thread must follow good narration principles:
-   setup → reader identification ("oh no, I do that too") → cliffhanger → answer.
-   Do NOT provide dry facts. Start with a situation the reader already encountered,
-   then make a twist. Big surprise. The reader must think "wait, WHAT?"
+2. NARRATIVE & VOICE — each thread must read like someone telling a story at a bar,
+   not a dry incident report. Write in active, not passive voice. The reader must feel
+   "oh no, I've been there" or "wait, WHAT?"
+   - Hook must end on an unresolved moment: a reaction, disbelief, a question.
+     ("I thought AWS made a billing error." / "Nobody could explain the number.")
+   - Reveal must directly continue from the hook's unresolved moment.
+     ("They didn't. Here's what actually happened..." / "Turns out...")
+   - Reveal must close the story — what you did about it, what you learned,
+     what happened next. Never trail off with a dangling fact.
 
 3. SIX ENGAGEMENT FORMATS (see ENGAGEMENT_FORMATS constant):
    cliffhanger, deliberately_wrong, reply_with_number,
@@ -117,55 +122,58 @@ STANDALONE_FORMATS = {"reply_with_number", "impossible_quiz"}
 ENGAGEMENT_FORMATS = """
 ## The 6 engagement formats — you MUST use a DIFFERENT format for each tweet
 
+## VOICE (applies to ALL formats)
+Write like you're telling a friend what happened — not writing a post-mortem.
+Active voice - NOT passive. Short sentences. The reader must feel the story, not read a report.
+BAD: "Cross-region read replicas were configured. The resulting data transfer bill was unexpected."
+GOOD: "I added a cross-region read replica to our 180GB Postgres. Instance costs $95/mo. First month's replication bill: $820. I thought AWS made a billing error."
+
+## HOOK → REVEAL CONNECTION (applies to all thread formats)
+The hook must end on something UNRESOLVED — a reaction, disbelief, a question the reader needs answered.
+The reveal must OPEN by directly answering that unresolved moment, then CLOSE the story (what you did, what you learned).
+BAD hook ending: "The bill was high." (flat statement, no tension)
+BAD reveal opening: "RDS replicates the transaction log." (disconnected lecture)
+GOOD hook ending: "I thought AWS made a billing error."
+GOOD reveal opening: "They didn't. RDS streams the transaction log, not a storage snapshot."
+
 ### 1. CLIFFHANGER THREAD (format: "cliffhanger")
-Hook: Tell a real story — a specific company, a specific dollar amount, a specific disaster.
-Build tension. End mid-story: "And then we opened the bill."
-Reveal (self-reply): The punchline — what actually happened, the real number, the consequence nobody expected.
-ACCURACY: The story must be plausible. Every number must be realistic for that service/company.
-A senior engineer reading this must think "yeah, that tracks" — not "that's made up."
-Example hook: "Our team mass-migrated from AWS to GCP for the 'savings.' Three months in we got the first real bill."
-Example reveal: "Egress fees alone were $14K/mo. They weren't on any pricing calculator. We migrated back within 6 weeks."
+Hook: Tell a real story. Build tension. End on your reaction or disbelief — make the reader NEED to know what happened.
+Reveal: Open by answering the hook's unresolved moment. Explain what actually happened. End with what you did about it.
+ACCURACY: Every number must be realistic for that service/company. A senior engineer must think "yeah, that tracks."
+Example hook: "I added a cross-region read replica to our 180GB Postgres. Instance costs $95/mo. First month's replication bill: $820. I thought AWS made a billing error."
+Example reveal: "They didn't. RDS streams the transaction log, not a storage snapshot. Our write-heavy workload pushed 41TB through the wire in 30 days. I removed the replica and bought a $12/mo monitoring dashboard instead."
 
 ### 2. DELIBERATELY WRONG (format: "deliberately_wrong")
-Hook: State something that SOUNDS true but is provably wrong. Make it specific enough that experts will rage-reply.
-The wronger it sounds, the more replies you get. People cannot resist correcting strangers on the internet.
-Reveal (self-reply): The actual correction + proof. Show the receipt.
-CRITICAL: The hook is SATIRE — it must be obviously a setup, not something that makes us look ignorant.
-The reveal MUST follow immediately as a self-reply so readers see it's a thread. The correction must
-contain real, verifiable facts. Do NOT make claims that are just slightly off — make them boldly,
-confidently wrong in a way that's clearly bait. Think "hot take that triggers the reply guys."
+Hook: State something boldly, confidently wrong. So wrong that experts physically cannot stop themselves from replying.
+Not slightly off — obviously bait. Think "hot take that triggers the reply guys."
+Reveal: The correction with real, verifiable facts. Show the receipt. End with the punchline.
+CRITICAL: The hook is SATIRE — it must read as provocation, not ignorance.
 Example hook: "Kubernetes saves money. That's just a fact at this point."
 Example reveal: "Average K8s cluster runs at 13% utilization. The orchestrator itself eats 15-30% overhead. You're paying for a scheduler to waste your money efficiently."
 
 ### 3. REPLY WITH YOUR NUMBER (format: "reply_with_number") [STANDALONE — no reveal needed]
 One tweet that forces participation. Ask for a SPECIFIC number from their experience.
 People love comparing themselves. Make it about money, time, or pain.
-ACCURACY: The "mine is X" number you include must be realistic and relatable.
-Example: "How many mass-subscriptions are you paying for that you haven't opened in 6+ months? Reply with your number. Mine is 11."
+ACCURACY: The "mine is X" number must be realistic and relatable.
+Example: "How many SaaS subscriptions are you paying for that you haven't opened in 6+ months? Reply with your number. Mine is 11."
 
 ### 4. CONFESSION (format: "confession")
-Hook: Admit something most people would hide. Make it specific and slightly reckless.
-Must be relatable — the reader should think "oh no, I do that too."
-Reveal (self-reply): What happened next — the consequence, the lesson, or the even worse thing you discovered.
-ACCURACY: The confession must be something a competent engineer might actually do for pragmatic reasons —
-not something genuinely negligent. The reveal must show the reasoning was sound or the lesson was learned.
+Hook: Admit something most people would hide. Specific and slightly reckless. End with a detail that makes the reader gasp.
+Reveal: Open by explaining WHY you did it. End with the consequence or the even worse thing you discovered.
+ACCURACY: Must be something a competent engineer might actually do for pragmatic reasons — not genuine negligence.
 Example hook: "I've been running a production database without backups for 8 months. On purpose."
 Example reveal: "It's a 200MB SQLite file that rebuilds from an event log in 4 minutes. The 'backup solution' my company quoted was $1,200/mo. Sometimes the right answer is no answer."
 
 ### 5. MATH NOBODY DID (format: "math_nobody_did")
-Hook: Tease a calculation that reveals a hidden truth. Use real company names and real (or realistic) numbers.
-Make the reader NEED to see the math.
-Reveal (self-reply): The actual breakdown with numbers. Show your work.
-ACCURACY: Every number in the reveal must be realistic and internally consistent. If someone checks
-your math, it must hold up. Use real pricing pages, real typical usage patterns, real industry averages.
-Do NOT invent percentages or dollar amounts that a practitioner would immediately call out as fake.
-Example hook: "I calculated the real hourly cost of an AWS support engineer. The number doesn't make sense."
-Example reveal: "Enterprise Support: $15K/mo minimum. Average response for Sev-2: 12 hours. Median resolution: 'have you tried restarting the instance.' That's $1,250/ticket for the privilege of waiting."
+Hook: Tease a calculation that reveals a hidden truth. End with your reaction to the result — make the reader NEED to see the numbers.
+Reveal: Show the actual breakdown. Every step must be checkable. End with the punchline number.
+ACCURACY: Every number must be internally consistent and match real pricing/industry data. If someone checks your math, it must hold up.
+Example hook: "I ran the numbers on what AWS Enterprise Support actually costs per resolved ticket. The number is genuinely hard to believe."
+Example reveal: "$15K/mo minimum. Average Sev-2 response: 12 hours. Median resolution: 'have you tried restarting the instance.' That's $1,250 per ticket for the privilege of waiting."
 
 ### 6. IMPOSSIBLE QUIZ (format: "impossible_quiz") [STANDALONE — no reveal needed]
 One question with an answer that sounds impossible but is true. People will guess wrong and share it.
-ACCURACY: The surprising answer MUST be actually true or at least widely reported. If someone
-Googles it, the answer should check out. Do NOT make up fake statistics.
+ACCURACY: The surprising answer MUST be actually true or at least widely reported. If someone Googles it, it must check out.
 Example: "What percentage of S3 buckets in production right now have public read access? Wrong answers only."
 """
 
@@ -177,6 +185,18 @@ _PROMPT_RULES = """# Rules
 - Hook: max 280 chars. Reveal: max 280 chars.
 - Use REAL company names (AWS, GCP, Azure, Cloudflare, Vercel, etc.) and realistic numbers.
 - Each thread must be about a DIFFERENT topic. No two threads about the same company or issue.
+- DO NOT rehash any scenario from the "RECENTLY POSTED" list — not even with different
+  wording. Same plot with new numbers is still a duplicate. If a recent post covered
+  "enterprise customer demands SOC2", you MUST NOT write another SOC2-compliance thread.
+  Pick a completely different situation.
+
+# Voice — write like a person, not a report
+- First person (I/we). You're telling a story, not filing an incident report.
+- Short punchy sentences. Read it out loud — if it sounds stiff, rewrite it.
+- Hook MUST end on something unresolved (your reaction, disbelief, a question).
+- Reveal MUST open by directly answering the hook's unresolved moment.
+- Reveal MUST close the story (what you did about it, what happened next).
+  Never end a reveal on a dangling fact with no resolution.
 
 # Accuracy — non-negotiable
 - Every number (dollar amounts, percentages, timeframes) must be REALISTIC for that company/service.
@@ -358,7 +378,12 @@ def _build_context_sections(conn, top_tweets: list[dict] | None = None) -> str:
 
 {_format_top_tweets(top_tweets)}
 
-# Do NOT repeat these recent posts:
+# RECENTLY POSTED — DO NOT DUPLICATE
+The following posts were already published. DO NOT generate anything with the same
+story, scenario, plot, or premise — even if you rephrase it. Same company + same
+cost issue = duplicate. Same compliance dilemma = duplicate. Same migration story
+= duplicate. You MUST write about DIFFERENT situations, companies, and problems.
+
 {json.dumps(recent_posts, indent=2)}
 
 {f"Trending today (NO links):{chr(10)}{research_text}" if research_text else ""}
@@ -520,7 +545,7 @@ Output ONLY: {{"format": "{fmt_choice}", "hook": "the main tweet", "reveal": "th
 # Ranking
 # ---------------------------------------------------------------------------
 
-def llm_rank_candidates(candidates: list[dict]) -> list[dict]:
+def llm_rank_candidates(candidates: list[dict], recent_posts: list[str] | None = None) -> list[dict]:
     """Rank thread candidates by engagement potential using a single LLM call.
 
     Returns candidates sorted best-first, each with an 'llm_score' added.
@@ -541,6 +566,14 @@ def llm_rank_candidates(candidates: list[dict]) -> list[dict]:
         else:
             lines.append(f"[{label}] ({fmt})\n  TWEET: {hook}")
 
+    recent_section = ""
+    if recent_posts:
+        recent_section = f"""
+## Our recently published posts (for duplicate detection)
+
+{chr(10).join(f"- {p}" for p in recent_posts)}
+"""
+
     prompt = f"""You are scrolling Twitter. You see 200 posts per session. Most are forgettable.
 
 Below are tweet thread drafts. Each has a HOOK (the main tweet) and optionally a REVEAL (self-reply).
@@ -548,7 +581,7 @@ Below are tweet thread drafts. Each has a HOOK (the main tweet) and optionally a
 ## The candidates
 
 {chr(10).join(lines)}
-
+{recent_section}
 ## How to judge
 
 For each thread, evaluate:
@@ -558,17 +591,36 @@ For each thread, evaluate:
    - Generic observation with no tension → skip, score 0-3
 
 2. REVEAL PAYOFF (if present): Does the reveal DELIVER?
-   - Specific numbers, real consequences, receipts → score 8-10
-   - Vague "it was bad" → score 0-4
+   - Directly continues from the hook's unresolved moment → good
+   - Specific numbers, real consequences, closes the story → score 8-10
+   - Vague "it was bad" or disconnected lecture → score 0-4
 
-3. PARTICIPATION PULL: Would you reply, quote-tweet, or share?
+3. HOOK → REVEAL CONNECTION: Does the reveal answer the hook?
+   - Hook ends on "I thought it was a billing error" → reveal opens "It wasn't." → strong
+   - Hook ends on a cliffhanger → reveal opens with unrelated explanation → weak, score -2
+
+4. PARTICIPATION PULL: Would you reply, quote-tweet, or share?
    - "Reply with your number" + relatable question → high
    - Closed statement nobody needs to add to → low
 
+5. DUPLICATE DETECTION: Does this candidate rehash a recently published post?
+   - Same story/scenario/premise as a recent post, even with different wording → score 0
+   - Same company + same cost problem = duplicate → score 0
+   - Same compliance/migration/outage dilemma with swapped numbers = duplicate → score 0
+   - A candidate that tells a GENUINELY different story is fine even if it mentions
+     the same company — "AWS egress fees" and "AWS support pricing" are different topics.
+
 REJECT (score 0):
+- DUPLICATES: Any candidate whose story, scenario, or premise overlaps with our
+  recently published posts. Rewording the same plot with new numbers is STILL a
+  duplicate. This is the FIRST thing to check — if it's a duplicate, score 0
+  immediately, do not evaluate further.
 - Common knowledge hooks ("cloud is expensive" — yeah, we know)
 - AI-sounding language (hedge-y, generic, no voice)
+- Passive/dry report voice ("resources were provisioned", "the bill was high")
 - Missing payoff (tension with no resolution)
+- Reveal that doesn't answer the hook (disconnected lecture)
+- Reveal that trails off on a dangling fact without resolution
 - Incomplete thoughts or meta-commentary
 - FACTUALLY WRONG claims (numbers that don't add up, stats a practitioner would call fake)
 - OBVIOUS statements that anyone with basic tech knowledge already knows
@@ -584,7 +636,8 @@ Return ONLY valid JSON:
 Requirements:
 - Rank ALL {len(candidates)} candidates: C1..C{len(candidates)}
 - score: integer 0-10
-- Be HARSH. Most tweets are forgettable. Only 1-2 should score above 7."""
+- Be HARSH. Most tweets are forgettable. Only 1-2 should score above 7.
+- Any duplicate of a recent post MUST get score 0."""
 
     try:
         raw = call_llm(prompt, timeout=600, json_mode=True)
@@ -682,14 +735,15 @@ def main(argv: list[str] | None = None) -> int:
         print("*** DRY-RUN MODE — will NOT post ***", flush=True)
     print(f"Time: {utc_now()}", flush=True)
 
-    try:
-        ensure_browser_ready()
-    except RuntimeError as e:
-        send_error_alert(f"Browser not ready: {e}")
-        print(f"Browser not ready: {e}", file=sys.stderr)
-        return 1
+    if not dry_run:
+        try:
+            ensure_browser_ready()
+        except RuntimeError as e:
+            send_error_alert(f"Browser not ready: {e}")
+            print(f"Browser not ready: {e}", file=sys.stderr)
+            return 1
 
-    # Fetch top tweets before DB work (avoid holding connections during CDP)
+    # Fetch top tweets (cache-first; CDP only on cache miss)
     top_tweets: list[dict] = []
     try:
         top_tweets = fetch_top_tweets(
@@ -739,10 +793,11 @@ def main(argv: list[str] | None = None) -> int:
                 print("No tweets available in queue")
                 return 1
 
-            # Rank candidates
+            # Rank candidates (pass recent posts so ranker can reject duplicates)
+            recent_posts = [p.get("text", "")[:200] for p in get_recent_posts(conn, days=14, limit=12)]
             rank_candidates = [_to_rank_candidate(e) for e in unposted[:20]]
             print(f"Ranking {len(rank_candidates)} candidates...", flush=True)
-            ranked = llm_rank_candidates(rank_candidates)
+            ranked = llm_rank_candidates(rank_candidates, recent_posts=recent_posts)
             best = ranked[0] if ranked else None
             if best is None:
                 print("No valid candidate after ranking", flush=True)
@@ -779,10 +834,24 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print("Hook posted successfully", flush=True)
 
-            # Post reveal as self-reply (thread formats only)
+            # Get tweet ID before recording
             jitter_sleep(6, 12)
             hook_tweet_id = get_latest_own_tweet_id("DecentCloud_org")
 
+            # Record in DB immediately so the post is tracked even if
+            # the reveal CDP call fails and rolls back the transaction.
+            if best.get("id") is not None:
+                mark_content_queue_posted(conn, int(best["id"]), datetime.now(timezone.utc))
+            insert_post(
+                conn,
+                tweet_id=hook_tweet_id or f"unknown-{utc_now()}",
+                type="post",
+                text=hook_text,
+            )
+            conn.commit()
+            print(f"Logged post to DB (tweet_id={hook_tweet_id})", flush=True)
+
+            # Post reveal as self-reply (thread formats only)
             if reveal_text and hook_tweet_id:
                 print(f"Posting reveal as reply to {hook_tweet_id}...", flush=True)
                 jitter_sleep(3, 6)
@@ -795,27 +864,6 @@ def main(argv: list[str] | None = None) -> int:
                     print("Failed to post reveal (hook is still live)", flush=True)
             elif reveal_text:
                 print("Could not get hook tweet ID — reveal not posted", flush=True)
-
-            # Record in DB
-            if best.get("id") is not None:
-                mark_content_queue_posted(conn, int(best["id"]), datetime.now(timezone.utc))
-
-            for attempt in range(1, 4):
-                try:
-                    insert_post(
-                        conn,
-                        tweet_id=hook_tweet_id or f"unknown-{utc_now()}",
-                        type="post",
-                        text=hook_text,
-                    )
-                    break
-                except psycopg2.errors.DeadlockDetected:
-                    if attempt == 3:
-                        raise
-                    wait = 0.8 * attempt
-                    print(f"insert_post deadlock; retrying in {wait:.1f}s (attempt {attempt}/3)", flush=True)
-                    time.sleep(wait)
-            print(f"Logged post to DB (tweet_id={hook_tweet_id})", flush=True)
 
         return 0
 
