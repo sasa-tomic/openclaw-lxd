@@ -86,14 +86,10 @@ from twitter_utils import (
     get_latest_own_tweet_id,
 )
 from db import (
-    get_content_queue,
     get_conn,
     get_latest_morning_research,
     count_posts_today,
     ensure_schema,
-    insert_content_queue_entries,
-    mark_content_queue_posted,
-    prune_content_queue,
     get_recent_posts,
     get_top_posts,
     insert_post,
@@ -125,56 +121,64 @@ ENGAGEMENT_FORMATS = """
 ## VOICE (applies to ALL formats)
 Write like you're telling a friend what happened — not writing a post-mortem.
 Active voice - NOT passive. Short sentences. The reader must feel the story, not read a report.
-BAD: "Cross-region read replicas were configured. The resulting data transfer bill was unexpected."
-GOOD: "I added a cross-region read replica to our 180GB Postgres. Instance costs $95/mo. First month's replication bill: $820. I thought AWS made a billing error."
+When you cite numbers, REACT to them like a human would. Don't just list "X at $Y each" —
+show that you felt something. "We had 340,000 of them. At $0.05 each." hits differently
+than "340,000 custom metrics at $0.05 each."
+BAD: "The deployment was misconfigured. Several services experienced degraded performance for approximately 47 minutes."
+GOOD: "I fat-fingered a deploy config and took down prod for 47 minutes. My Slack hit 200 notifications before I could even open the dashboard."
 
 ## HOOK → REVEAL CONNECTION (applies to all thread formats)
 The hook must end on something UNRESOLVED — a reaction, disbelief, a question the reader needs answered.
 The reveal must OPEN by directly answering that unresolved moment, then CLOSE the story (what you did, what you learned).
-BAD hook ending: "The bill was high." (flat statement, no tension)
-BAD reveal opening: "RDS replicates the transaction log." (disconnected lecture)
-GOOD hook ending: "I thought AWS made a billing error."
-GOOD reveal opening: "They didn't. RDS streams the transaction log, not a storage snapshot."
+BAD hook ending: "The costs were higher than expected." (flat, no tension)
+BAD reveal opening: "Data transfer fees apply between availability zones." (disconnected lecture)
+GOOD hook ending: "I checked the bill expecting $200. It said $1,100."
+GOOD reveal opening: "Every Lambda cold start was pulling container images through our NAT Gateway."
 
 ### 1. CLIFFHANGER THREAD (format: "cliffhanger")
 Hook: Tell a real story. Build tension. End on your reaction or disbelief — make the reader NEED to know what happened.
 Reveal: Open by answering the hook's unresolved moment. Explain what actually happened. End with what you did about it.
 ACCURACY: Every number must be realistic for that service/company. A senior engineer must think "yeah, that tracks."
-Example hook: "I added a cross-region read replica to our 180GB Postgres. Instance costs $95/mo. First month's replication bill: $820. I thought AWS made a billing error."
-Example reveal: "They didn't. RDS streams the transaction log, not a storage snapshot. Our write-heavy workload pushed 41TB through the wire in 30 days. I removed the replica and bought a $12/mo monitoring dashboard instead."
+Example hook: "Our Datadog bill quietly crossed $18,000/month. We're a 12-person startup. Nobody approved this."
+Example reveal: "APM auto-instrumentation was indexing every database query as a separate custom metric. We had 340,000 of them. At $0.05 each. I added one sampling filter and it dropped to $3,200. Nobody tells you this during onboarding."
 
 ### 2. DELIBERATELY WRONG (format: "deliberately_wrong")
 Hook: State something boldly, confidently wrong. So wrong that experts physically cannot stop themselves from replying.
-Not slightly off — obviously bait. Think "hot take that triggers the reply guys."
+Not slightly off — provocative bait. Think "hot take that triggers the reply guys."
 Reveal: The correction with real, verifiable facts. Show the receipt. End with the punchline.
 CRITICAL: The hook is SATIRE — it must read as provocation, not ignorance.
 Example hook: "Kubernetes saves money. That's just a fact at this point."
-Example reveal: "Average K8s cluster runs at 13% utilization. The orchestrator itself eats 15-30% overhead. You're paying for a scheduler to waste your money efficiently."
+Example reveal: "EKS charges you $73/month before a single pod even runs. That's just the control plane. Datadog's Container Report says average cluster CPU utilization is under 20%. You're paying for a scheduler to efficiently waste 80% of your compute."
 
 ### 3. REPLY WITH YOUR NUMBER (format: "reply_with_number") [STANDALONE — no reveal needed]
-One tweet that forces participation. Ask for a SPECIFIC number from their experience.
-People love comparing themselves. Make it about money, time, or pain.
-ACCURACY: The "mine is X" number must be realistic and relatable.
-Example: "How many SaaS subscriptions are you paying for that you haven't opened in 6+ months? Reply with your number. Mine is 11."
+One tweet that asks for a SPECIFIC number from their experience. People love comparing.
+Make it about money, time, or pain. Share yours to anchor the conversation.
+ACCURACY: Your number must be realistic and relatable.
+Example: "How many SaaS subscriptions is your company paying for that nobody has logged into in 6 months? Mine is 11."
 
 ### 4. CONFESSION (format: "confession")
 Hook: Admit something most people would hide. Specific and slightly reckless. End with a detail that makes the reader gasp.
-Reveal: Open by explaining WHY you did it. End with the consequence or the even worse thing you discovered.
+Reveal: Open by explaining WHY you did it. End with the consequence or what you discovered.
 ACCURACY: Must be something a competent engineer might actually do for pragmatic reasons — not genuine negligence.
-Example hook: "I've been running a production database without backups for 8 months. On purpose."
-Example reveal: "It's a 200MB SQLite file that rebuilds from an event log in 4 minutes. The 'backup solution' my company quoted was $1,200/mo. Sometimes the right answer is no answer."
+Example hook: "I deleted our entire staging environment 6 months ago. Nobody has noticed."
+Example reveal: "It cost us $3,200/mo, had stale data, different configs from prod, and hadn't caught a single bug in 5 months. Turns out everyone was deploying behind feature flags anyway. Still off. That's $38K/year we were lighting on fire."
 
 ### 5. MATH NOBODY DID (format: "math_nobody_did")
 Hook: Tease a calculation that reveals a hidden truth. End with your reaction to the result — make the reader NEED to see the numbers.
 Reveal: Show the actual breakdown. Every step must be checkable. End with the punchline number.
 ACCURACY: Every number must be internally consistent and match real pricing/industry data. If someone checks your math, it must hold up.
-Example hook: "I ran the numbers on what AWS Enterprise Support actually costs per resolved ticket. The number is genuinely hard to believe."
-Example reveal: "$15K/mo minimum. Average Sev-2 response: 12 hours. Median resolution: 'have you tried restarting the instance.' That's $1,250 per ticket for the privilege of waiting."
+Example hook: "I calculated what percentage of our AWS bill is 'platform tax' — services that only exist because other AWS services are missing features."
+Example reveal: "NAT Gateway: $220/mo because Lambda can't reach the internet without one. Cross-AZ transfer: $340/mo because AWS spreads your stuff across AZs then charges you for the traffic between them. CloudWatch: $180/mo to see what your own services are doing. That's $740 — 14% of our $5,200 bill goes to paying AWS to fix AWS."
 
 ### 6. IMPOSSIBLE QUIZ (format: "impossible_quiz") [STANDALONE — no reveal needed]
-One question with an answer that sounds impossible but is true. People will guess wrong and share it.
-ACCURACY: The surprising answer MUST be actually true or at least widely reported. If someone Googles it, it must check out.
-Example: "What percentage of S3 buckets in production right now have public read access? Wrong answers only."
+Ask a single factual question whose true answer is so counterintuitive that most
+engineers will confidently guess wrong. The question alone must be the entire tweet —
+no hints, no framing, no call-to-action, no instructions to the reader.
+ACCURACY: The true answer MUST be verifiable. If someone Googles it, it checks out.
+The answer must surprise practitioners — if most engineers already know it, it's not
+a quiz, it's trivia. "How fast are leaked AWS keys exploited?" fails because everyone
+knows it's minutes.
+Example: "What percentage of S3 buckets in production right now have public read access?"
 """
 
 # Prompt rules shared by batch and single drafting
@@ -599,11 +603,16 @@ For each thread, evaluate:
    - Hook ends on "I thought it was a billing error" → reveal opens "It wasn't." → strong
    - Hook ends on a cliffhanger → reveal opens with unrelated explanation → weak, score -2
 
-4. PARTICIPATION PULL: Would you reply, quote-tweet, or share?
+4. HUMAN EMOTION: Does the post make you FEEL something?
+   - Disbelief, outrage, "oh no I've been there", schadenfreude, curiosity → good
+   - Numbers delivered like a spreadsheet with no reaction → score 0-3
+   - The author must feel something too — if the reveal reads like a report, it's dead
+
+5. PARTICIPATION PULL: Would you reply, quote-tweet, or share?
    - "Reply with your number" + relatable question → high
    - Closed statement nobody needs to add to → low
 
-5. DUPLICATE DETECTION: Does this candidate rehash a recently published post?
+6. DUPLICATE DETECTION: Does this candidate rehash a recently published post?
    - Same story/scenario/premise as a recent post, even with different wording → score 0
    - Same company + same cost problem = duplicate → score 0
    - Same compliance/migration/outage dilemma with swapped numbers = duplicate → score 0
@@ -615,6 +624,16 @@ REJECT (score 0):
   recently published posts. Rewording the same plot with new numbers is STILL a
   duplicate. This is the FIRST thing to check — if it's a duplicate, score 0
   immediately, do not evaluate further.
+- SPREADSHEET REVEALS: Numbers listed as line items with no human reaction.
+  "AWS egress: $0.09/GB. Wholesale: $0.001/GB. That's 9,000% markup." is a
+  calculator, not a person. The author must FEEL something about the numbers.
+- HYPERBOLE / UNVERIFIABLE CLAIMS: "would get any other industry investigated",
+  "most profitable line item ever", "nobody talks about this" — if it can't be
+  backed up with a link, don't say it. Exaggeration kills credibility.
+- PROMPT ARTIFACTS in the tweet text: "Wrong answers only", "Reply with your
+  number", "Here's why", or any phrase that reads like an instruction to the
+  reader rather than natural speech. If a real person wouldn't say it out loud
+  at a bar, it doesn't belong in the tweet.
 - Common knowledge hooks ("cloud is expensive" — yeah, we know)
 - AI-sounding language (hedge-y, generic, no voice)
 - Passive/dry report voice ("resources were provisioned", "the bill was high")
@@ -625,6 +644,9 @@ REJECT (score 0):
 - FACTUALLY WRONG claims (numbers that don't add up, stats a practitioner would call fake)
 - OBVIOUS statements that anyone with basic tech knowledge already knows
 - Hooks that make the author look ignorant rather than provocative
+- "impossible_quiz" questions where the real answer is ALREADY well-known to the
+  target audience (e.g. "how fast are leaked keys exploited?" — everyone knows
+  it's minutes, there's no surprise)
 
 Return ONLY valid JSON:
 {{
@@ -697,6 +719,9 @@ Requirements:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Post original Twitter content")
     parser.add_argument("--dry-run", action="store_true", help="Preview generated posts without posting")
+    parser.add_argument("--confirm", action="store_true", default=None,
+                        help="Prompt for confirmation before posting (default: auto-detect TTY)")
+    parser.add_argument("--no-confirm", action="store_true", help="Skip confirmation even in interactive mode")
     parser.add_argument("--top-tweets-hours", type=int, default=168, help="How far back to look for top tweets (default: 168 = 7 days)")
     parser.add_argument("--top-tweets-terms", type=int, default=4, help="Number of search terms to sample for top tweets (default: 4)")
     return parser
@@ -763,34 +788,22 @@ def main(argv: list[str] | None = None) -> int:
                 print("Already posted 6 original tweets today, skipping")
                 return 0
 
-            # Load and clean queue
-            pruned = prune_content_queue(conn, posted_older_than_days=7)
-            if pruned:
-                print(f"Pruned {pruned} old posted queue entries", flush=True)
+            # Generate fresh candidates every run
+            print("Drafting batch...", flush=True)
+            new_entries = draft_batch(conn, top_tweets=top_tweets)
+            if not new_entries:
+                print("Batch failed, falling back to single draft...", flush=True)
+                single = draft_single(conn, top_tweets=top_tweets)
+                new_entries = [single] if single else []
 
-            unposted = _filter_valid_unposted(get_content_queue(conn), conn)
-            print(f"Queue: {len(unposted)} unposted valid", flush=True)
-
-            # Draft if queue is low
-            if len(unposted) < 3:
-                print("Queue low, drafting batch...", flush=True)
-                new_entries = draft_batch(conn, top_tweets=top_tweets)
-                if new_entries:
-                    inserted = insert_content_queue_entries(conn, new_entries)
-                    print(f"Inserted {inserted} drafted entries into queue", flush=True)
-                else:
-                    print("Batch failed, falling back to single draft...", flush=True)
-                    single = draft_single(conn, top_tweets=top_tweets)
-                    if single:
-                        insert_content_queue_entries(conn, [single])
-                    else:
-                        print("Single draft also failed", flush=True)
-                unposted = _filter_valid_unposted(get_content_queue(conn))
-                print(f"Queue after drafting: {len(unposted)} unposted", flush=True)
+            unposted = _filter_valid_unposted(
+                [{"text": e.get("text", ""), "thread_data": e.get("thread_data")} for e in new_entries]
+            )
+            print(f"Drafted {len(new_entries)}, {len(unposted)} valid", flush=True)
 
             if not unposted:
-                send_error_alert("Content queue empty and all drafting failed")
-                print("No tweets available in queue")
+                send_error_alert("All drafting failed or produced no valid entries")
+                print("No valid tweets drafted")
                 return 1
 
             # Rank candidates (pass recent posts so ranker can reject duplicates)
@@ -826,6 +839,23 @@ def main(argv: list[str] | None = None) -> int:
             if reveal_text and not hook_text.rstrip().endswith("👇"):
                 hook_text = hook_text.rstrip() + " 👇"
 
+            # Interactive confirmation
+            interactive = (args.confirm or (args.confirm is None and not args.no_confirm
+                           and sys.stdin.isatty()))
+            if interactive:
+                print(f"\n{'=' * 60}", flush=True)
+                print(f"HOOK:   {hook_text}", flush=True)
+                if reveal_text:
+                    print(f"REVEAL: {reveal_text}", flush=True)
+                print(f"{'=' * 60}", flush=True)
+                try:
+                    answer = input("Post this? [y/N] ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+                if answer != "y":
+                    print("Skipped.", flush=True)
+                    return 0
+
             # Post hook
             print("Posting hook via browser CDP...", flush=True)
             if not post_tweet(hook_text):
@@ -840,8 +870,6 @@ def main(argv: list[str] | None = None) -> int:
 
             # Record in DB immediately so the post is tracked even if
             # the reveal CDP call fails and rolls back the transaction.
-            if best.get("id") is not None:
-                mark_content_queue_posted(conn, int(best["id"]), datetime.now(timezone.utc))
             insert_post(
                 conn,
                 tweet_id=hook_tweet_id or f"unknown-{utc_now()}",
