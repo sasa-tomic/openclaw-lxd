@@ -346,6 +346,27 @@ SEARCH_TERMS = [
     f"{_CLOUD} AND (accountability OR recourse OR responsible OR support)",
 ]
 
+# Broad terms for fetching viral tech tweets — used for structural inspiration.
+# Keep terms simple (no min_faves) — engagement filtering happens post-fetch.
+VIRAL_TWEET_TERMS = [
+    "software engineering",
+    "devops",
+    "startup founder",
+    "SRE on-call",
+    "tech debt",
+    "production incident",
+    "kubernetes",
+    "AWS bill",
+    "deploy production",
+    "engineering manager",
+    "microservices",
+    "infrastructure",
+    "cloud cost",
+    "monitoring observability",
+    "docker containers",
+    "terraform",
+]
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -1308,18 +1329,34 @@ def fetch_top_tweets(
     limit_per_term: int = 10,
     since_hours: int = 168,
     cache_ttl_hours: int = _TOP_TWEETS_CACHE_TTL_HOURS,
+    viral: bool = False,
+    min_engagement: int = 0,
 ) -> list[dict]:
     """Fetch popular tweets (f=top) as structural/compositional examples.
 
     Returns a list sorted by engagement (likes + retweets) descending.
     Results are cached to disk for cache_ttl_hours (default 6) to avoid
     redundant CDP searches across multiple runs in the same day.
+
+    Args:
+        viral: Use broad VIRAL_TWEET_TERMS instead of niche SEARCH_TERMS.
+        min_engagement: Filter out tweets below this likes+retweets threshold.
     """
     cached = _load_top_tweets_cache(ttl_hours=cache_ttl_hours)
     if cached is not None:
+        if min_engagement > 0:
+            cached = [
+                t for t in cached
+                if (t.get("likes", 0) + t.get("retweets", 0)) >= min_engagement
+            ]
         return cached
 
-    pool = terms if terms is not None else SEARCH_TERMS
+    if terms is not None:
+        pool = terms
+    elif viral:
+        pool = VIRAL_TWEET_TERMS
+    else:
+        pool = SEARCH_TERMS
     sample_size = min(n_terms, len(pool))
     sampled = random.sample(pool, sample_size)
     since_dt = datetime.now(timezone.utc) - timedelta(hours=since_hours)
@@ -1352,7 +1389,14 @@ def fetch_top_tweets(
         key=lambda t: (t.get("likes", 0) + t.get("retweets", 0)),
         reverse=True,
     )
-    print(f"Fetched {len(result)} unique top tweets", flush=True)
+
+    if min_engagement > 0:
+        result = [
+            t for t in result
+            if (t.get("likes", 0) + t.get("retweets", 0)) >= min_engagement
+        ]
+
+    print(f"Fetched {len(result)} unique top tweets (min_engagement={min_engagement})", flush=True)
 
     if result:
         _save_top_tweets_cache(result)

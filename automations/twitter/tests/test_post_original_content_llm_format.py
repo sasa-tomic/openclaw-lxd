@@ -66,13 +66,11 @@ def test_llm_rank_candidates_rejects_incomplete_rankings():
 
 
 def test_draft_batch_rejects_plain_text_fallback():
-    with _patch_context_deps() as patched:
-        _set_empty_context(patched)
-        with mock.patch.object(
-            poc, "call_llm",
-            return_value="Let me analyze this carefully:\n1) Here is a tweet idea",
-        ):
-            entries = poc.draft_batch(conn=object())
+    with mock.patch.object(
+        poc, "call_llm",
+        return_value="Let me analyze this carefully:\n1) Here is a tweet idea",
+    ):
+        entries = poc.draft_batch(context="test context")
 
     assert entries == []
 
@@ -85,30 +83,28 @@ def test_draft_batch_accepts_thread_json_array():
             "reveal": "Egress fees alone were $14K/mo. They weren't on any pricing calculator. We migrated back within 6 weeks.",
         },
         {
-            "format": "deliberately_wrong",
+            "format": "hot-take",
             "hook": "Kubernetes saves money. That's just a fact at this point.",
             "reveal": "Average K8s cluster runs at 13% utilization. The orchestrator itself eats 15-30% overhead.",
         },
         {
-            "format": "reply_with_number",
+            "format": "question",
             "hook": "How many SaaS subscriptions are you paying for that you haven't opened in 6 months? Reply with your number. Mine is 11.",
             "reveal": "",
         },
         {
-            "format": "confession",
+            "format": "story",
             "hook": "I've been running a production database without backups for 8 months. On purpose.",
             "reveal": "It's a 200MB SQLite file that rebuilds from an event log in 4 minutes.",
         },
     ]
-    with _patch_context_deps() as patched:
-        _set_empty_context(patched)
-        with mock.patch.object(poc, "call_llm", return_value=json.dumps(threads)):
-            entries = poc.draft_batch(conn=object())
+    with mock.patch.object(poc, "call_llm", return_value=json.dumps(threads)):
+        entries = poc.draft_batch(context="test context")
 
     assert len(entries) == 4
     assert all(e.get("thread_data") is not None for e in entries)
     assert entries[0]["thread_data"]["format"] == "cliffhanger"
-    assert entries[2]["thread_data"]["format"] == "reply_with_number"
+    assert entries[2]["thread_data"]["format"] == "question"
     assert entries[2]["thread_data"]["reveal"] == ""
 
 
@@ -120,15 +116,13 @@ def test_draft_batch_rejects_meta_lines_inside_json_array():
             "reveal": "Some reveal text that won't matter.",
         },
         {
-            "format": "confession",
+            "format": "story",
             "hook": "I accidentally deleted our entire S3 bucket during a Friday deploy. The backup script hadn't run in three weeks.",
             "reveal": "Total data loss: 2.4TB. Recovery cost: $47K in consultant fees. The intern who wrote the backup cron job had left 6 months ago.",
         },
     ]
-    with _patch_context_deps() as patched:
-        _set_empty_context(patched)
-        with mock.patch.object(poc, "call_llm", return_value=json.dumps(threads)):
-            entries = poc.draft_batch(conn=object())
+    with mock.patch.object(poc, "call_llm", return_value=json.dumps(threads)):
+        entries = poc.draft_batch(context="test context")
 
     assert len(entries) == 1
     assert "analyze the requirements" not in entries[0]["text"].lower()
@@ -146,37 +140,37 @@ def test_is_valid_tweet_text_rejects_prompt_like_text():
 
 
 def test_is_valid_thread_entry_validates_formats():
-    # Valid cliffhanger thread
+    # Valid thread with reveal
     assert poc._is_valid_thread_entry({
-        "format": "cliffhanger",
+        "format": "story",
         "hook": "Our team mass-migrated from AWS to GCP for the savings. Three months in we got the first real bill.",
         "reveal": "Egress fees alone were $14K/mo. They weren't on any pricing calculator.",
     })
 
-    # Valid standalone (reply_with_number)
+    # Valid standalone (no reveal)
     assert poc._is_valid_thread_entry({
-        "format": "reply_with_number",
+        "format": "question",
         "hook": "How many SaaS subscriptions are you paying for that you haven't opened in 6 months? Reply with your number.",
         "reveal": "",
     })
 
-    # Invalid: cliffhanger with no reveal
-    assert not poc._is_valid_thread_entry({
-        "format": "cliffhanger",
+    # Valid: any format can be standalone now
+    assert poc._is_valid_thread_entry({
+        "format": "observation",
         "hook": "Our team mass-migrated from AWS to GCP. Three months in we got the first real bill.",
         "reveal": "",
     })
 
     # Invalid: hook too short
     assert not poc._is_valid_thread_entry({
-        "format": "confession",
+        "format": "story",
         "hook": "I broke prod.",
         "reveal": "It was bad.",
     })
 
     # Invalid: product mention
     assert not poc._is_valid_thread_entry({
-        "format": "cliffhanger",
+        "format": "story",
         "hook": "We just launched Decent Cloud and it's better than everything else out there.",
         "reveal": "Check out our platform for the best cloud experience.",
     })
