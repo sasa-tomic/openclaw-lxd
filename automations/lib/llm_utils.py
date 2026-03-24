@@ -32,7 +32,9 @@ _LLM_LOGS_DIR = (
     Path(__file__).resolve().parent.parent / "twitter" / "debug_artifacts" / "llm"
 )
 
-_RETRY_DELAYS = [30, 60, 120]
+_RETRY_DELAYS = [60, 180, 300]
+_RATE_LIMIT_COOLDOWN = 300
+_rate_limited_until: float = 0
 
 OPENAI_API_KEY = _OPENAI_API_KEY
 OPENAI_BASE_URL = _OPENAI_BASE_URL
@@ -58,6 +60,11 @@ def _log_llm_call(
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     except Exception:
         pass
+
+
+def is_llm_rate_limited() -> bool:
+    """Check if LLM is currently in rate limit cooldown."""
+    return time.time() < _rate_limited_until
 
 
 def validate_llm_config() -> None:
@@ -147,6 +154,12 @@ def call_llm(
         - On success: (True, response_text)
         - On failure: (False, error_message)
     """
+    global _rate_limited_until
+    
+    if time.time() < _rate_limited_until:
+        remaining = int(_rate_limited_until - time.time())
+        return (False, f"LLM rate limited - cooldown for {remaining}s more")
+    
     api_key = OPENAI_API_KEY
     base_url = OPENAI_BASE_URL
     primary_model = model or os.environ.get("OPENAI_MODEL", "GLM-5")
@@ -238,8 +251,27 @@ def call_llm(
                     time.sleep(wait)
                     continue
                 else:
+                    _rate_limited_until = time.time() + _RATE_LIMIT_COOLDOWN
                     last_error = (
                         f"HTTP 429 rate limit on {model_label} model '{model_name}' - all attempts exhausted"
+                        f" — body: {response.text[:500]}. Cooldown for {_RATE_LIMIT_COOLDOWN}s"
+                    )
+                    print(f"LLM: {last_error}", file=sys.stderr)
+                    break
+
+            elif 500 <= response.status_code < 600:
+                if attempt < max_retries - 1 and attempt < len(_RETRY_DELAYS):
+                    wait = _RETRY_DELAYS[attempt]
+                    print(
+                        f"LLM: HTTP {response.status_code} server error on {model_label} model '{model_name}' "
+                        f"— body: {response.text[:200]}. Waiting {wait}s before retry...",
+                        flush=True,
+                    )
+                    time.sleep(wait)
+                    continue
+                else:
+                    last_error = (
+                        f"HTTP {response.status_code} server error on {model_label} model '{model_name}' - all attempts exhausted"
                         f" — body: {response.text[:500]}"
                     )
                     print(f"LLM: {last_error}", file=sys.stderr)
