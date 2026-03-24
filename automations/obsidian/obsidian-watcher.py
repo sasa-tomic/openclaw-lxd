@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-Obsidian Note Watcher Service - Aggressive Task Extraction
+Obsidian Note Watcher Service - Git-diff Task Extraction
 
 Monitors /projects/Notes for ALL changes including:
 - Notes in vault
 - Chat messages (Signal, WhatsApp, Telegram)
 - Daily notes
 
-Aggressively extracts tasks and adds to Todoist:
-- Action items, TODOs, commitments
-- Follow-ups from conversations
-- Questions needing answers
-- Meeting/action items from chats
+Uses a shadow git repo (outside syncthing) to track changes.
+Only NEW lines (since last commit) are fed to the LLM — so past
+events and already-processed content are automatically invisible.
 
-Deduplication: Checks existing Todoist tasks and updates instead of duplicating.
+Git repo: /home/openclaw/clawd/memory/notes-tracker.git
+Work tree: /projects/Notes (managed by syncthing, no .git dir)
 
 Configuration: /projects/automations/obsidian/HOW_TO_ADD_TODOS.md
 """
@@ -55,6 +54,52 @@ CHAT_DIRS = {"Signal", "WhatsApp", "Telegram"}
 STATE_FILE = "/home/openclaw/clawd/memory/obsidian-watcher-state.json"
 LASTRUN_FILE = "/home/openclaw/clawd/memory/obsidian-watcher-lastrun"
 COOLDOWN_SECONDS = 120.0
+
+# Shadow git repo — .git dir lives outside syncthing, work tree is the notes dir
+GIT_DIR = "/home/openclaw/clawd/memory/notes-tracker.git"
+GIT_WORK_TREE = "/projects/Notes"
+
+
+def _git(*args) -> subprocess.CompletedProcess:
+    """Run a git command against the shadow repo."""
+    return subprocess.run(
+        ["git", f"--git-dir={GIT_DIR}", f"--work-tree={GIT_WORK_TREE}", *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+MAINTENANCE_MARKER = "🥒"
+
+
+def get_new_lines(filepath: str) -> str:
+    """Return only the added lines for filepath since last git commit.
+
+    Lines written by the maintenance process (containing 🥒) are excluded
+    so maintenance rewrites are invisible to the task extractor.
+
+    Returns empty string if nothing new (file unchanged or not yet tracked).
+    """
+    result = _git("diff", "HEAD", "--", filepath)
+    if result.returncode != 0 or not result.stdout:
+        return ""
+
+    added = []
+    for line in result.stdout.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            content = line[1:]  # strip the leading '+'
+            if MAINTENANCE_MARKER not in content:
+                added.append(content)
+
+    return "\n".join(added).strip()
+
+
+def commit_file(filepath: str):
+    """Stage and commit a single file to advance the baseline."""
+    _git("add", "--", filepath)
+    rel = filepath.replace(GIT_WORK_TREE + "/", "")
+    _git("commit", "-m", f"processed: {rel}", "--allow-empty")
 
 PROJECT_MAPPING = {
     "axiom": "Axiom GmbH",
@@ -124,33 +169,6 @@ def save_state(state: dict):
         logger.error(f"Could not save state file: {e}")
 
 
-def is_task_processed(filepath: str, task_content: str) -> bool:
-    """Check if a task from a file has already been processed."""
-    state = load_state()
-    processed = state.get("processed_tasks", {})
-    content_hash = hashlib.md5(strip_task_markers(task_content).encode()).hexdigest()[
-        :12
-    ]
-    key = f"{filepath}:{content_hash}"
-    return key in processed
-
-
-def mark_task_processed(filepath: str, task_content: str):
-    """Mark a task as processed."""
-    state = load_state()
-    if "processed_tasks" not in state:
-        state["processed_tasks"] = {}
-    content_hash = hashlib.md5(strip_task_markers(task_content).encode()).hexdigest()[
-        :12
-    ]
-    key = f"{filepath}:{content_hash}"
-    state["processed_tasks"][key] = time.time()
-    now = time.time()
-    state["processed_tasks"] = {
-        k: v for k, v in state["processed_tasks"].items() if now - v < 86400 * 7
-    }
-    save_state(state)
-
 
 def should_skip_path(filepath: str) -> bool:
     path = Path(filepath)
@@ -204,35 +222,20 @@ def mark_as_processed(filepath: str):
 
 
 def find_files_since_lastrun() -> list[str]:
-    """Find .md files modified since the last run using the lastrun timestamp file.
+    """Find .md files that have uncommitted changes in the shadow git repo.
 
-    Returns an empty list on first run (no lastrun file exists yet).
+    These are files that changed while the watcher was not running.
     """
-    if not os.path.exists(LASTRUN_FILE):
-        logger.info("No lastrun file — skipping startup backfill (first run)")
-        return []
-    try:
-        result = subprocess.run(
-            ["find", WATCH_PATH, "-newer", LASTRUN_FILE, "-name", "*.md", "-type", "f"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        files = [f.strip() for f in result.stdout.strip().split("\n") if f.strip()]
-        files = [f for f in files if not should_skip_path(f)]
-        return files
-    except Exception as e:
-        logger.error(f"Failed to find files since last run: {e}")
+    result = _git("diff", "--name-only", "HEAD")
+    if result.returncode != 0 or not result.stdout.strip():
         return []
 
-
-def touch_lastrun_file():
-    """Update the lastrun file mtime to now."""
-    try:
-        os.makedirs(os.path.dirname(LASTRUN_FILE), exist_ok=True)
-        Path(LASTRUN_FILE).touch()
-    except Exception as e:
-        logger.error(f"Failed to touch lastrun file: {e}")
+    files = []
+    for rel in result.stdout.strip().splitlines():
+        full = os.path.join(GIT_WORK_TREE, rel)
+        if os.path.isfile(full) and not should_skip_path(full):
+            files.append(full)
+    return files
 
 
 def add_todoist_task(
@@ -258,9 +261,9 @@ def add_todoist_task(
             )
 
             if is_duplicate and duplicate_tasks:
-                logger.info(f"LLM identified duplicate task: {reasoning}")
+                logger.info(f"Duplicate detected, skipping: {reasoning[:80]}...")
                 logger.info(
-                    f"Skipping new task, keeping {len(duplicate_tasks)} existing duplicate(s)"
+                    f"Matched {len(duplicate_tasks)} existing task(s): {[t.get('id') for t in duplicate_tasks[:3]]}"
                 )
                 return True, "Skipped duplicate", duplicate_tasks[0].get("id")
 
@@ -305,7 +308,11 @@ def filter_already_processed_lines(content: str) -> str:
 
 def extract_tasks_with_llm(content: str, filepath: str, is_chat: bool) -> list[dict]:
     """Use LLM directly for intelligent task extraction."""
-    from lib.llm_utils import call_llm
+    from lib.llm_utils import call_llm, is_llm_rate_limited
+
+    if is_llm_rate_limited():
+        logger.info("LLM rate limited, skipping extraction")
+        return []
 
     try:
         relative_path = filepath.replace(WATCH_PATH + "/", "")
@@ -338,6 +345,8 @@ CRITICAL RULES - FOLLOW STRICTLY:
 3. SKIP other people's messages in groups unless owner is mentioned
 4. SKIP system messages, bridge notifications, timestamps, media placeholders
 5. SKIP questions from others that don't need owner's answer
+6. SKIP anything that is already in the past - completed events, past meetings, things that already happened, historical records
+7. SKIP tasks that are clearly already done (e.g. "did X", "sent X", "finished X")
 
 If uncertain, SKIP - false negatives are better than false positives.
 
@@ -511,7 +520,7 @@ def send_telegram_summary(
 
 
 def process_note_change(filepath: str) -> bool:
-    """Analyze note/chat and extract tasks aggressively."""
+    """Extract tasks from new lines only (git diff since last commit)."""
     global skip_dedup_this_run
     skip_dedup_this_run = False
 
@@ -519,26 +528,28 @@ def process_note_change(filepath: str) -> bool:
         if not os.path.exists(filepath):
             return False
 
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-        if len(content) < 20:
-            return False
-
         relative_path = filepath.replace(WATCH_PATH + "/", "")
         is_chat = is_chat_file(filepath)
 
-        logger.info(f"Analyzing {'chat' if is_chat else 'note'}: {relative_path}")
+        # Only look at what's new since last commit
+        new_content = get_new_lines(filepath)
 
-        lines = content.split("\n")
-        recent_content = "\n".join(lines[-100:]) if len(lines) > 100 else content
+        if not new_content or len(new_content) < 10:
+            logger.debug(f"No new content in diff for {relative_path}")
+            commit_file(filepath)  # advance baseline even if nothing to process
+            mark_as_processed(filepath)
+            return True
 
-        tasks = extract_tasks_with_llm(recent_content, filepath, is_chat)
+        logger.info(f"Analyzing diff ({len(new_content)} chars) for {'chat' if is_chat else 'note'}: {relative_path}")
 
+        tasks = extract_tasks_with_llm(new_content, filepath, is_chat)
         tasks = dedupe_tasks(tasks)
 
+        # Commit immediately after extraction so the next trigger sees a clean baseline
+        commit_file(filepath)
+
         if not tasks:
-            logger.debug("No tasks found")
+            logger.debug("No tasks found in diff")
             mark_as_processed(filepath)
             return True
 
@@ -549,10 +560,6 @@ def process_note_change(filepath: str) -> bool:
             content_clean = content_clean.replace('"', "'")
             if len(content_clean) < 5:
                 task_results.append((task, "skipped", "too short", None))
-                continue
-
-            if is_task_processed(relative_path, content_clean):
-                logger.debug(f"Skipping already-processed task: {content_clean[:40]}")
                 continue
 
             priority = task.get("priority", 4)
@@ -570,11 +577,10 @@ def process_note_change(filepath: str) -> bool:
             )
 
             if success:
-                mark_task_processed(relative_path, content_clean)
                 time.sleep(2)
                 if "new" in action.lower():
                     task_results.append((task, "added", action, todoist_id))
-                elif "already" in action.lower():
+                elif "already" in action.lower() or "duplicate" in action.lower():
                     pass
                 else:
                     task_results.append((task, "updated", action, todoist_id))
@@ -597,7 +603,6 @@ def process_note_change(filepath: str) -> bool:
     except Exception as e:
         logger.error(f"Error processing note: {e}")
         import traceback
-
         traceback.print_exc()
         return False
 
@@ -664,10 +669,8 @@ def main():
         logger.error(f"Watch path does not exist: {WATCH_PATH}")
         return 1
 
-    # Collect backlog BEFORE touching, so we capture everything since last run.
-    # Touch immediately after so the next run's window starts from now.
+    # Files with uncommitted changes = modified while watcher was not running
     backlog = find_files_since_lastrun()
-    touch_lastrun_file()
 
     event_handler = DebouncedHandler()
     observer = Observer()
