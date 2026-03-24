@@ -214,6 +214,15 @@ def call_llm(
                     time.sleep(10)
                     continue
                 break
+            except requests.exceptions.ConnectionError as exc:
+                last_error = f"{model_label} model '{model_name}' connection failed: {exc}"
+                print(f"LLM: {last_error}", file=sys.stderr)
+                if attempt < max_retries - 1:
+                    wait = 10 * (attempt + 1)
+                    print(f"LLM: retrying in {wait}s...", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                break
             except Exception as exc:
                 last_error = f"{model_label} model '{model_name}' request failed: {exc}"
                 print(f"LLM: {last_error}", file=sys.stderr)

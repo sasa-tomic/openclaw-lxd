@@ -213,6 +213,11 @@ def cdp_tab(timeout: int = CDP_LOCK_TIMEOUT):
     slot, lf = _acquire_tab_slot(time.monotonic() + timeout)
     try:
         tabs = _get_sorted_page_tabs()
+        if slot >= len(tabs):
+            raise RuntimeError(
+                f"CDP tab pool has {len(tabs)} page tab(s) but need slot {slot}. "
+                "Chrome may be unresponsive — try restarting the browser."
+            )
         cdp = CDPSession.connect_to_tab(tabs[slot]["webSocketDebuggerUrl"])
         try:
             yield cdp

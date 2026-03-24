@@ -52,6 +52,7 @@ from db import (
     get_recent_posts,
     get_top_posts,
     insert_post,
+    mark_content_queue_posted,
 )
 
 LLM_LOG_DIR = Path("/home/openclaw/clawd/logs")
