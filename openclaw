@@ -162,39 +162,10 @@ def setup_user(name: str, user: str) -> None:
     lxc_exec(name, ["groupmod", "-n", user, "ubuntu"], check=False)
 
 
-def configure_dhcpcd(name: str) -> None:
-    """Install and enable dhcpcd to maintain DHCP lease.
-
-    Ubuntu LXC containers use systemd-networkd by default, which can
-    silently lose its IPv4 lease. dhcpcd actively renews the lease and
-    prevents network dropout.
-    """
-    service = (
-        "[Unit]\n"
-        "Description=DHCP Client Daemon\n"
-        "After=network.target\n"
-        "Wants=network.target\n"
-        "\n"
-        "[Service]\n"
-        "Type=simple\n"
-        "ExecStart=/usr/sbin/dhcpcd --nobackground eth0\n"
-        "Restart=on-failure\n"
-        "RestartSec=10\n"
-        "\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n"
-    )
-    lxc_exec(name, ["bash", "-c", f"cat > /etc/systemd/system/dhcpcd.service << 'EOF'\n{service}EOF"])
-    lxc_exec(name, ["systemctl", "daemon-reload"])
-    lxc_exec(name, ["systemctl", "enable", "--now", "dhcpcd"])
-    print("DHCP client (dhcpcd) enabled")
-
-
 def install_dependencies(name: str) -> None:
     """Install system dependencies."""
     lxc_exec(name, ["apt-get", "update"])
-    lxc_exec(name, ["apt-get", "install", "-y", "curl", "ca-certificates", "git", "dhcpcd-base"])
-    configure_dhcpcd(name)
+    lxc_exec(name, ["apt-get", "install", "-y", "curl", "ca-certificates", "git"])
 
 
 def install_nodejs(name: str) -> None:
