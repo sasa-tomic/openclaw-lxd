@@ -221,8 +221,12 @@ class TodoistClient:
         Returns:
             (is_duplicate: bool, reasoning: str, duplicate_tasks: list[dict])
         """
-        from lib.llm_utils import call_llm, extract_json
+        from lib.llm_utils import call_llm, extract_json, is_llm_rate_limited
         import json
+
+        if is_llm_rate_limited():
+            logger.info("Skipping LLM duplicate check - rate limited")
+            return False, "LLM rate limited, skipping duplicate check", []
 
         tasks = cls.get_tasks()
         if not tasks:
@@ -238,21 +242,24 @@ class TodoistClient:
                     {"idx": i, "task_id": task.get("id"), "content": task_content}
                 )
 
-        prompt = f"""Is the NEW task a duplicate of any EXISTING task? Tasks with DIFFERENT names/people are NEVER duplicates.
+        prompt = f"""Is the NEW task a duplicate of any EXISTING task? Consider SEMANTIC meaning, not just exact wording.
+
+Rules:
+- Duplicates: same intent/action even if worded differently (e.g. "call dentist" vs "schedule dentist appointment" vs "book dentist" = duplicates)
+- NOT duplicates: tasks that involve DIFFERENT people, companies, or distinct subjects
+- When in doubt, mark as duplicate to avoid clutter
 
 NEW TASK: "{new_task_clean}"
 
 EXISTING TASKS:
 {json.dumps(tasks_summary, indent=2)}
 
-Return JSON: {{"is_duplicate": true/false, "reasoning": "why", "duplicate_task_ids": ["id1", ...]}}
-
-Be conservative - when in doubt, return false."""
+Return JSON: {{"is_duplicate": true/false, "reasoning": "why", "duplicate_task_ids": ["id1", ...]}}"""
 
         success, response = call_llm(prompt, timeout=120, json_mode=True)
 
         if not success:
-            logger.error(f"LLM duplicate check failed: {response}")
+            logger.info(f"LLM duplicate check skipped: {response[:100]}")
             return False, f"LLM error: {response}", []
 
         json_str = extract_json(response)
@@ -276,7 +283,7 @@ Be conservative - when in doubt, return false."""
             ]
 
             logger.info(
-                f"LLM duplicate check: is_duplicate={is_duplicate}, reasoning={reasoning[:100]}"
+                f"LLM duplicate check: is_duplicate={is_duplicate}, matched_ids={duplicate_ids[:3]}"
             )
 
             return is_duplicate, reasoning, duplicate_tasks
@@ -330,3 +337,41 @@ Be conservative - when in doubt, return false."""
         except Exception as e:
             logger.error(f"Failed to get projects: {e}")
             return all_projects if all_projects else []
+
+    @classmethod
+    def get_completed_tasks(cls, since: str | None = None, limit: int = 100) -> list[dict]:
+        """Get recently completed tasks via /api/v1/tasks/completed.
+
+        Args:
+            since: ISO 8601 datetime string, e.g. '2026-03-01T00:00:00Z'
+            limit: max tasks to return (API max is 200)
+
+        Returns list of dicts with keys: id, task_id, content, completed_at, project_id
+        """
+        if cls.is_rate_limited():
+            return []
+
+        params: dict = {"limit": min(limit, 200)}
+        if since:
+            params["since"] = since
+
+        try:
+            resp = requests.get(
+                f"{API_BASE}/tasks/completed",
+                headers=cls._headers(),
+                params=params,
+                timeout=30,
+            )
+
+            if resp.status_code == 429:
+                retry = int(resp.headers.get("Retry-After", 60))
+                cls._set_rate_limit(retry)
+                return []
+
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("items", [])
+
+        except Exception as e:
+            logger.error(f"Failed to get completed tasks: {e}")
+            return []
