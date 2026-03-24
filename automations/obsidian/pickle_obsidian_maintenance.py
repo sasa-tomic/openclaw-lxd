@@ -72,6 +72,8 @@ DEFAULT_RULES = [
             "Remove intra-note duplicates - within each scoped note, delete repeated sections or content that restates the same thing; keep the clearest version",
             "Remove cross-note duplicates - if a scoped note duplicates content from another note, remove the duplicate and replace with a [[wikilink]]; you may read other notes for comparison but only modify files in scope (plus the merge target if appending)",
             "Consolidate near-empty notes - for any scoped note under ~150 words: (a) if covered elsewhere, delete and update incoming links; (b) if valuable but thin, append to the most relevant note then delete; (c) if trivial, delete without merging",
+            "IMPORTANT: Any line you add, rewrite, move, or leave unchanged during maintenance MUST end with 🥒 (the pickle marker). This tells the task watcher that the line was touched by maintenance, not freshly written by the user, so it will not be re-processed as a new task. Lines already containing 🥒 are already marked. Mark every line in every file you touch.",
+            "Sync completed Todoist tasks back to notes: a JSON list of recently completed tasks will be provided at the end of this prompt under COMPLETED_TODOIST_TASKS. For each completed task: (a) if [[Note/Path.md]] is embedded in the content, open that note directly; (b) otherwise search the vault for a note that clearly contains matching text — use grep or read likely candidates. When you find a match, locate the TODO line and mark it done with ✅ and the completion date. Only skip if no confident match is found. Add 🥒 to any line you modify.",
         ],
     },
     {
@@ -330,6 +332,30 @@ def main() -> int:
         return 0
 
     prompt = build_prompt(rule, args.mode, NOTES_DIR)
+
+    # Append recently completed Todoist tasks so opencode can sync them back to notes
+    try:
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from lib.todoist_client import TodoistClient
+        from datetime import timedelta
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        completed = TodoistClient.get_completed_tasks(since=since, limit=100)
+        if completed:
+            completed_json = json.dumps(
+                [{"content": t["content"], "completed_at": t["completed_at"]} for t in completed],
+                indent=2
+            )
+            prompt += f"\n\n# COMPLETED_TODOIST_TASKS (last 7 days)\n\n```json\n{completed_json}\n```\n"
+            prompt += (
+                "\nFor each completed task: if the content contains [[Note/Path.md]], open that note directly. "
+                "Otherwise search the vault for a note containing text that clearly matches the task — "
+                "if you find a confident match, mark it done there. If no match is found, skip it.\n"
+            )
+            print(f"Injecting {len(completed)} completed tasks into prompt", flush=True)
+        else:
+            print("No completed tasks found", flush=True)
+    except Exception as e:
+        print(f"Warning: could not fetch completed tasks: {e}", file=sys.stderr)
 
     print(f"Running opencode with {args.timeout}s timeout...", flush=True)
 
