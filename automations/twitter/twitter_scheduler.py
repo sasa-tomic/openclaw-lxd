@@ -47,10 +47,12 @@ def _get_prefect_logs(flow_run_id, limit=50) -> str:
     import urllib.request
 
     url = "http://127.0.0.1:4200/api/logs/filter"
-    payload = json.dumps({
-        "logs": {"flow_run_id": {"any_": [str(flow_run_id)]}},
-        "limit": limit,
-    }).encode()
+    payload = json.dumps(
+        {
+            "logs": {"flow_run_id": {"any_": [str(flow_run_id)]}},
+            "limit": limit,
+        }
+    ).encode()
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"}
     )
@@ -74,12 +76,17 @@ def _on_flow_failure(flow, flow_run, state):
     try:
         subprocess.Popen(
             [
-                sys.executable, "-u",
+                sys.executable,
+                "-u",
                 str(_REPAIR_SCRIPT),
-                "--flow-name", flow.name,
-                "--flow-run-id", str(flow_run.id),
-                "--state-message", str(state.message or ""),
-                "--log-snippet", log_snippet,
+                "--flow-name",
+                flow.name,
+                "--flow-run-id",
+                str(flow_run.id),
+                "--state-message",
+                str(state.message or ""),
+                "--log-snippet",
+                log_snippet,
             ],
             stdout=log_fh,
             stderr=subprocess.STDOUT,
@@ -170,8 +177,7 @@ def _is_stale_run(max_late_seconds: int, logger) -> bool:
         late_by = (now - expected).total_seconds()
         if late_by > max_late_seconds:
             logger.warning(
-                f"Skipping stale run: late by {int(late_by)}s "
-                f"(max {max_late_seconds}s)"
+                f"Skipping stale run: late by {int(late_by)}s (max {max_late_seconds}s)"
             )
             return True
         return False
@@ -180,7 +186,12 @@ def _is_stale_run(max_late_seconds: int, logger) -> bool:
         return False
 
 
-@flow(name="twitter-engagement", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-engagement",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def engagement_flow():
     """Autonomous Twitter engagement - 2x hourly at :07 and :38."""
     logger = get_run_logger()
@@ -190,39 +201,65 @@ def engagement_flow():
     return code
 
 
-@flow(name="twitter-engagement-prepare", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-engagement-prepare",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def engagement_prepare_flow():
     """Prepare candidates + full context for LLM analysis (CDP/browser phase)."""
     logger = get_run_logger()
     logger.info("Starting engagement prepare phase")
-    code = run_script(TWITTER_DIR / "twitter_engagement_prepare.py", timeout=900, logger=logger)
+    code = run_script(
+        TWITTER_DIR / "twitter_engagement_prepare.py", timeout=900, logger=logger
+    )
     logger.info(f"Engagement prepare completed with code {code}")
     return code
 
 
-@flow(name="twitter-engagement-analyze", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-engagement-analyze",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def engagement_analyze_flow():
     """LLM-only engagement analysis phase (no browser lock)."""
     logger = get_run_logger()
     logger.info("Starting engagement analyze phase")
-    code = run_script(TWITTER_DIR / "twitter_engagement_analyze.py", timeout=900, logger=logger)
+    code = run_script(
+        TWITTER_DIR / "twitter_engagement_analyze.py", timeout=900, logger=logger
+    )
     logger.info(f"Engagement analyze completed with code {code}")
     return code
 
 
-@flow(name="twitter-engagement-post", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-engagement-post",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def engagement_post_flow():
     """Post analyzed replies (CDP/browser phase)."""
     logger = get_run_logger()
     logger.info("Starting engagement post phase")
-    code = run_script(TWITTER_DIR / "twitter_engagement_post.py", timeout=900, logger=logger)
+    code = run_script(
+        TWITTER_DIR / "twitter_engagement_post.py", timeout=900, logger=logger
+    )
     logger.info(f"Engagement post completed with code {code}")
     return code
 
 
-@flow(name="twitter-original-content", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-original-content",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def original_content_flow():
-    """Post original content - 2x daily."""
+    """Post original content - 1x daily."""
     logger = get_run_logger()
     logger.info("Starting original content post")
     code = run_script(TWITTER_DIR / "post_original_content.py", logger=logger)
@@ -230,7 +267,12 @@ def original_content_flow():
     return code
 
 
-@flow(name="twitter-weekly-thread", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-weekly-thread",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def weekly_thread_flow():
     """Post weekly thread - Wed 15:00 UTC."""
     logger = get_run_logger()
@@ -240,7 +282,12 @@ def weekly_thread_flow():
     return code
 
 
-@flow(name="twitter-daily-eval", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-daily-eval",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def daily_eval_flow():
     """Daily strategy evaluation - 7:00 UTC."""
     logger = get_run_logger()
@@ -250,7 +297,12 @@ def daily_eval_flow():
     return code
 
 
-@flow(name="twitter-morning-research", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-morning-research",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def morning_research_flow():
     """Morning research - 8:00 UTC."""
     logger = get_run_logger()
@@ -260,7 +312,12 @@ def morning_research_flow():
     return code
 
 
-@flow(name="twitter-cdp-health", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-cdp-health",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def cdp_health_flow():
     """CDP health check - every 15 min."""
     logger = get_run_logger()
@@ -272,7 +329,12 @@ def cdp_health_flow():
     return code
 
 
-@flow(name="twitter-reply-monitor", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-reply-monitor",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def reply_monitor_flow():
     """Monitor and respond to replies/mentions — every 5 min."""
     logger = get_run_logger()
@@ -284,8 +346,12 @@ def reply_monitor_flow():
     return code
 
 
-
-@flow(name="twitter-target-monitor", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-target-monitor",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def target_monitor_flow():
     """Monitor target accounts for fast-reply opportunities -- every 30 min."""
     logger = get_run_logger()
@@ -297,7 +363,12 @@ def target_monitor_flow():
     return code
 
 
-@flow(name="twitter-timeline-monitor", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-timeline-monitor",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def timeline_monitor_flow():
     """Monitor Following feed for near-realtime reply opportunities — every 5 min."""
     logger = get_run_logger()
@@ -309,7 +380,12 @@ def timeline_monitor_flow():
     return code
 
 
-@flow(name="twitter-search-queue", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-search-queue",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def search_queue_flow():
     """Fill candidate queue via CDP search — every hour."""
     logger = get_run_logger()
@@ -321,7 +397,12 @@ def search_queue_flow():
     return code
 
 
-@flow(name="twitter-account-discovery", log_prints=True, on_failure=[_on_flow_failure], on_crashed=[_on_flow_failure])
+@flow(
+    name="twitter-account-discovery",
+    log_prints=True,
+    on_failure=[_on_flow_failure],
+    on_crashed=[_on_flow_failure],
+)
 def account_discovery_flow():
     """Discover and score new candidate accounts — daily."""
     logger = get_run_logger()

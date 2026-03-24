@@ -50,7 +50,7 @@ deployments:
     version: "1.0"
     tags: ["twitter", "content"]
     schedule:
-      cron: "30 7,10,13,17,21 * * *"  # 5x daily: 07:30, 10:30, 13:30, 17:30, 21:30 UTC
+      cron: "30 7 * * *"  # 1x daily: 07:30 UTC
       timezone: "UTC"
     entrypoint: twitter_scheduler.py:original_content_flow
     work_pool:
